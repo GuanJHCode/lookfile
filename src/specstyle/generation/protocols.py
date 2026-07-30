@@ -92,6 +92,7 @@ def _rebuild_request(value: object) -> GenerationRequest:
         value.control_input,
         value.variation_index,
         value.environment_hash,
+        value.execution_parameters,
     )
     if rebuilt != value:
         raise _contract_failure()

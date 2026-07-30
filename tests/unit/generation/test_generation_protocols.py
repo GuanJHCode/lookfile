@@ -4,11 +4,11 @@ import pytest
 from PIL import Image, PngImagePlugin
 
 from specstyle.domain.artifacts import ArtifactRef
-from specstyle.domain.identifiers import ArtifactId
+from specstyle.domain.identifiers import ArtifactId, AttemptId
 from specstyle.errors import DomainError, InfrastructureError
 from specstyle.generation.protocols import build_control_input, run_generation
 from specstyle.generation.fake_backend import FakeBackend
-from specstyle.generation.requests import PreparedControlInput
+from specstyle.generation.requests import GenerationParameters, PreparedControlInput
 from specstyle.observability.hashing import hash_bytes
 from tests.unit.generation.test_requests import _request
 
@@ -121,6 +121,41 @@ def test_runner_rejects_forged_request_before_calling_backend() -> None:
     with pytest.raises(InfrastructureError, match="contract violation"):
         run_generation(backend, request)
     assert backend.called is False
+
+
+def test_runner_rejects_forged_execution_parameters_before_calling_backend() -> None:
+    request = _request(
+        parent_attempt_id=AttemptId("parent"),
+        execution_parameters=GenerationParameters(0.4, 0.45, 0.7),
+    )
+    object.__setattr__(request.execution_parameters, "ip_adapter_scale", "forged")
+
+    class Backend:
+        called = False
+
+        def generate(self, value: object) -> object:
+            self.called = True
+            raise AssertionError("forged parameters reached backend")
+
+    backend = Backend()
+    with pytest.raises(InfrastructureError, match="contract violation"):
+        run_generation(backend, request)
+    assert backend.called is False
+
+
+def test_runner_rebuilds_request_with_execution_parameters_intact() -> None:
+    request = _request(
+        parent_attempt_id=AttemptId("parent"),
+        execution_parameters=GenerationParameters(0.4, 0.45, 0.7),
+    )
+
+    class Backend:
+        def generate(self, value: object) -> object:
+            assert value.execution_parameters == GenerationParameters(0.4, 0.45, 0.7)
+            return FakeBackend().generate(value)
+
+    artifact = run_generation(Backend(), request)
+    assert artifact.generation_fingerprint == request.generation_fingerprint
 
 
 def test_runner_rejects_pre_forged_prompt_before_calling_backend() -> None:

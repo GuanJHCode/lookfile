@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from dataclasses import dataclass, field, replace
 from typing import Literal
 
@@ -162,6 +163,26 @@ class PreparedControlInput:
 
 
 @dataclass(frozen=True, slots=True)
+class GenerationParameters:
+    ip_adapter_scale: float
+    img2img_strength: float
+    controlnet_scale: float
+
+    def __post_init__(self) -> None:
+        for value in (
+            self.ip_adapter_scale,
+            self.img2img_strength,
+            self.controlnet_scale,
+        ):
+            if (
+                type(value) is not float
+                or not math.isfinite(value)
+                or not 0 <= value <= 1
+            ):
+                raise DomainError("invalid generation parameters")
+
+
+@dataclass(frozen=True, slots=True)
 class GenerationRequest:
     job_id: JobId
     attempt_id: AttemptId
@@ -175,6 +196,7 @@ class GenerationRequest:
     control_input: PreparedControlInput
     variation_index: int
     environment_hash: Sha256
+    execution_parameters: GenerationParameters | None = None
     seed: SeedSnapshot = field(init=False)
     request_hash: Sha256 = field(init=False)
     generation_fingerprint: Sha256 = field(init=False)
@@ -185,6 +207,7 @@ class GenerationRequest:
         if recomputed.compiled_spec_hash != self.compiled_spec.compiled_spec_hash:
             raise DomainError("forged compiled spec hash")
         graph = self._resolve_graph()
+        self._resolve_execution_parameters(graph)
         self._validate_materials(graph)
         seed = derive_seed(
             self.source.source.sha256,
@@ -194,7 +217,7 @@ class GenerationRequest:
         )
         object.__setattr__(self, "seed", seed)
         fingerprint = _hash(
-            "specstyle.generation.materials.v1",
+            "specstyle.generation.materials.v2",
             self._fingerprint_materials(graph, seed),
         )
         object.__setattr__(self, "generation_fingerprint", fingerprint)
@@ -202,7 +225,7 @@ class GenerationRequest:
             self,
             "request_hash",
             _hash(
-                "specstyle.generation.request.v1",
+                "specstyle.generation.request.v2",
                 {
                     "generation_fingerprint": _sha(fingerprint),
                     "job_id": _identifier(self.job_id, JobId),
@@ -257,6 +280,31 @@ class GenerationRequest:
             }
         ):
             raise DomainError("invalid generation selector")
+
+    def _resolve_execution_parameters(
+        self, graph: CompiledExecutionGraph
+    ) -> GenerationParameters:
+        defaults = GenerationParameters(
+            graph.ip_adapter_scale,
+            graph.img2img_strength,
+            graph.controlnet_scale,
+        )
+        if self.execution_parameters is None:
+            object.__setattr__(self, "execution_parameters", defaults)
+            return defaults
+        if type(self.execution_parameters) is not GenerationParameters:
+            raise DomainError("invalid generation parameters")
+        parameters = GenerationParameters(
+            self.execution_parameters.ip_adapter_scale,
+            self.execution_parameters.img2img_strength,
+            self.execution_parameters.controlnet_scale,
+        )
+        if parameters != self.execution_parameters:
+            raise DomainError("forged generation parameters")
+        if self.parent_attempt_id is None and parameters != defaults:
+            raise DomainError("generation parameter override requires parent attempt")
+        object.__setattr__(self, "execution_parameters", parameters)
+        return parameters
 
     def _resolve_graph(self) -> CompiledExecutionGraph:
         graphs = (
@@ -342,6 +390,11 @@ class GenerationRequest:
             },
             "control_kind": self.control_input.kind,
             "control_image": _prepared(self.control_input.image),
+            "execution_parameters": {
+                "ip_adapter_scale": self.execution_parameters.ip_adapter_scale,
+                "img2img_strength": self.execution_parameters.img2img_strength,
+                "controlnet_scale": self.execution_parameters.controlnet_scale,
+            },
             "variation_index": self.variation_index,
             "seed": seed.seed,
         }

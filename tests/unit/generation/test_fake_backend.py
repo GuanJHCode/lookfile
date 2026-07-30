@@ -8,7 +8,9 @@ from PIL import Image
 from tests.unit.generation.test_requests import _request
 
 from specstyle.errors import DomainError, InfrastructureError
+from specstyle.domain.identifiers import AttemptId
 from specstyle.generation.fake_backend import FakeBackend
+from specstyle.generation.requests import GenerationParameters
 
 
 def test_fake_backend_is_deterministic_across_fresh_instances() -> None:
@@ -68,6 +70,45 @@ def test_fake_backend_attempt_changes_artifact_but_not_content_or_random_state()
     assert first.content == second.content
     assert first.ref.artifact_id != second.ref.artifact_id
     assert random.getstate() == before
+
+
+def test_fake_backend_parameter_override_changes_content_without_changing_seed() -> (
+    None
+):
+    base = _request()
+    override = _request(
+        parent_attempt_id=AttemptId("parent"),
+        execution_parameters=GenerationParameters(0.4, 0.45, 0.7),
+    )
+
+    first = FakeBackend().generate(base)
+    second = FakeBackend().generate(override)
+
+    assert override.seed == base.seed
+    assert second.content != first.content
+
+
+@pytest.mark.parametrize(
+    "parameters",
+    (
+        GenerationParameters(0.4, 0.45, 0.7),
+        GenerationParameters(0.55, 0.4, 0.7),
+        GenerationParameters(0.55, 0.45, 0.6),
+    ),
+)
+def test_fake_backend_changes_content_for_each_parameter_override(
+    parameters: GenerationParameters,
+) -> None:
+    base = _request()
+    override = _request(
+        parent_attempt_id=AttemptId("parent"), execution_parameters=parameters
+    )
+
+    first = FakeBackend().generate(base)
+    second = FakeBackend().generate(override)
+
+    assert override.seed == base.seed
+    assert second.content != first.content
 
 
 def test_fake_backend_output_is_clean_single_frame_rgb_png_at_graph_resolution() -> (

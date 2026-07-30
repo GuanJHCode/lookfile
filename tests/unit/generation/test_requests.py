@@ -1,6 +1,6 @@
 import hashlib
 import json
-from dataclasses import fields, replace
+from dataclasses import FrozenInstanceError, fields, replace
 from io import BytesIO
 
 import pytest
@@ -15,6 +15,7 @@ from specstyle.generation.preprocess import (
     preprocess_image,
 )
 from specstyle.generation.requests import (
+    GenerationParameters,
     GenerationRequest,
     PreparedControlInput,
     RenderedPrompt,
@@ -23,6 +24,10 @@ from specstyle.observability.hashing import hash_bytes
 from specstyle.spec.compiler import compile_style_spec
 from specstyle.spec.compiled_models import ResourcePin
 from tests.unit.spec.test_compiler import context, raw_spec
+
+
+class FloatSubclass(float):
+    pass
 
 
 def _request(**changes: object) -> GenerationRequest:
@@ -70,6 +75,165 @@ def test_request_resolves_graph_and_excludes_attempt_and_environment_from_finger
     assert base.seed == changed.seed
     assert base.generation_fingerprint == changed.generation_fingerprint
     assert base.request_hash != changed.request_hash
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("ip_adapter_scale", True),
+        ("img2img_strength", 0),
+        ("controlnet_scale", "0.5"),
+        ("ip_adapter_scale", float("nan")),
+        ("img2img_strength", float("inf")),
+        ("controlnet_scale", float("-inf")),
+        ("ip_adapter_scale", -0.0000001),
+        ("img2img_strength", 1.0000001),
+        ("ip_adapter_scale", FloatSubclass(0.5)),
+        ("img2img_strength", FloatSubclass(0.5)),
+        ("controlnet_scale", FloatSubclass(0.5)),
+    ),
+)
+def test_generation_parameters_rejects_non_exact_or_out_of_range_values(
+    field: str, value: object
+) -> None:
+    with pytest.raises(DomainError):
+        GenerationParameters(
+            **{
+                "ip_adapter_scale": 0.5,
+                "img2img_strength": 0.5,
+                "controlnet_scale": 0.5,
+                field: value,
+            }
+        )  # type: ignore[arg-type]
+
+
+def test_generation_parameters_is_frozen_and_slotted() -> None:
+    parameters = GenerationParameters(0.55, 0.45, 0.7)
+
+    assert not hasattr(parameters, "__dict__")
+    with pytest.raises(FrozenInstanceError):
+        parameters.ip_adapter_scale = 0.4
+    with pytest.raises((AttributeError, TypeError)):
+        setattr(parameters, "unexpected", "value")
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("ip_adapter_scale", 0.0),
+        ("ip_adapter_scale", 1.0),
+        ("img2img_strength", 0.0),
+        ("img2img_strength", 1.0),
+        ("controlnet_scale", 0.0),
+        ("controlnet_scale", 1.0),
+    ),
+)
+def test_generation_parameters_accepts_exact_unit_interval_boundaries(
+    field: str, value: float
+) -> None:
+    parameters = GenerationParameters(
+        **{
+            "ip_adapter_scale": 0.55,
+            "img2img_strength": 0.45,
+            "controlnet_scale": 0.7,
+            field: value,
+        }
+    )
+
+    assert getattr(parameters, field) == value
+
+
+def test_request_defaults_execution_parameters_from_the_resolved_graph() -> None:
+    request = _request()
+
+    assert request.execution_parameters == GenerationParameters(0.55, 0.45, 0.7)
+
+
+def test_request_accepts_explicit_graph_default_parameters_without_parent() -> None:
+    parameters = GenerationParameters(0.55, 0.45, 0.7)
+
+    request = _request(execution_parameters=parameters)
+
+    assert request.execution_parameters == parameters
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("ip_adapter_scale", 0.4),
+        ("img2img_strength", 0.4),
+        ("controlnet_scale", 0.6),
+    ),
+)
+def test_retry_parameter_override_changes_each_field_without_changing_seed(
+    field: str, value: float
+) -> None:
+    base = _request()
+    parameters = GenerationParameters(
+        **{
+            "ip_adapter_scale": 0.55,
+            "img2img_strength": 0.45,
+            "controlnet_scale": 0.7,
+            field: value,
+        }
+    )
+    retry = _request(
+        parent_attempt_id=AttemptId("parent"), execution_parameters=parameters
+    )
+
+    assert retry.seed == base.seed
+    assert retry.execution_parameters == parameters
+    assert getattr(retry.execution_parameters, field) == value
+    assert retry.generation_fingerprint != base.generation_fingerprint
+    assert retry.request_hash != base.request_hash
+
+
+def test_request_keeps_original_twelve_positional_arguments_compatible() -> None:
+    canonical = _request()
+    positional = GenerationRequest(
+        canonical.job_id,
+        canonical.attempt_id,
+        canonical.parent_attempt_id,
+        canonical.compiled_spec,
+        canonical.generation_profile,
+        canonical.output_profile,
+        canonical.source,
+        canonical.style_references,
+        canonical.prompt,
+        canonical.control_input,
+        canonical.variation_index,
+        canonical.environment_hash,
+    )
+
+    assert positional.execution_parameters == GenerationParameters(0.55, 0.45, 0.7)
+    assert positional.generation_fingerprint == canonical.generation_fingerprint
+    assert positional.request_hash == canonical.request_hash
+
+
+def test_request_rejects_parameter_override_without_a_parent_attempt() -> None:
+    with pytest.raises(DomainError):
+        _request(execution_parameters=GenerationParameters(0.4, 0.45, 0.7))
+
+
+def test_request_accepts_parameter_override_for_a_retry_and_keeps_its_seed() -> None:
+    base = _request()
+    retry = _request(
+        parent_attempt_id=AttemptId("parent"),
+        execution_parameters=GenerationParameters(0.4, 0.45, 0.7),
+    )
+
+    assert retry.seed == base.seed
+    assert retry.execution_parameters == GenerationParameters(0.4, 0.45, 0.7)
+    assert retry.generation_fingerprint != base.generation_fingerprint
+    assert retry.request_hash != base.request_hash
+
+
+def test_request_rejects_forged_execution_parameters_before_hashing() -> None:
+    parameters = GenerationParameters(0.4, 0.45, 0.7)
+    object.__setattr__(parameters, "ip_adapter_scale", "forged")
+
+    with pytest.raises(DomainError):
+        _request(parent_attempt_id=AttemptId("parent"), execution_parameters=parameters)
 
 
 def test_request_rejects_style_order_and_cross_field_mismatches() -> None:
@@ -168,14 +332,13 @@ def test_request_rejects_zero_and_multiple_graph_selector_matches() -> None:
 
 def test_generation_hashes_match_fixed_independent_golden_values() -> None:
     request = _request()
+    override = _request(
+        parent_attempt_id=AttemptId("parent"),
+        execution_parameters=GenerationParameters(0.4, 0.45, 0.7),
+    )
 
     assert request.seed.seed == 6964608022339675490
-    assert request.generation_fingerprint.value == (
-        "adc89df1cc70bc5ec08ac934c9bb7550d9104234981efd73f3aa71413b10100d"
-    )
-    assert request.request_hash.value == (
-        "b54ba7403046f7129e851db637d00e0c3eed6c9ccc7c73541c8e3b37824534e3"
-    )
+    assert override.seed == request.seed
     materials_payload = {
         "domain": "specstyle.generation.materials.v1",
         "compiled_spec_hash": "c21f061f246a258eb1ffc9043343f4bcc886ea775fdc2302c7d2cfe03538141a",
@@ -264,9 +427,8 @@ def test_generation_hashes_match_fixed_independent_golden_values() -> None:
         ensure_ascii=False,
         allow_nan=False,
     ).encode("utf-8")
-    assert (
-        hashlib.sha256(materials_encoded).hexdigest()
-        == request.generation_fingerprint.value
+    assert hashlib.sha256(materials_encoded).hexdigest() == (
+        "adc89df1cc70bc5ec08ac934c9bb7550d9104234981efd73f3aa71413b10100d"
     )
     request_payload = {
         "domain": "specstyle.generation.request.v1",
@@ -283,7 +445,90 @@ def test_generation_hashes_match_fixed_independent_golden_values() -> None:
         ensure_ascii=False,
         allow_nan=False,
     ).encode("utf-8")
-    assert hashlib.sha256(encoded).hexdigest() == request.request_hash.value
+    assert hashlib.sha256(encoded).hexdigest() == (
+        "b54ba7403046f7129e851db637d00e0c3eed6c9ccc7c73541c8e3b37824534e3"
+    )
+
+    default_materials = {
+        **materials_payload,
+        "domain": "specstyle.generation.materials.v2",
+        "execution_parameters": {
+            "ip_adapter_scale": 0.55,
+            "img2img_strength": 0.45,
+            "controlnet_scale": 0.7,
+        },
+    }
+    default_fingerprint = hashlib.sha256(
+        json.dumps(
+            default_materials,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    assert default_fingerprint == (
+        "107996a657061ad76c724f49b90681bb984a2e92dd22f52ec7c54b74fb97a544"
+    )
+    assert request.generation_fingerprint.value == default_fingerprint
+    default_request = {
+        **request_payload,
+        "domain": "specstyle.generation.request.v2",
+        "generation_fingerprint": default_fingerprint,
+    }
+    assert (
+        hashlib.sha256(
+            json.dumps(
+                default_request,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            ).encode("utf-8")
+        ).hexdigest()
+        == request.request_hash.value
+        == ("2fd5db543407d828c9169ca4aa2ab54a2ed906d6e0e1e24db3911f049cce1bc9")
+    )
+
+    override_materials = {
+        **default_materials,
+        "execution_parameters": {
+            "ip_adapter_scale": 0.4,
+            "img2img_strength": 0.45,
+            "controlnet_scale": 0.7,
+        },
+    }
+    override_fingerprint = hashlib.sha256(
+        json.dumps(
+            override_materials,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    assert override_fingerprint == (
+        "b4acb16c72ead52b10bec9f04441929184e6c76a21df0502a02be17b219d35f1"
+    )
+    assert override.generation_fingerprint.value == override_fingerprint
+    override_request = {
+        **default_request,
+        "generation_fingerprint": override_fingerprint,
+        "parent_attempt_id": "parent",
+    }
+    assert (
+        hashlib.sha256(
+            json.dumps(
+                override_request,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            ).encode("utf-8")
+        ).hexdigest()
+        == override.request_hash.value
+        == ("3a448423fd6db88b1e130acdeaaaf3c5042e96d50751e407df7ae5e3b5c0cda2")
+    )
 
 
 def test_fingerprint_excludes_job_attempt_parent_and_environment() -> None:
