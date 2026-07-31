@@ -523,6 +523,56 @@ def test_corrupted_attempt_ids_type_fail_closed(tmp_path: Path) -> None:
         store.load(JobId("job1"))
 
 
+def test_append_event_fsyncs_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """append_event 必须在文件 fsync 后 fsync 目录，保证崩溃恢复幂等。"""
+    import specstyle.workflow.job_store as store_mod
+
+    calls: list[tuple[object, bool]] = []
+    real = store_mod._fsync_dir
+
+    def spy(directory, *, require: bool = False):
+        calls.append((directory, require))
+        return real(directory, require=require)
+
+    monkeypatch.setattr(store_mod, "_fsync_dir", spy)
+    store = _store(tmp_path)
+    store.save_snapshot(
+        JobId("job1"),
+        JobSnapshot("specstyle.workflow.snapshot.v1", _job("CREATED"), 0, (), ()),
+    )
+    store.append_event(
+        JobId("job1"),
+        _event(1, EventType.JOB_STARTED, "CREATED", "SPEC_VALIDATED", _start_payload()),
+    )
+    assert any(require is True for _, require in calls)
+
+
+def test_append_event_dir_fsync_failure_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import specstyle.workflow.job_store as store_mod
+
+    def boom(directory, *, require: bool = False):
+        if require:
+            raise OSError("dir fsync denied")
+
+    monkeypatch.setattr(store_mod, "_fsync_dir", boom)
+    store = _store(tmp_path)
+    store.save_snapshot(
+        JobId("job1"),
+        JobSnapshot("specstyle.workflow.snapshot.v1", _job("CREATED"), 0, (), ()),
+    )
+    with pytest.raises(InfrastructureError, match="job store io failed"):
+        store.append_event(
+            JobId("job1"),
+            _event(
+                1, EventType.JOB_STARTED, "CREATED", "SPEC_VALIDATED", _start_payload()
+            ),
+        )
+
+
 def test_append_event_rejects_forged_from_state(tmp_path: Path) -> None:
     store = _store(tmp_path)
     store.save_snapshot(

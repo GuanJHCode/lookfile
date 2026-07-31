@@ -498,6 +498,8 @@ class JobStore:
                 handle.write(line)
                 handle.flush()
                 os.fsync(handle.fileno())
+            # 目录项落盘：崩溃后 attempt/export 幂等集不得回退（恢复 at-most-once）
+            _fsync_dir(directory, require=True)
         except OSError as cause:
             raise InfrastructureError("job store io failed") from cause
         return finalized
@@ -521,14 +523,23 @@ class JobStore:
         return tuple(events)
 
 
-def _fsync_dir(directory: Path) -> None:
+def _fsync_dir(directory: Path, *, require: bool = False) -> None:
+    """fsync 目录项。
+
+    ``require=True`` 时 open/fsync 失败向上抛 OSError（由调用方映射为
+    InfrastructureError），用于 append_event 耐久性；默认 best-effort 兼容
+    snapshot 路径的既有语义。
+    """
     try:
         fd = os.open(str(directory), os.O_RDONLY | os.O_DIRECTORY)
     except OSError:
+        if require:
+            raise
         return
     try:
         os.fsync(fd)
     except OSError:
-        pass
+        if require:
+            raise
     finally:
         os.close(fd)
