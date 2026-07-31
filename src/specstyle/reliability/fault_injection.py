@@ -1,7 +1,7 @@
 """REL-001 fault injection against real shipped fail-closed entry points.
 
-OOM/cancel drive ``run_production_job`` (real production path). Cancel also
-exercises ``_CancellableBackend``. No always-true stubs.
+OOM/cancel drive ``run_production_job``. Fixtures live in
+``specstyle.reliability.fixtures`` (no ``tests.*`` imports).
 """
 
 from __future__ import annotations
@@ -20,6 +20,20 @@ from specstyle.errors import DomainError, InfrastructureError
 from specstyle.exporting.bundle import ExportBundle, export_bundle
 from specstyle.generation.fake_backend import FakeBackend
 from specstyle.generation.model_registry import ModelRegistry
+from specstyle.reliability.fixtures import (
+    CannyBuilder,
+    ScriptedVerifier,
+    sample_approved_export_request,
+    sample_compiled,
+    sample_context_with_style_low,
+    sample_environment,
+    sample_materials,
+    sample_plan,
+    sample_prompt,
+    sample_root_request,
+    sample_source,
+    sample_spec_text,
+)
 from specstyle.verification.l1.decode import rule_decode
 from specstyle.verification.protocols import run_verifier
 from specstyle.verification.rule_models import GatePolicy, RuleDefinition
@@ -76,12 +90,6 @@ def _sha(c: str = "a") -> Sha256:
     return Sha256(c * 64)
 
 
-def _fx():
-    from tests.integration import test_fake_vertical_slice as t
-
-    return t
-
-
 def exercise_fault(kind: FaultKind) -> FaultResult:
     """Drive real shipped code paths; return whether fail-closed held."""
     if kind == "corrupt_image":
@@ -98,7 +106,6 @@ def exercise_fault(kind: FaultKind) -> FaultResult:
             return FaultResult(kind, True, str(exc))
 
     if kind == "oom":
-        t = _fx()
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "store").mkdir()
@@ -107,19 +114,19 @@ def exercise_fault(kind: FaultKind) -> FaultResult:
             fd = os.open(os.fspath(root / "out"), os.O_RDONLY | os.O_DIRECTORY)
             try:
                 result = run_production_job(
-                    spec_text=t._spec_text(),
-                    context=t._context_with_style_low(),
-                    source=t._source(),
-                    prompt=t._prompt(t._compiled()),
-                    control_builder=t._CannyBuilder(),
-                    environment=t._env(),
-                    plan=t._plan(),
+                    spec_text=sample_spec_text(),
+                    context=sample_context_with_style_low(),
+                    source=sample_source(),
+                    prompt=sample_prompt(sample_compiled()),
+                    control_builder=CannyBuilder(),
+                    environment=sample_environment(),
+                    plan=sample_plan(),
                     job_store=store,
                     root_fd=fd,
                     bundle_name="oom-fault",
                     services=PipelineServices(
                         _FaultyBackend(FakeBackend(), 0, "generation OOM"),
-                        t.FakeVerifier(),
+                        ScriptedVerifier(),
                     ),
                 )
             finally:
@@ -177,14 +184,15 @@ def exercise_fault(kind: FaultKind) -> FaultResult:
             return FaultResult(kind, True, "rejected_bundle_on_failed")
 
     if kind == "disk_failure":
+        # Real ExportRequest + invalid root fd → export target fail-closed.
+        request = sample_approved_export_request()
         try:
-            export_bundle(None, -1, "diskfail")  # type: ignore[arg-type]
+            export_bundle(request, -1, "diskfail")
             return FaultResult(kind, False, "export_accepted_bad_fd")
         except DomainError as exc:
             return FaultResult(kind, True, str(exc))
 
     if kind == "cancel":
-        t = _fx()
         token = CancelToken()
         token.cancel()
         closed = True
@@ -198,17 +206,17 @@ def exercise_fault(kind: FaultKind) -> FaultResult:
             try:
                 try:
                     run_production_job(
-                        spec_text=t._spec_text(),
-                        context=t._context_with_style_low(),
-                        source=t._source(),
-                        prompt=t._prompt(t._compiled()),
-                        control_builder=t._CannyBuilder(),
-                        environment=t._env(),
-                        plan=t._plan(),
+                        spec_text=sample_spec_text(),
+                        context=sample_context_with_style_low(),
+                        source=sample_source(),
+                        prompt=sample_prompt(sample_compiled()),
+                        control_builder=CannyBuilder(),
+                        environment=sample_environment(),
+                        plan=sample_plan(),
                         job_store=store,
                         root_fd=fd,
                         bundle_name="cancel-fault",
-                        services=PipelineServices(FakeBackend(), t.FakeVerifier()),
+                        services=PipelineServices(FakeBackend(), ScriptedVerifier()),
                         cancel=token,
                     )
                     closed = False
@@ -223,8 +231,8 @@ def exercise_fault(kind: FaultKind) -> FaultResult:
                 os.close(fd)
         proxy = _CancellableBackend(FakeBackend(), token)
         try:
-            compiled, source, prompt, env, env_hash = t._materials()
-            proxy.generate(t._req0(compiled, source, prompt, env_hash))
+            compiled, source, prompt, env, env_hash = sample_materials()
+            proxy.generate(sample_root_request(compiled, source, prompt, env_hash))
             closed = False
             detail = f"{detail};proxy_did_not_refuse"
         except DomainError as exc:
