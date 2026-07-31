@@ -116,4 +116,99 @@ def test_batch_consistency_outlier_affected_ids() -> None:
         ),
     )
     assert result.status is RuleStatus.FAIL
-    assert ArtifactId("i3") in result.affected_artifact_ids
+    # Gate affected = full ordered cohort (report/routing invariant)
+    assert result.affected_artifact_ids == (
+        ArtifactId("i1"),
+        ArtifactId("i2"),
+        ArtifactId("i3"),
+    )
+    from specstyle.verification.l2.batch_consistency import batch_outlier_ids
+
+    outliers = batch_outlier_ids(
+        items,
+        _profile(
+            thresholds=(MetricThreshold("batch_style_dispersion_max", "lte", 0.01),)
+        ),
+    )
+    assert ArtifactId("i3") in outliers
+
+
+def test_nan_feature_rejected_by_style_feature() -> None:
+    from specstyle.errors import DomainError
+    from specstyle.verification.l2.encoder import StyleFeature
+    import pytest
+
+    with pytest.raises(DomainError):
+        StyleFeature((1.0, float("nan")), _pin(), _sha("1"))
+
+
+def test_revoked_profile_fails_fidelity() -> None:
+    enc = FakeStyleEncoder(_pin())
+    feat = enc.encode(b"x", _sha("2"))
+    result = evaluate_style_fidelity(
+        ArtifactId("a1"),
+        feat,
+        (feat,),
+        _profile(status="REVOKED"),
+    )
+    assert result.status is RuleStatus.FAIL
+
+
+def test_batch_permutation_stable_outliers() -> None:
+    from specstyle.verification.l2.encoder import StyleFeature
+
+    enc = FakeStyleEncoder(_pin())
+    a = enc.encode(b"aaa", _sha("1"))
+    far = StyleFeature(tuple(1.0 for _ in a.vector), a.pin, _sha("9"))
+    order1 = (
+        (ArtifactId("i1"), a),
+        (ArtifactId("i3"), far),
+        (ArtifactId("i2"), a),
+    )
+    order2 = (
+        (ArtifactId("i3"), far),
+        (ArtifactId("i2"), a),
+        (ArtifactId("i1"), a),
+    )
+    thr = _profile(
+        thresholds=(MetricThreshold("batch_style_dispersion_max", "lte", 0.01),)
+    )
+    r1 = evaluate_batch_consistency(order1, thr)
+    r2 = evaluate_batch_consistency(order2, thr)
+    assert r1.status is RuleStatus.FAIL and r2.status is RuleStatus.FAIL
+    # Full cohort in input order for each call
+    assert r1.affected_artifact_ids == tuple(a for a, _ in order1)
+    assert r2.affected_artifact_ids == tuple(a for a, _ in order2)
+    from specstyle.verification.l2.batch_consistency import batch_outlier_ids
+
+    assert set(batch_outlier_ids(order1, thr)) == set(batch_outlier_ids(order2, thr))
+
+
+def test_batch_revoked_and_draft_not_pass() -> None:
+    enc = FakeStyleEncoder(_pin())
+    a = enc.encode(b"a", _sha("1"))
+    items = ((ArtifactId("i1"), a),)
+    revoked = evaluate_batch_consistency(items, _profile(status="REVOKED"))
+    assert revoked.status is RuleStatus.FAIL
+    draft = evaluate_batch_consistency(items, _profile(status="DRAFT"))
+    assert draft.status is RuleStatus.UNVERIFIABLE
+
+
+def test_concurrent_cache_puts_no_corrupt(tmp_path: Path) -> None:
+    import concurrent.futures
+
+    enc = FakeStyleEncoder(_pin())
+    cache = FeatureCache(tmp_path)
+    data = b"concurrent-img"
+    h = hash_bytes(data)
+
+    def worker(_: int):
+        return encode_with_cache(enc, cache, data, h).vector
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        vectors = list(pool.map(worker, range(16)))
+    assert all(v == vectors[0] for v in vectors)
+    # readable after concurrent writes
+    hit = cache.get(_pin(), h)
+    assert hit is not None
+    assert hit.vector == vectors[0]

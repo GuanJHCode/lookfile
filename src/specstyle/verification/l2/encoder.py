@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, runtime_checkable
@@ -130,7 +131,8 @@ class FeatureCache:
             raise DomainError("invalid feature")
         key = cache_key(feature.pin, feature.asset_hash)
         path = self._root / f"{key}.json"
-        tmp = self._root / f".{key}.tmp"
+        # Unique tmp per writer so concurrent puts do not clobber partial files.
+        tmp = self._root / f".{key}.{os.getpid()}.{threading.get_ident()}.tmp"
         payload = json.dumps(
             {"vector": list(feature.vector)},
             separators=(",", ":"),
@@ -143,7 +145,25 @@ class FeatureCache:
                 os.fsync(handle.fileno())
             os.replace(tmp, path)
         except OSError as exc:
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except OSError:
+                pass
             raise InfrastructureError("feature cache write failed") from exc
+
+
+_ENCODE_LOCKS: dict[str, threading.Lock] = {}
+_ENCODE_LOCKS_GUARD = threading.Lock()
+
+
+def _lock_for(key: str) -> threading.Lock:
+    with _ENCODE_LOCKS_GUARD:
+        lock = _ENCODE_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _ENCODE_LOCKS[key] = lock
+        return lock
 
 
 def encode_with_cache(
@@ -153,11 +173,15 @@ def encode_with_cache(
     asset_hash: Sha256,
     /,
 ) -> StyleFeature:
-    hit = cache.get(encoder.pin, asset_hash)
-    if hit is not None:
-        if hit.pin != encoder.pin:
-            raise DomainError("cache pin mismatch")
-        return hit
-    feature = encoder.encode(image_bytes, asset_hash)
-    cache.put(feature)
-    return feature
+    """Encode with single-flight per cache key (in-process)."""
+    key = cache_key(encoder.pin, asset_hash)
+    lock = _lock_for(key)
+    with lock:
+        hit = cache.get(encoder.pin, asset_hash)
+        if hit is not None:
+            if hit.pin != encoder.pin:
+                raise DomainError("cache pin mismatch")
+            return hit
+        feature = encoder.encode(image_bytes, asset_hash)
+        cache.put(feature)
+        return feature

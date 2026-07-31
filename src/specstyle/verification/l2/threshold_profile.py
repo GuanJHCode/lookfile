@@ -27,6 +27,10 @@ class MetricThreshold:
             raise DomainError("invalid metric operator")
         if type(self.value) is not float or self.value != self.value:
             raise DomainError("invalid metric value")
+        import math
+
+        if not math.isfinite(self.value):
+            raise DomainError("invalid metric value")
 
 
 @dataclass(frozen=True, slots=True)
