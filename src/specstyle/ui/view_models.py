@@ -19,13 +19,18 @@ class JobStatusView:
     job_id: str
     status: str
     message: str
+    can_cancel: bool
+    profile_label: str  # "preview" | "production" | ""
 
 
 @dataclass(frozen=True, slots=True)
 class QaRuleView:
     rule_id: str
-    status: str
+    status: (
+        str  # PASS|FAIL|WARNING|UNVERIFIABLE — never mapped to green PASS if not PASS
+    )
     score: float | None
+    display_class: str  # css/semantic: pass|fail|warning|unverifiable
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,3 +40,17 @@ class ExportView:
     rejected_count: int
     manual_review_count: int
     bundle_sha256: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class RepairStepView:
+    artifact_id: str
+    rounds: int
+    stop_reason: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class ReplayView:
+    status: str  # EXACT|COMPATIBLE|REJECTED
+    mode: str
+    reasons: tuple[str, ...]
