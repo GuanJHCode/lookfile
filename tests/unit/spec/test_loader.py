@@ -9,6 +9,7 @@
   错误信息不含完整私密绝对路径。
 - 限额：MAX_SPEC_BYTES=1_048_576、MAX_YAML_DEPTH=32、MAX_YAML_NODES=10_000；P0 拒绝所有 alias 和 merge。
 """
+
 from __future__ import annotations
 
 import os
@@ -50,7 +51,12 @@ def _valid_dict() -> dict:
         "models": {
             "base": {"id": "sdxl-base", "revision": "r1", "sha256": "a" * 64},
             "ip_adapter": {"id": "ip-adapter", "revision": "r1", "sha256": "b" * 64},
-            "controlnet": {"type": "canny", "id": "canny-cn", "revision": "r1", "sha256": "c" * 64},
+            "controlnet": {
+                "type": "canny",
+                "id": "canny-cn",
+                "revision": "r1",
+                "sha256": "c" * 64,
+            },
         },
         "assets": {
             "style_references": [
@@ -64,7 +70,12 @@ def _valid_dict() -> dict:
             ]
         },
         "profiles": {
-            "preview": {"pipeline": "sdxl_turbo", "resolution": [512, 512], "steps": 4, "guidance_scale": 0},
+            "preview": {
+                "pipeline": "sdxl_turbo",
+                "resolution": [512, 512],
+                "steps": 4,
+                "guidance_scale": 0,
+            },
             "production": {
                 "pipeline": "sdxl_base",
                 "resolution": [1024, 1024],
@@ -85,20 +96,35 @@ def _valid_dict() -> dict:
             "seed_policy": "per_asset_deterministic",
             "batch_execution": "sequential",
         },
-        "domain": {"profile": "product_instance", "verifier_version": None, "fidelity_required": False},
+        "domain": {
+            "profile": "product_instance",
+            "verifier_version": None,
+            "fidelity_required": False,
+        },
         "outputs": {"profiles": ["xhs_grid"]},
         "verification": {
             "ruleset_version": "1.0",
-            "gate_defaults": {"on_unverifiable": "reject", "on_warning": "manual_review"},
+            "gate_defaults": {
+                "on_unverifiable": "reject",
+                "on_warning": "manual_review",
+            },
             "l2": {
                 "encoder_id": "enc",
                 "encoder_revision": "r1",
                 "preprocessing_version": "p1",
-                "threshold_profile": {"id": "tp1", "revision": "r1", "sha256": "e" * 64},
+                "threshold_profile": {
+                    "id": "tp1",
+                    "revision": "r1",
+                    "sha256": "e" * 64,
+                },
             },
             "l3": None,
         },
-        "repair": {"policy_version": "1.0", "max_rounds": 3, "stop_after_no_improvement": 2},
+        "repair": {
+            "policy_version": "1.0",
+            "max_rounds": 3,
+            "stop_after_no_improvement": 2,
+        },
         "replay_contract": {
             "mode": "semantic",
             "tolerated_metric_delta": {"l2_style_fidelity": 0.02, "l3_fidelity": 0.02},
@@ -111,17 +137,21 @@ def _valid_dict() -> dict:
 
 
 def _valid_yaml() -> str:
-    return yaml.dump(_valid_dict(), sort_keys=False, default_flow_style=False, allow_unicode=True)
+    return yaml.dump(
+        _valid_dict(), sort_keys=False, default_flow_style=False, allow_unicode=True
+    )
 
 
 def _mutate_yaml(mutator) -> str:
     import copy
+
     d = copy.deepcopy(_valid_dict())
     mutator(d)
     return yaml.dump(d, sort_keys=False, default_flow_style=False, allow_unicode=True)
 
 
 # --- 常量 ---
+
 
 def test_limits_constants():
     assert MAX_SPEC_BYTES == 1_048_576
@@ -130,6 +160,7 @@ def test_limits_constants():
 
 
 # --- 合法文本加载 ---
+
 
 def test_load_valid_text_returns_spec():
     spec = load_style_spec_text(_valid_yaml())
@@ -148,11 +179,13 @@ def test_load_valid_text_accepts_bytes():
 def test_sha_uppercase_normalized_in_text():
     def m(d):
         d["models"]["base"]["sha256"] = "A" * 64
+
     spec = load_style_spec_text(_mutate_yaml(m))
     assert spec.models.base.sha256 == "a" * 64
 
 
 # --- 非法 UTF-8 / 大小 ---
+
 
 def test_invalid_utf8_raises_domain_error():
     with pytest.raises(DomainError):
@@ -166,38 +199,40 @@ def test_text_exceeds_max_bytes_raises():
 
 # --- duplicate key / alias / merge / unsafe tag ---
 
+
 def test_duplicate_key_raises():
-    text = "schema_version: \"1.0\"\nschema_version: \"2.0\"\n"
+    text = 'schema_version: "1.0"\nschema_version: "2.0"\n'
     with pytest.raises(DomainError):
         load_style_spec_text(text)
 
 
 def test_alias_raises():
-    text = "schema_version: &a \"1.0\"\nschema_uri: *a\n"
+    text = 'schema_version: &a "1.0"\nschema_uri: *a\n'
     with pytest.raises(DomainError):
         load_style_spec_text(text)
 
 
 def test_merge_key_raises():
-    base = "schema_version: \"1.0\"\nschema_uri: \"schemas/style-spec-1.0.schema.json\"\n"
+    base = 'schema_version: "1.0"\nschema_uri: "schemas/style-spec-1.0.schema.json"\n'
     merge = base + "<<: {extra: 1}\n"
     with pytest.raises(DomainError):
         load_style_spec_text(merge)
 
 
 def test_custom_tag_raises():
-    text = "schema_version: !foo \"1.0\"\n"
+    text = 'schema_version: !foo "1.0"\n'
     with pytest.raises(DomainError):
         load_style_spec_text(text)
 
 
 def test_unsafe_python_tag_raises():
-    text = "schema_version: !!python/object/apply:os.system [\"echo pwn\"]\n"
+    text = 'schema_version: !!python/object/apply:os.system ["echo pwn"]\n'
     with pytest.raises(DomainError):
         load_style_spec_text(text)
 
 
 # --- root mapping / depth / nodes ---
+
 
 def test_root_not_mapping_raises():
     with pytest.raises(DomainError):
@@ -227,16 +262,22 @@ def test_very_deep_recursion_caught():
 
 def test_excessive_nodes_raises():
     # 节点数 > 10000
-    text = "schema_version: \"1.0\"\nitems: [" + ", ".join("1" for _ in range(MAX_YAML_NODES + 1)) + "]\n"
+    text = (
+        'schema_version: "1.0"\nitems: ['
+        + ", ".join("1" for _ in range(MAX_YAML_NODES + 1))
+        + "]\n"
+    )
     with pytest.raises(DomainError):
         load_style_spec_text(text)
 
 
 # --- Pydantic 输入错误 -> DomainError，不回显值 ---
 
+
 def test_pydantic_validation_error_becomes_domain_error():
     def m(d):
         d["schema_version"] = "9.9"  # 非法 Literal
+
     with pytest.raises(DomainError):
         load_style_spec_text(_mutate_yaml(m))
 
@@ -244,6 +285,7 @@ def test_pydantic_validation_error_becomes_domain_error():
 def test_error_message_does_not_leak_value():
     def m(d):
         d["models"]["base"]["sha256"] = "SECRET-LEAK-VALUE"
+
     try:
         load_style_spec_text(_mutate_yaml(m))
     except DomainError as exc:
@@ -252,6 +294,7 @@ def test_error_message_does_not_leak_value():
 
 
 # --- 文件加载 + 路径安全 ---
+
 
 def _write(tmp_path: Path, name: str, content: str) -> Path:
     p = tmp_path / name
@@ -317,5 +360,7 @@ def test_non_str_text_raises():
 def test_load_file_uses_size_guard(tmp_path):
     # 写一个刚好等于上限的合法文件不应被拒
     _write(tmp_path, "spec.yaml", _valid_yaml())
-    spec = load_style_spec_file(tmp_path, "spec.yaml", max_bytes=len(_valid_yaml().encode("utf-8")) + 1000)
+    spec = load_style_spec_file(
+        tmp_path, "spec.yaml", max_bytes=len(_valid_yaml().encode("utf-8")) + 1000
+    )
     assert spec.schema_version == "1.0"

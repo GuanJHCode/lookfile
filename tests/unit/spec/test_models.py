@@ -10,6 +10,7 @@
 注：strict=True 使 tuple 字段拒绝 list（合同：loader 在 YAML sequence 边界显式转 tuple，
 直接 model validation 不放宽）。故本文件集合字段用 tuple（loader 转换后形态）。
 """
+
 from __future__ import annotations
 
 import copy
@@ -44,7 +45,12 @@ def _valid_spec() -> dict[str, Any]:
         "models": {
             "base": {"id": "sdxl-base", "revision": "r1", "sha256": "a" * 64},
             "ip_adapter": {"id": "ip-adapter", "revision": "r1", "sha256": "b" * 64},
-            "controlnet": {"type": "canny", "id": "canny-cn", "revision": "r1", "sha256": "c" * 64},
+            "controlnet": {
+                "type": "canny",
+                "id": "canny-cn",
+                "revision": "r1",
+                "sha256": "c" * 64,
+            },
         },
         "assets": {
             "style_references": (
@@ -58,7 +64,12 @@ def _valid_spec() -> dict[str, Any]:
             )
         },
         "profiles": {
-            "preview": {"pipeline": "sdxl_turbo", "resolution": (512, 512), "steps": 4, "guidance_scale": 0},
+            "preview": {
+                "pipeline": "sdxl_turbo",
+                "resolution": (512, 512),
+                "steps": 4,
+                "guidance_scale": 0,
+            },
             "production": {
                 "pipeline": "sdxl_base",
                 "resolution": (1024, 1024),
@@ -79,20 +90,35 @@ def _valid_spec() -> dict[str, Any]:
             "seed_policy": "per_asset_deterministic",
             "batch_execution": "sequential",
         },
-        "domain": {"profile": "product_instance", "verifier_version": None, "fidelity_required": False},
+        "domain": {
+            "profile": "product_instance",
+            "verifier_version": None,
+            "fidelity_required": False,
+        },
         "outputs": {"profiles": ("xhs_grid",)},
         "verification": {
             "ruleset_version": "1.0",
-            "gate_defaults": {"on_unverifiable": "reject", "on_warning": "manual_review"},
+            "gate_defaults": {
+                "on_unverifiable": "reject",
+                "on_warning": "manual_review",
+            },
             "l2": {
                 "encoder_id": "enc",
                 "encoder_revision": "r1",
                 "preprocessing_version": "p1",
-                "threshold_profile": {"id": "tp1", "revision": "r1", "sha256": "e" * 64},
+                "threshold_profile": {
+                    "id": "tp1",
+                    "revision": "r1",
+                    "sha256": "e" * 64,
+                },
             },
             "l3": None,
         },
-        "repair": {"policy_version": "1.0", "max_rounds": 3, "stop_after_no_improvement": 2},
+        "repair": {
+            "policy_version": "1.0",
+            "max_rounds": 3,
+            "stop_after_no_improvement": 2,
+        },
         "replay_contract": {
             "mode": "semantic",
             "tolerated_metric_delta": {"l2_style_fidelity": 0.02, "l3_fidelity": 0.02},
@@ -120,6 +146,7 @@ def _with(spec: dict, path: list, value: Any) -> dict:
 
 # --- 合法构造 ---
 
+
 def test_valid_spec_constructs(valid_spec):
     spec = StyleSpecV1(**valid_spec)
     assert spec.schema_version == "1.0"
@@ -140,12 +167,24 @@ def test_spec_is_frozen(valid_spec):
 
 # --- extra-forbid + required ---
 
+
 @pytest.mark.parametrize(
     "field",
     [
-        "schema_version", "schema_uri", "metadata", "runtime", "models", "assets",
-        "profiles", "style", "generation", "domain", "outputs", "verification",
-        "repair", "replay_contract",
+        "schema_version",
+        "schema_uri",
+        "metadata",
+        "runtime",
+        "models",
+        "assets",
+        "profiles",
+        "style",
+        "generation",
+        "domain",
+        "outputs",
+        "verification",
+        "repair",
+        "replay_contract",
     ],
 )
 def test_top_level_field_required(valid_spec, field):
@@ -179,6 +218,7 @@ def test_no_repair_rules_field(valid_spec):
 
 # --- Literal enums ---
 
+
 def test_schema_version_literal(valid_spec):
     with pytest.raises(ValidationError):
         StyleSpecV1(**_with(valid_spec, ["schema_version"], "2.0"))
@@ -201,7 +241,9 @@ def test_controlnet_type_literal(valid_spec):
 
 def test_consent_literal(valid_spec):
     with pytest.raises(ValidationError):
-        StyleSpecV1(**_with(valid_spec, ["assets", "style_references", 0, "consent"], "maybe"))
+        StyleSpecV1(
+            **_with(valid_spec, ["assets", "style_references", 0, "consent"], "maybe")
+        )
 
 
 def test_domain_profile_literal(valid_spec):
@@ -215,6 +257,7 @@ def test_output_profile_literal(valid_spec):
 
 
 # --- SHA lowercase normalization ---
+
 
 def test_sha256_uppercase_normalized(valid_spec):
     valid_spec["models"]["base"]["sha256"] = "A" * 64
@@ -235,6 +278,7 @@ def test_sha256_wrong_length_rejected(valid_spec):
 
 
 # --- SafeText boundaries ---
+
 
 def test_safetext_rejects_control_chars(valid_spec):
     for bad in ("ab\x00c", "ab\x1bc", "ab\x7fc"):
@@ -263,6 +307,7 @@ def test_name_max_256(valid_spec):
 
 # --- ID-like ---
 
+
 def test_idlike_rejects_non_ascii(valid_spec):
     with pytest.raises(ValidationError):
         StyleSpecV1(**_with(valid_spec, ["metadata", "spec_id"], "café"))
@@ -277,26 +322,41 @@ def test_idlike_rejects_leading_hyphen_and_too_long(valid_spec):
 
 # --- created_at RFC3339 tz ---
 
+
 def test_created_at_requires_timezone(valid_spec):
     with pytest.raises(ValidationError):
-        StyleSpecV1(**_with(valid_spec, ["metadata", "created_at"], "2026-07-29T10:00:00"))
+        StyleSpecV1(
+            **_with(valid_spec, ["metadata", "created_at"], "2026-07-29T10:00:00")
+        )
 
 
 def test_created_at_accepts_offset(valid_spec):
-    spec = StyleSpecV1(**_with(valid_spec, ["metadata", "created_at"], "2026-07-29T10:00:00+08:00"))
+    spec = StyleSpecV1(
+        **_with(valid_spec, ["metadata", "created_at"], "2026-07-29T10:00:00+08:00")
+    )
     assert spec.metadata.created_at == "2026-07-29T10:00:00+08:00"
 
 
 # --- source_url ---
 
+
 def test_source_url_http_only(valid_spec):
     with pytest.raises(ValidationError):
-        StyleSpecV1(**_with(valid_spec, ["assets", "style_references", 0, "source_url"], "ftp://x"))
+        StyleSpecV1(
+            **_with(
+                valid_spec, ["assets", "style_references", 0, "source_url"], "ftp://x"
+            )
+        )
     with pytest.raises(ValidationError):
-        StyleSpecV1(**_with(valid_spec, ["assets", "style_references", 0, "source_url"], "not-a-url"))
+        StyleSpecV1(
+            **_with(
+                valid_spec, ["assets", "style_references", 0, "source_url"], "not-a-url"
+            )
+        )
 
 
 # --- Scale [0,1] ---
+
 
 def test_scale_rejects_out_of_range(valid_spec):
     with pytest.raises(ValidationError):
@@ -314,6 +374,7 @@ def test_scale_rejects_bool_and_string(valid_spec):
 
 def test_scale_rejects_inf_nan(valid_spec):
     import math
+
     with pytest.raises(ValidationError):
         StyleSpecV1(**_with(valid_spec, ["style", "user_strength"], math.inf))
     with pytest.raises(ValidationError):
@@ -322,23 +383,33 @@ def test_scale_rejects_inf_nan(valid_spec):
 
 # --- resolution ---
 
+
 def test_resolution_exactly_two(valid_spec):
     with pytest.raises(ValidationError):
         StyleSpecV1(**_with(valid_spec, ["profiles", "preview", "resolution"], (512,)))
     with pytest.raises(ValidationError):
-        StyleSpecV1(**_with(valid_spec, ["profiles", "preview", "resolution"], (512, 512, 512)))
+        StyleSpecV1(
+            **_with(valid_spec, ["profiles", "preview", "resolution"], (512, 512, 512))
+        )
 
 
 def test_resolution_range_and_multiple_of_8(valid_spec):
     with pytest.raises(ValidationError):
-        StyleSpecV1(**_with(valid_spec, ["profiles", "preview", "resolution"], (63, 512)))
+        StyleSpecV1(
+            **_with(valid_spec, ["profiles", "preview", "resolution"], (63, 512))
+        )
     with pytest.raises(ValidationError):
-        StyleSpecV1(**_with(valid_spec, ["profiles", "preview", "resolution"], (4097, 512)))
+        StyleSpecV1(
+            **_with(valid_spec, ["profiles", "preview", "resolution"], (4097, 512))
+        )
     with pytest.raises(ValidationError):
-        StyleSpecV1(**_with(valid_spec, ["profiles", "preview", "resolution"], (513, 512)))
+        StyleSpecV1(
+            **_with(valid_spec, ["profiles", "preview", "resolution"], (513, 512))
+        )
 
 
 # --- steps / guidance ---
+
 
 def test_steps_range(valid_spec):
     with pytest.raises(ValidationError):
@@ -354,6 +425,7 @@ def test_guidance_range(valid_spec):
 
 
 # --- nullable exactly three ---
+
 
 def test_parent_spec_nullable(valid_spec):
     spec = StyleSpecV1(**_with(valid_spec, ["metadata", "parent_spec"], None))
@@ -377,6 +449,7 @@ def test_non_nullable_field_rejects_none(valid_spec):
 
 # --- fidelity_required strict bool ---
 
+
 def test_fidelity_required_strict_bool(valid_spec):
     for bad in (0, 1, "true", None, 0.0):
         with pytest.raises(ValidationError):
@@ -393,6 +466,7 @@ def test_fidelity_required_true_l3_null_passes_raw(valid_spec):
 
 # --- outputs no-dup, no silent dedup ---
 
+
 def test_outputs_rejects_empty(valid_spec):
     valid_spec["outputs"]["profiles"] = ()
     with pytest.raises(ValidationError):
@@ -406,12 +480,17 @@ def test_outputs_rejects_duplicate_no_dedup(valid_spec):
 
 
 def test_outputs_accepts_three_distinct(valid_spec):
-    valid_spec["outputs"]["profiles"] = ("xhs_grid", "talking_head_cover", "background_sequence")
+    valid_spec["outputs"]["profiles"] = (
+        "xhs_grid",
+        "talking_head_cover",
+        "background_sequence",
+    )
     spec = StyleSpecV1(**valid_spec)
     assert len(spec.outputs.profiles) == 3
 
 
 # --- assets non-empty ---
+
 
 def test_assets_style_references_non_empty(valid_spec):
     valid_spec["assets"]["style_references"] = ()
@@ -420,6 +499,7 @@ def test_assets_style_references_non_empty(valid_spec):
 
 
 # --- repair stop_after_no_improvement ≤ max_rounds ---
+
 
 def test_stop_after_no_improvement_le_max_rounds(valid_spec):
     with pytest.raises(ValidationError):
@@ -437,10 +517,21 @@ def test_max_rounds_range(valid_spec):
 
 # --- replay_contract Literal[False] before-validator ---
 
-@pytest.mark.parametrize("bad", [0, 0.0, "false", "", None, True], ids=["int0", "float0", "str_false", "empty", "none", "true"])
+
+@pytest.mark.parametrize(
+    "bad",
+    [0, 0.0, "false", "", None, True],
+    ids=["int0", "float0", "str_false", "empty", "none", "true"],
+)
 def test_per_item_metric_equality_required_only_false(valid_spec, bad):
     with pytest.raises(ValidationError):
-        StyleSpecV1(**_with(valid_spec, ["replay_contract", "new_batch", "per_item_metric_equality_required"], bad))
+        StyleSpecV1(
+            **_with(
+                valid_spec,
+                ["replay_contract", "new_batch", "per_item_metric_equality_required"],
+                bad,
+            )
+        )
 
 
 def test_per_item_metric_equality_required_false_accepted(valid_spec):
@@ -450,11 +541,29 @@ def test_per_item_metric_equality_required_false_accepted(valid_spec):
 
 def test_replay_tolerated_delta_range(valid_spec):
     with pytest.raises(ValidationError):
-        StyleSpecV1(**_with(valid_spec, ["replay_contract", "tolerated_metric_delta", "l2_style_fidelity"], 1.5))
+        StyleSpecV1(
+            **_with(
+                valid_spec,
+                ["replay_contract", "tolerated_metric_delta", "l2_style_fidelity"],
+                1.5,
+            )
+        )
     with pytest.raises(ValidationError):
-        StyleSpecV1(**_with(valid_spec, ["replay_contract", "tolerated_metric_delta", "l3_fidelity"], -0.1))
+        StyleSpecV1(
+            **_with(
+                valid_spec,
+                ["replay_contract", "tolerated_metric_delta", "l3_fidelity"],
+                -0.1,
+            )
+        )
 
 
 def test_replay_new_batch_contract_literal(valid_spec):
     with pytest.raises(ValidationError):
-        StyleSpecV1(**_with(valid_spec, ["replay_contract", "new_batch", "contract"], "something_else"))
+        StyleSpecV1(
+            **_with(
+                valid_spec,
+                ["replay_contract", "new_batch", "contract"],
+                "something_else",
+            )
+        )

@@ -3,6 +3,7 @@
 AssetRef(asset_id, sha256) 与 ArtifactRef(artifact_id, sha256)：immutable、严格类型、
 精确 mapping round-trip。不含 path，不做 IO、解码或 hash 计算（hash 由外部计算后传入）。
 """
+
 from __future__ import annotations
 
 from collections.abc import Mapping

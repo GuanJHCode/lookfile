@@ -3,6 +3,7 @@
 build_style_spec_schema 每次返回互不污染的新对象；$schema 固定 Draft 2020-12 官方 URI，
 $id 等于实例 schema_uri；dump 使用 sort_keys + 紧凑分隔 + ensure_ascii=False 的 canonical JSON。
 """
+
 from __future__ import annotations
 
 import json

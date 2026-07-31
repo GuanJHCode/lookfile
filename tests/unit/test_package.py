@@ -7,6 +7,7 @@
 - DomainError / InfrastructureError 继承 SpecStyleError；
 - 三者均可正常 raise 并被捕获。
 """
+
 import pytest
 
 

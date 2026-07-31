@@ -9,6 +9,7 @@
 
 重点测试：ASCII 控制字符、尾随换行、长度边界。
 """
+
 import dataclasses
 
 import pytest
@@ -52,6 +53,7 @@ INVALID_IDS = [
 
 # --- 有效 / 非法 ID ---
 
+
 @pytest.mark.parametrize("cls", ID_TYPES, ids=lambda c: c.__name__)
 @pytest.mark.parametrize("value", VALID_IDS)
 def test_valid_id_accepted(cls, value):
@@ -92,6 +94,7 @@ def test_no_case_change():
 
 # --- frozen / slots / hashable ---
 
+
 @pytest.mark.parametrize("cls", ID_TYPES, ids=lambda c: c.__name__)
 def test_frozen(cls):
     obj = cls("abc")
@@ -115,6 +118,7 @@ def test_hashable(cls):
 
 
 # --- 具体类型隔离 ---
+
 
 def test_sibling_ids_not_equal():
     value = "same"
@@ -150,6 +154,7 @@ def test_from_primitive_non_string_raises(cls):
 
 
 # --- Identifier 基类 ---
+
 
 def test_identifier_base_construction():
     obj = Identifier("abc")

@@ -7,6 +7,7 @@
 - SHA/ID/resolution/scale 约束出现在 Schema（Pydantic 用 $defs，故用 dump 子串校验）；
 - dump_style_spec_schema 返回 canonical JSON（sort_keys、紧凑、ensure_ascii=False）。
 """
+
 from __future__ import annotations
 
 import json
@@ -17,9 +18,20 @@ DRAFT_URI = "https://json-schema.org/draft/2020-12/schema"
 SCHEMA_ID = "schemas/style-spec-1.0.schema.json"
 
 TOP_LEVEL = {
-    "schema_version", "schema_uri", "metadata", "runtime", "models", "assets",
-    "profiles", "style", "generation", "domain", "outputs", "verification",
-    "repair", "replay_contract",
+    "schema_version",
+    "schema_uri",
+    "metadata",
+    "runtime",
+    "models",
+    "assets",
+    "profiles",
+    "style",
+    "generation",
+    "domain",
+    "outputs",
+    "verification",
+    "repair",
+    "replay_contract",
 }
 
 
@@ -94,7 +106,10 @@ def test_dump_canonical_json_string():
     assert isinstance(dumped, str)
     reparsed = json.loads(dumped)
     assert reparsed["$schema"] == DRAFT_URI
-    assert json.dumps(reparsed, sort_keys=True, separators=(",", ":"), ensure_ascii=False) == dumped
+    assert (
+        json.dumps(reparsed, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        == dumped
+    )
 
 
 def test_dump_is_idempotent():

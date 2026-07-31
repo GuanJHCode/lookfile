@@ -8,6 +8,7 @@
 
 重点测试：Sibling ID 错配、额外/缺失 mapping key。
 """
+
 import dataclasses
 from collections import UserDict
 from types import MappingProxyType
@@ -32,6 +33,7 @@ def _artifact_ref(value="r1"):
 
 # --- 构造与字段 ---
 
+
 def test_asset_ref_construction():
     ref = _asset_ref("a1")
     assert ref.asset_id == AssetId("a1")
@@ -50,6 +52,7 @@ def test_refs_have_no_path_field():
 
 
 # --- 严格类型：sibling ID 错配与非 Sha256 ---
+
 
 def test_asset_ref_rejects_plain_string_asset_id():
     with pytest.raises(DomainError):
@@ -84,6 +87,7 @@ def test_artifact_ref_rejects_plain_strings():
 
 
 # --- to_primitive / from_primitive 精确 round-trip ---
+
 
 def test_asset_ref_to_primitive_shape():
     assert _asset_ref("a1").to_primitive() == {"asset_id": "a1", "sha256": HEX}
@@ -140,6 +144,7 @@ def test_asset_ref_from_primitive_rejects_wrong_key_name():
 
 # --- 非 dict Mapping 正例（MappingProxyType / UserDict）---
 
+
 def test_asset_ref_accepts_mapping_proxy_type():
     data = MappingProxyType({"asset_id": "a1", "sha256": HEX_UPPER})
     ref = AssetRef.from_primitive(data)
@@ -178,7 +183,10 @@ def test_artifact_ref_accepts_user_dict():
 
 # --- ArtifactRef from_primitive 负例（与 AssetRef 对称）---
 
-@pytest.mark.parametrize("bad", [None, "not-a-mapping", 123, []], ids=["none", "str", "int", "list"])
+
+@pytest.mark.parametrize(
+    "bad", [None, "not-a-mapping", 123, []], ids=["none", "str", "int", "list"]
+)
 def test_artifact_ref_from_primitive_rejects_non_mapping(bad):
     with pytest.raises(DomainError):
         ArtifactRef.from_primitive(bad)
@@ -203,6 +211,7 @@ def test_artifact_ref_from_primitive_rejects_wrong_key_name():
 
 
 # --- frozen / slots / hashable / 类型隔离 ---
+
 
 def test_refs_frozen():
     ref = _asset_ref()

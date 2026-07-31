@@ -12,6 +12,7 @@
 - RuleStatus 不含 NOT_APPLICABLE，NOT_APPLICABLE 只属于 StaticApplicability；
 - specstyle.domain 不 re-export 任一枚举、不定义 __all__。
 """
+
 import enum
 import json
 
@@ -44,6 +45,7 @@ def _members(cls):
 
 
 # --- 精确成员顺序与精确值 ---
+
 
 def test_rulestatus_members():
     assert _members(RuleStatus) == [
@@ -107,6 +109,7 @@ def test_rulescope_members():
 
 # --- 不变量 ---
 
+
 @pytest.mark.parametrize("cls", ALL_ENUMS, ids=lambda c: c.__name__)
 def test_name_equals_value(cls):
     for m in cls:
@@ -163,6 +166,7 @@ def test_enum_uses_strenum(cls):
 
 # --- RuleStatus / StaticApplicability 分离 ---
 
+
 def test_rulestatus_excludes_not_applicable():
     names = {m.name for m in RuleStatus}
     values = {m.value for m in RuleStatus}
@@ -183,6 +187,7 @@ def test_not_applicable_only_in_staticapplicability():
 
 
 # --- specstyle.domain 不 re-export ---
+
 
 def test_domain_package_does_not_reexport_enums():
     import specstyle.domain as dom

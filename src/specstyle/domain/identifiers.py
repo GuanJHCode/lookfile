@@ -7,6 +7,7 @@ frozen+slots、hashable、无 __dict__；具体类型隔离；to/from_primitive 
   非法值抛 DomainError，不 strip、不改大小写。
 - Sha256：严格 64 hex，规范为小写；不做 hash 计算，仅校验与存储。
 """
+
 from __future__ import annotations
 
 import re
