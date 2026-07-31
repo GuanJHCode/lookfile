@@ -37,6 +37,8 @@ class DiffusersBackend:
             raise DomainError("invalid generation request")
         if self.cancelled:
             raise DomainError("generation cancelled")
+        if self.graph.profile != "production":
+            raise DomainError("diffusers backend requires production graph")
         if request.generation_profile != "production":
             raise DomainError("diffusers backend is production-only")
         params = request.execution_parameters

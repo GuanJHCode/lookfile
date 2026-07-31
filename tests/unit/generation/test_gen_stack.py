@@ -118,3 +118,62 @@ def test_mock_diffusers_backend_parameter_mapping() -> None:
     assert artifact.content.startswith(b"\x89PNG")
     assert pipe.calls
     assert pipe.calls[0]["generator_seed"] == request.seed.seed
+
+
+def test_family_mismatch_blocked() -> None:
+    reg = ModelRegistry(
+        (
+            ModelDescriptor(
+                "base1", "base", "rev1", _sha("1"), "Apache-2.0", "APPROVED", "sdxl"
+            ),
+            ModelDescriptor(
+                "ip1",
+                "ip_adapter",
+                "rev1",
+                _sha("2"),
+                "Apache-2.0",
+                "APPROVED",
+                "other",
+            ),
+            ModelDescriptor(
+                "cn1", "controlnet", "rev1", _sha("3"), "Apache-2.0", "APPROVED", "sdxl"
+            ),
+        )
+    )
+    factory = PipelineFactory(reg, Path("cache"))
+    with pytest.raises(DomainError, match="family"):
+        factory.build_production("base1", "ip1", "cn1")
+
+
+def test_blocked_license_not_production() -> None:
+    reg = ModelRegistry(
+        (
+            ModelDescriptor(
+                "base1", "base", "rev1", _sha("1"), "Proprietary", "BLOCKED", "sdxl"
+            ),
+        )
+    )
+    with pytest.raises(DomainError, match="BLOCKED"):
+        reg.require_production("base1")
+
+
+def test_preview_backend_rejects_production_profile() -> None:
+    from specstyle.generation.pipeline_factory import PipelineGraph
+    from specstyle.generation.preview import PreviewBackend, StrengthMapping
+    from tests.unit.exporting.test_manifest import _production_request
+
+    reg = _registry()
+    factory = PipelineFactory(reg, Path("cache"))
+    g = factory.build_preview("base1", "ip1", "cn1", "prev1")
+    pgraph = PipelineGraph(
+        "preview", g.base, g.ip_adapter, g.controlnet, g.preview_adapter, g.cache_root
+    )
+
+    class Stub:
+        def generate(self, request):  # pragma: no cover
+            raise AssertionError("should not be called")
+
+    prev = PreviewBackend(pgraph, Stub(), StrengthMapping("map-v1", 4, 30, 0.0, 5.0))
+    req = _production_request()
+    with pytest.raises(DomainError, match="preview"):
+        prev.generate(req)
