@@ -24,11 +24,17 @@ def combine_geometry_and_features(
             RULE_PRODUCT_INSTANCE, RuleStatus.UNVERIFIABLE, (artifact_id,), None
         )
     if geometry.status is RuleStatus.FAIL or features.status is RuleStatus.FAIL:
-        score = None
-        if geometry.score is not None and features.score is not None:
-            score = min(geometry.score, features.score)
+        score = _combine_scores(geometry.score, features.score)
         return RuleResult(RULE_PRODUCT_INSTANCE, RuleStatus.FAIL, (artifact_id,), score)
-    score = 1.0
-    if geometry.score is not None and features.score is not None:
-        score = min(geometry.score, features.score)
+    score = _combine_scores(geometry.score, features.score)
     return RuleResult(RULE_PRODUCT_INSTANCE, RuleStatus.PASS, (artifact_id,), score)
+
+
+def _combine_scores(a: float | None, b: float | None) -> float | None:
+    if a is not None and b is not None:
+        return min(a, b)
+    if a is not None:
+        return a
+    if b is not None:
+        return b
+    return None

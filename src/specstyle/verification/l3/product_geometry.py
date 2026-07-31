@@ -78,9 +78,9 @@ class ProductGeometryPlugin:
             )
         ref = self._refs.get_mask(artifact_id)
         if ref is None:
-            # geometry without reference: coverage-only PASS
+            # Mask reference unavailable → UNVERIFIABLE (never silent PASS).
             return RuleResult(
-                RULE_PRODUCT_GEOMETRY, RuleStatus.PASS, (artifact_id,), cov
+                RULE_PRODUCT_GEOMETRY, RuleStatus.UNVERIFIABLE, (artifact_id,), cov
             )
         ref_reason = validate_mask_for_image(ref, self._size)
         if ref_reason is not None:

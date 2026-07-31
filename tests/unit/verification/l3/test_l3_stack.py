@@ -50,6 +50,22 @@ def test_geometry_iou_and_coverage() -> None:
     assert mask_iou(m, ref) == 1.0
 
 
+def test_missing_reference_mask_unverifiable_not_pass() -> None:
+    aid = ArtifactId("a1")
+    m = _mask(4, 4, {(1, 1), (2, 1), (1, 2), (2, 2)})
+    plugin = ProductGeometryPlugin(
+        DictMaskProvider({aid: m}),
+        DictMaskProvider({}),  # no reference
+        (4, 4),
+        min_coverage=0.1,
+        max_coverage=0.5,
+    )
+    ctx = DomainContext("product_instance", "product_geometry", "v1")
+    result = plugin.verify(aid, ctx)
+    assert result.status is RuleStatus.UNVERIFIABLE
+    assert result.status is not RuleStatus.PASS
+
+
 def test_features_and_composite() -> None:
     aid = ArtifactId("a1")
     m = _mask(2, 2, {(0, 0), (1, 0)})
@@ -70,3 +86,38 @@ def test_features_and_composite() -> None:
     )
     assert bad.status is RuleStatus.FAIL
     assert combine_geometry_and_features(aid, geo, bad).status is RuleStatus.FAIL
+
+
+def test_empty_mask_unverifiable_not_pass() -> None:
+    from specstyle.verification.l3.mask_provider import validate_mask_for_image
+
+    empty = _mask(4, 4, set())
+    assert validate_mask_for_image(empty, (4, 4)) == "MASK_EMPTY"
+    aid = ArtifactId("empty")
+    plugin = ProductGeometryPlugin(
+        DictMaskProvider({aid: empty}),
+        DictMaskProvider({}),
+        (4, 4),
+    )
+    ctx = DomainContext("product_instance", "product_geometry", "v1")
+    result = plugin.verify(aid, ctx)
+    assert result.status is RuleStatus.UNVERIFIABLE
+    assert result.status is not RuleStatus.PASS
+
+
+def test_mask_size_mismatch_unverifiable() -> None:
+    from specstyle.verification.l3.mask_provider import validate_mask_for_image
+
+    m = _mask(2, 2, {(0, 0)})
+    assert validate_mask_for_image(m, (4, 4)) == "MASK_SIZE_MISMATCH"
+
+
+def test_composite_unverifiable_if_any_component_unverifiable() -> None:
+    from specstyle.domain.identifiers import RuleId
+    from specstyle.verification.rule_models import RuleResult
+
+    aid = ArtifactId("a1")
+    geo = RuleResult(RuleId("g"), RuleStatus.UNVERIFIABLE, (aid,), None)
+    feat = RuleResult(RuleId("f"), RuleStatus.PASS, (aid,), 1.0)
+    out = combine_geometry_and_features(aid, geo, feat)
+    assert out.status is RuleStatus.UNVERIFIABLE
