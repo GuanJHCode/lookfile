@@ -96,3 +96,39 @@ def test_results_deterministic() -> None:
     a = check_pixels(aid, data)
     b = check_pixels(aid, data)
     assert a == b
+
+
+def test_decode_rejects_multi_frame_gif() -> None:
+    """Multi-frame must hard-fail via shipped rule_decode (not aesthetic)."""
+    frames = [Image.new("RGB", (16, 16), c) for c in ((10, 0, 0), (0, 10, 0))]
+    buf = BytesIO()
+    frames[0].save(
+        buf,
+        format="GIF",
+        save_all=True,
+        append_images=frames[1:],
+        duration=100,
+        loop=0,
+    )
+    data = buf.getvalue()
+    with pytest.raises(DomainError, match="MULTI_FRAME"):
+        decode_png_bytes(data)
+    assert rule_decode(_aid(), data).status is RuleStatus.FAIL
+
+
+def test_low_contrast_not_hard_fail_on_pixels() -> None:
+    """Style-like low contrast must not be L1 hard fail (handoff 禁止)."""
+    # near-uniform gray but not pure black/white
+    data = _png((40, 41, 42), (32, 32))
+    assert check_pixels(_aid(), data).status is RuleStatus.PASS
+
+
+def test_l1_verifier_wrong_dimensions_fail_not_pass() -> None:
+    data = _png((1, 2, 3), (32, 32))
+    aid = _aid("dim")
+    ref = ArtifactRef(aid, hash_bytes(data))
+    verifier = L1HardVerifier({aid: data}, (64, 64))
+    results = run_verifier(verifier, (ref,), l1_hard_rule_definitions())
+    by_rule = {r.rule_id.value: r for r in results}
+    assert by_rule["L1_DIMENSIONS"].status is RuleStatus.FAIL
+    assert by_rule["L1_DIMENSIONS"].affected_artifact_ids == (aid,)

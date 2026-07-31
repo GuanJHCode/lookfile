@@ -71,3 +71,19 @@ def test_soft_quality_warning_not_hard() -> None:
         ).status
         is RuleStatus.WARNING
     )
+    # Soft never returns FAIL (not a hard gate).
+    for status in (
+        soft_quality_warnings(
+            aid, blur_score=None, exposure_score=None, contrast_score=None
+        ).status,
+        soft_quality_warnings(
+            aid, blur_score=0.01, exposure_score=0.99, contrast_score=0.01
+        ).status,
+    ):
+        assert status is not RuleStatus.FAIL
+
+
+def test_layout_empty_bbox_tuple_fails() -> None:
+    aid = ArtifactId("a1")
+    zone = SafeZone(0.1, 0.1, 0.9, 0.9)
+    assert check_layout(aid, (), zone).status is RuleStatus.FAIL
