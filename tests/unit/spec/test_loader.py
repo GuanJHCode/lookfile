@@ -17,7 +17,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from specstyle.errors import DomainError, InfrastructureError
+from specstyle.errors import DomainError
 from specstyle.spec.loader import (
     MAX_SPEC_BYTES,
     MAX_YAML_DEPTH,
