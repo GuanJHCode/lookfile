@@ -511,3 +511,34 @@ def test_i007_approved_file_hash_matches_manifest_and_content() -> None:
         assert entry["sha256"] == f.sha256.value
         assert entry["size_bytes"] == f.size_bytes
         assert f.sha256 == hash_bytes(f.content)
+
+
+def test_rejected_artifact_routed_to_rejected_path() -> None:
+    request = _production_request()
+    artifact = run_generation(FakeBackend(), request)
+    plan = request.compiled_spec.verification_plans[0]
+    report = VerificationReport(
+        (artifact.ref,),
+        plan.applicable_rule_definitions,
+        tuple(
+            RuleResult(rule.rule_id, RuleStatus.FAIL, (artifact.ref.artifact_id,), None)
+            for rule in plan.applicable_rule_definitions
+        ),
+    )
+    history = start_repair_history(request, artifact, report)
+    decision = decide_artifact(
+        report,
+        artifact.ref.artifact_id,
+        repair_stop_reason=RepairStopReason.NO_IMPROVEMENT,
+    )
+    item = ExportItem(history, RepairTerminal(decision, None), None)
+    cohort = ExportCohort("xhs_grid", report, (item,))
+    prepared = _prepare_export(ExportRequest((cohort,), _env(), _credits(request)))
+    rejected = [
+        f for f in prepared.payload_files if f.relative_path.startswith("rejected/")
+    ]
+    assert len(rejected) == 1
+    assert rejected[0].relative_path.startswith("rejected/source/")
+    assert not any(
+        f.relative_path.startswith("approved/") for f in prepared.payload_files
+    )
