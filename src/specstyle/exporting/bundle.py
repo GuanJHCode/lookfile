@@ -5,12 +5,16 @@ fsync、写后 readback、Linux ``renameat2(RENAME_NOREPLACE)`` 与 macOS
 ``renameatx_np(RENAME_EXCL)`` 原子发布、安全 cleanup 与 ``ExportBundle``。
 不使用 Path convenience、``resolve``、``shutil`` 或普通 rename fallback；
 不重跑 verifier 或修改 gate。
+
+只从 ``manifest`` 导入冻结 public/prepared ABI；canonical parse 在本模块
+内联实现，不直接依赖 ``qa_report``（§13.2 ABI 边界）。
 """
 
 from __future__ import annotations
 
 import ctypes
 import errno
+import json
 import os
 import re
 import stat
@@ -34,6 +38,9 @@ _ALWAYS_ON_DIRS = (
 )
 _RENAME_EXCL = 0x00000004
 _RENAME_NOREPLACE = 1
+_DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+_FILE_WRITE_FLAGS = os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+_FILE_READ_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,6 +59,12 @@ class ExportBundle:
     payload_sha256: Sha256
     bundle_sha256: Sha256
     files: tuple[ExportedFile, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _NodeIdentity:
+    st_dev: int
+    st_ino: int
 
 
 def _invalid_target() -> None:
@@ -80,10 +93,6 @@ def _sync_failed(cause: BaseException) -> None:
 
 def _publication_unavailable(cause: BaseException | None) -> None:
     raise InfrastructureError("secure atomic publication unavailable") from cause
-
-
-def _publish_failed(cause: BaseException) -> None:
-    raise InfrastructureError("export publish failed") from cause
 
 
 def _validate_bundle_name(bundle_name: object) -> str:
@@ -189,30 +198,68 @@ def _create_staging(root_dup: int, root_st: os.stat_result) -> tuple[int, str]:
 
 
 def _open_dir(parent_fd: int, name: str) -> int:
-    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
     try:
-        return os.open(name, flags, dir_fd=parent_fd)
+        return os.open(name, _DIR_FLAGS, dir_fd=parent_fd)
     except OSError as cause:
         _readback_failed(cause)
 
 
-def _mkdir_rel(staging_fd: int, parts: tuple[str, ...]) -> None:
+def _open_parent_chain(root_fd: int, parts: tuple[str, ...]) -> tuple[list[int], int]:
+    """沿 held dirfd 逐组件 O_NOFOLLOW 打开父目录，返回 (opened, leaf_parent)."""
+    parent = root_fd
+    opened: list[int] = []
+    for component in parts:
+        try:
+            child = os.open(component, _DIR_FLAGS, dir_fd=parent)
+        except OSError:
+            _close_fds(opened)
+            raise
+        opened.append(child)
+        parent = child
+    return opened, parent
+
+
+def _close_fds(opened: list[int]) -> None:
+    for fd in reversed(opened):
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def _mkdir_rel(
+    staging_fd: int, parts: tuple[str, ...], dir_ids: dict[str, _NodeIdentity]
+) -> None:
     parent = staging_fd
     opened: list[int] = []
+    prefix: list[str] = []
     try:
         for component in parts:
+            prefix.append(component)
+            rel = "/".join(prefix)
             try:
                 os.mkdir(component, 0o700, dir_fd=parent)
             except FileExistsError:
                 pass
             except OSError as cause:
                 _write_failed(cause)
-            child = _open_dir(parent, component)
+            try:
+                child = os.open(component, _DIR_FLAGS, dir_fd=parent)
+            except OSError as cause:
+                _write_failed(cause)
+            try:
+                st = os.fstat(child)
+            except OSError as cause:
+                os.close(child)
+                _write_failed(cause)
+            if not stat.S_ISDIR(st.st_mode):
+                os.close(child)
+                _write_failed(InfrastructureError("directory became non-dir"))
+            dir_ids[rel] = _NodeIdentity(st.st_dev, st.st_ino)
             opened.append(child)
             parent = child
     finally:
-        for fd in reversed(opened):
-            os.close(fd)
+        _close_fds(opened)
 
 
 def _dir_parents(rel_path: str) -> list[tuple[str, ...]]:
@@ -220,32 +267,54 @@ def _dir_parents(rel_path: str) -> list[tuple[str, ...]]:
     return [parts[: i + 1] for i in range(len(parts) - 1)]
 
 
-def _write_file(staging_fd: int, rel_path: str, content: bytes) -> None:
-    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+def _write_file(
+    staging_fd: int, rel_path: str, content: bytes, file_ids: dict[str, _NodeIdentity]
+) -> None:
+    parts = tuple(rel_path.split("/"))
     try:
-        fd = os.open(rel_path, flags, 0o600, dir_fd=staging_fd)
+        opened, parent = _open_parent_chain(staging_fd, parts[:-1])
     except OSError as cause:
         _write_failed(cause)
     try:
-        written = 0
-        total = len(content)
-        while written < total:
+        try:
+            fd = os.open(parts[-1], _FILE_WRITE_FLAGS, 0o600, dir_fd=parent)
+        except OSError as cause:
+            _write_failed(cause)
+        try:
+            written = 0
+            total = len(content)
+            while written < total:
+                try:
+                    chunk = os.write(fd, content[written:])
+                except OSError as cause:
+                    _write_failed(cause)
+                if type(chunk) is not int or chunk <= 0:
+                    _write_failed(InfrastructureError("short write returned zero"))
+                written += chunk
             try:
-                chunk = os.write(fd, content[written:])
+                os.fsync(fd)
+            except OSError as cause:
+                _sync_failed(cause)
+            try:
+                st = os.fstat(fd)
             except OSError as cause:
                 _write_failed(cause)
-            if type(chunk) is not int or chunk <= 0:
-                _write_failed(InfrastructureError("short write returned zero"))
-            written += chunk
-        try:
-            os.fsync(fd)
-        except OSError as cause:
-            _sync_failed(cause)
+            if not stat.S_ISREG(st.st_mode):
+                _write_failed(InfrastructureError("file became non-regular"))
+            file_ids[rel_path] = _NodeIdentity(st.st_dev, st.st_ino)
+        finally:
+            os.close(fd)
     finally:
-        os.close(fd)
+        _close_fds(opened)
 
 
 def _fsync_dir(staging_fd: int, parts: tuple[str, ...]) -> None:
+    if not parts:
+        try:
+            os.fsync(staging_fd)
+        except OSError as cause:
+            _sync_failed(cause)
+        return
     parent = staging_fd
     opened: list[int] = []
     try:
@@ -259,35 +328,41 @@ def _fsync_dir(staging_fd: int, parts: tuple[str, ...]) -> None:
             except OSError as cause:
                 _sync_failed(cause)
     finally:
-        for fd in reversed(opened):
-            os.close(fd)
+        _close_fds(opened)
 
 
 def _readback_file(staging_fd: int, rel_path: str, expected: bytes) -> None:
-    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+    parts = tuple(rel_path.split("/"))
     try:
-        fd = os.open(rel_path, flags, dir_fd=staging_fd)
+        opened, parent = _open_parent_chain(staging_fd, parts[:-1])
     except OSError as cause:
         _readback_failed(cause)
     try:
-        st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode):
-            _hash_mismatch()
-        data = b""
-        while len(data) < st.st_size:
-            try:
-                block = os.read(fd, 1 << 20)
-            except OSError as cause:
-                _readback_failed(cause)
-            if not block:
-                break
-            data += block
-        if len(data) != st.st_size:
-            _readback_failed(InfrastructureError("short read"))
-        if data != expected or hash_bytes(data) != hash_bytes(expected):
-            _hash_mismatch()
+        try:
+            fd = os.open(parts[-1], _FILE_READ_FLAGS, dir_fd=parent)
+        except OSError as cause:
+            _readback_failed(cause)
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                _hash_mismatch()
+            data = b""
+            while len(data) < st.st_size:
+                try:
+                    block = os.read(fd, 1 << 20)
+                except OSError as cause:
+                    _readback_failed(cause)
+                if not block:
+                    break
+                data += block
+            if len(data) != st.st_size:
+                _readback_failed(InfrastructureError("short read"))
+            if data != expected or hash_bytes(data) != hash_bytes(expected):
+                _hash_mismatch()
+        finally:
+            os.close(fd)
     finally:
-        os.close(fd)
+        _close_fds(opened)
 
 
 def _readback_png(content: bytes, resolution: tuple[int, int]) -> None:
@@ -304,6 +379,59 @@ def _readback_png(content: bytes, resolution: tuple[int, int]) -> None:
             _hash_mismatch()
 
 
+def _reject_duplicate_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    seen: set[str] = set()
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if type(key) is not str or key in seen:
+            raise DomainError("export invariant violation")
+        seen.add(key)
+        result[key] = value
+    return result
+
+
+def _parse_strict(data: bytes) -> object:
+    if type(data) is not bytes:
+        raise DomainError("export invariant violation")
+    try:
+        return json.loads(
+            data,
+            object_pairs_hook=_reject_duplicate_pairs,
+            parse_constant=lambda _: (_ for _ in ()).throw(
+                DomainError("export invariant violation")
+            ),
+        )
+    except UnicodeDecodeError:
+        raise DomainError("export invariant violation") from None
+    except json.JSONDecodeError:
+        raise DomainError("export invariant violation") from None
+
+
+def _canonical_json_bytes(primitive: object) -> bytes:
+    def normalize(value: object) -> object:
+        if type(value) is float:
+            return 0.0 if value == 0.0 else value
+        if type(value) is dict:
+            return {k: normalize(v) for k, v in value.items()}
+        if type(value) is list:
+            return [normalize(v) for v in value]
+        return value
+
+    return json.dumps(
+        normalize(primitive),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def _assert_canonical_round_trip(data: bytes) -> None:
+    parsed = _parse_strict(data)
+    if _canonical_json_bytes(parsed) != data:
+        raise DomainError("export invariant violation")
+
+
 def export_bundle(
     request: ExportRequest, target_root_fd: int, bundle_name: str, /
 ) -> ExportBundle:
@@ -313,19 +441,16 @@ def export_bundle(
         root_st = os.fstat(root_dup)
         prepared = _prepare_export(request)
         staging_fd, staging_name = _create_staging(root_dup, root_st)
-        expected_dirs: set[str] = set()
-        expected_files: set[str] = set()
+        dir_ids: dict[str, _NodeIdentity] = {}
+        file_ids: dict[str, _NodeIdentity] = {}
         committed = False
         try:
             for parts in _ALWAYS_ON_DIRS:
-                _mkdir_rel(staging_fd, parts)
-                expected_dirs.add("/".join(parts))
+                _mkdir_rel(staging_fd, parts, dir_ids)
             for f in (*prepared.payload_files, prepared.manifest_file):
                 for parents in _dir_parents(f.relative_path):
-                    _mkdir_rel(staging_fd, parents)
-                    expected_dirs.add("/".join(parents))
-                expected_files.add(f.relative_path)
-                _write_file(staging_fd, f.relative_path, f.content)
+                    _mkdir_rel(staging_fd, parents, dir_ids)
+                _write_file(staging_fd, f.relative_path, f.content, file_ids)
             for f in (*prepared.payload_files, prepared.manifest_file):
                 parents = tuple(f.relative_path.split("/")[:-1])
                 if parents:
@@ -333,7 +458,7 @@ def export_bundle(
             for parts in _ALWAYS_ON_DIRS:
                 _fsync_dir(staging_fd, parts)
             _fsync_dir(staging_fd, ())
-            _readback(staging_fd, prepared, expected_dirs | expected_files)
+            _readback(staging_fd, prepared, set(dir_ids) | set(file_ids))
             _native_rename(root_dup, staging_name, root_dup, bundle_name)
             committed = True
             try:
@@ -348,8 +473,8 @@ def export_bundle(
                     staging_fd,
                     root_dup,
                     staging_name,
-                    frozenset(expected_files),
-                    frozenset(expected_dirs),
+                    file_ids,
+                    dir_ids,
                 )
             raise
         finally:
@@ -377,16 +502,14 @@ def export_bundle(
 
 
 def _readback(staging_fd, prepared, expected: set[str]) -> None:
-    from specstyle.exporting import qa_report as _qa
-
     manifest = prepared.manifest_file
     _readback_file(staging_fd, manifest.relative_path, manifest.content)
-    _qa.assert_canonical_round_trip(manifest.content)
+    _assert_canonical_round_trip(manifest.content)
     res_by_path = _resolution_by_path(manifest.content)
     for f in prepared.payload_files:
         _readback_file(staging_fd, f.relative_path, f.content)
         if f.relative_path.endswith(".json") or f.relative_path.endswith(".yaml"):
-            _qa.assert_canonical_round_trip(f.content)
+            _assert_canonical_round_trip(f.content)
         if f.relative_path.endswith(".png"):
             resolution = res_by_path.get(f.relative_path)
             if resolution is None:
@@ -396,14 +519,36 @@ def _readback(staging_fd, prepared, expected: set[str]) -> None:
 
 
 def _resolution_by_path(manifest_bytes: bytes) -> dict[str, tuple[int, int]]:
-    import json
-
-    manifest = json.loads(manifest_bytes)
+    manifest = _parse_strict(manifest_bytes)
+    if type(manifest) is not dict:
+        _hash_mismatch()
     result: dict[str, tuple[int, int]] = {}
-    for cohort in manifest["cohorts"]:
-        for item in cohort["items"]:
-            path = item["final_artifact"]["relative_path"]
-            result[path] = tuple(item["initial_attempt"]["graph"]["resolution"])
+    cohorts = manifest.get("cohorts")
+    if type(cohorts) is not list:
+        _hash_mismatch()
+    for cohort in cohorts:
+        if type(cohort) is not dict:
+            _hash_mismatch()
+        items = cohort.get("items")
+        if type(items) is not list:
+            _hash_mismatch()
+        for item in items:
+            if type(item) is not dict:
+                _hash_mismatch()
+            final = item.get("final_artifact")
+            initial = item.get("initial_attempt")
+            if type(final) is not dict or type(initial) is not dict:
+                _hash_mismatch()
+            path = final.get("relative_path")
+            graph = initial.get("graph")
+            if type(path) is not str or type(graph) is not dict:
+                _hash_mismatch()
+            resolution = graph.get("resolution")
+            if type(resolution) is not list or len(resolution) != 2:
+                _hash_mismatch()
+            if type(resolution[0]) is not int or type(resolution[1]) is not int:
+                _hash_mismatch()
+            result[path] = (resolution[0], resolution[1])
     return result
 
 
@@ -434,79 +579,82 @@ def _walk(fd: int, prefix: str, seen: set[str]) -> None:
                 os.close(child)
 
 
-def _open_chain(root: int, parts: tuple[str, ...]) -> tuple[list[int], int]:
-    parent = root
-    opened: list[int] = []
-    for component in parts:
-        try:
-            child = os.open(
-                component,
-                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
-                dir_fd=parent,
-            )
-        except OSError:
-            for fd in reversed(opened):
-                try:
-                    os.close(fd)
-                except OSError:
-                    pass
-            raise
-        opened.append(child)
-        parent = child
-    return opened, parent
-
-
-def _close_fds(opened: list[int]) -> None:
-    for fd in reversed(opened):
-        try:
-            os.close(fd)
-        except OSError:
-            pass
-
-
 def _safe_cleanup(
     staging_fd: int,
     root_dup: int,
     staging_name: str,
-    expected_files: frozenset[str],
-    expected_dirs: frozenset[str],
+    file_ids: dict[str, _NodeIdentity],
+    dir_ids: dict[str, _NodeIdentity],
 ) -> None:
-    """pre-commit cleanup：只遍历 expected inventory，发现额外 entry/类型变化/symlink/
-    OSError 时停止并保留整个隐藏 staging；绝不清理 final。"""
-    seen: set[str] = set()
+    """pre-commit cleanup：只遍历 expected inventory，确认类型/inode 后删除。
+
+    发现额外 entry、类型/inode 变化、symlink 或任何 OSError 时停止并保留整个
+    隐藏 staging；绝不清理 final。cleanup 错误不得遮蔽 primary exception。
+    """
     try:
-        _walk(staging_fd, "", seen)
+        seen: set[str] = set()
+        try:
+            _walk(staging_fd, "", seen)
+        except Exception:
+            return
+        expected = set(file_ids) | set(dir_ids)
+        if seen != expected:
+            return
+        for rel in sorted(file_ids, key=lambda p: p.count("/"), reverse=True):
+            if not _unlink_expected_file(staging_fd, rel, file_ids[rel]):
+                return
+        for parts in sorted(
+            {tuple(d.split("/")) for d in dir_ids},
+            key=lambda p: (-len(p), p),
+        ):
+            if not _rmdir_expected(staging_fd, parts, dir_ids["/".join(parts)]):
+                return
+        try:
+            os.rmdir(staging_name, dir_fd=root_dup)
+        except OSError:
+            pass
     except Exception:
         return
-    if seen != (expected_files | expected_dirs):
-        return
-    for rel in sorted(expected_files, key=lambda p: p.count("/"), reverse=True):
-        parts = tuple(rel.split("/"))
-        opened, parent = _open_chain(staging_fd, parts[:-1])
+
+
+def _unlink_expected_file(staging_fd: int, rel: str, identity: _NodeIdentity) -> bool:
+    parts = tuple(rel.split("/"))
+    try:
+        opened, parent = _open_parent_chain(staging_fd, parts[:-1])
+    except OSError:
+        return False
+    try:
         try:
             st = os.stat(parts[-1], dir_fd=parent, follow_symlinks=False)
             if not stat.S_ISREG(st.st_mode):
-                return
+                return False
+            if st.st_dev != identity.st_dev or st.st_ino != identity.st_ino:
+                return False
             os.unlink(parts[-1], dir_fd=parent)
         except OSError:
-            return
-        finally:
-            _close_fds(opened)
-    for parts in sorted(
-        {tuple(d.split("/")) for d in expected_dirs},
-        key=lambda p: (-len(p), p),
-    ):
-        opened, parent = _open_chain(staging_fd, parts[:-1])
+            return False
+    finally:
+        _close_fds(opened)
+    return True
+
+
+def _rmdir_expected(
+    staging_fd: int, parts: tuple[str, ...], identity: _NodeIdentity
+) -> bool:
+    try:
+        opened, parent = _open_parent_chain(staging_fd, parts[:-1])
+    except OSError:
+        return False
+    try:
         try:
             st = os.stat(parts[-1], dir_fd=parent, follow_symlinks=False)
             if not stat.S_ISDIR(st.st_mode):
-                return
+                return False
+            if st.st_dev != identity.st_dev or st.st_ino != identity.st_ino:
+                return False
             os.rmdir(parts[-1], dir_fd=parent)
         except OSError:
-            return
-        finally:
-            _close_fds(opened)
-    try:
-        os.rmdir(staging_name, dir_fd=root_dup)
-    except OSError:
-        pass
+            return False
+    finally:
+        _close_fds(opened)
+    return True

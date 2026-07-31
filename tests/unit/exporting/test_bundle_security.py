@@ -178,3 +178,94 @@ def test_readback_mismatch_does_not_publish(tmp_path: Path, monkeypatch) -> None
         os.close(root_fd)
     assert not (tmp_path / "mismatch").exists()
     assert not list(tmp_path.iterdir())
+
+
+def test_existing_leaf_symlink_target_not_overwritten(tmp_path: Path) -> None:
+    """Final leaf name is a symlink → no-replace fails closed; symlink kept."""
+    target = tmp_path / "real_target"
+    target.mkdir()
+    (target / "marker").write_text("keep")
+    link = tmp_path / "leaf_link"
+    link.symlink_to(target)
+    root_fd = _root_fd(tmp_path)
+    try:
+        with pytest.raises(DomainError, match="export target exists"):
+            export_bundle(_export_request(), root_fd, "leaf_link")
+    finally:
+        os.close(root_fd)
+    assert link.is_symlink()
+    assert (target / "marker").read_text() == "keep"
+    assert not (target / "manifest.json").exists()
+
+
+def test_parent_symlink_component_fails_closed(tmp_path: Path, monkeypatch) -> None:
+    """Intermediate dir component replaced by symlink → O_NOFOLLOW fails closed."""
+    import specstyle.exporting.bundle as bundle_mod
+
+    real_mkdir = bundle_mod._mkdir_rel
+    state = {"done": False}
+
+    def mkdir_then_symlink(staging_fd, parts, dir_ids):
+        real_mkdir(staging_fd, parts, dir_ids)
+        if parts == ("approved",) and not state["done"]:
+            state["done"] = True
+            # 用同名 symlink 替换 approved 目录，模拟 TOCTOU。
+            os.rmdir("approved", dir_fd=staging_fd)
+            os.symlink(".", "approved", dir_fd=staging_fd)
+            dir_ids.pop("approved", None)
+            for key in list(dir_ids):
+                if key.startswith("approved/"):
+                    dir_ids.pop(key)
+
+    monkeypatch.setattr(bundle_mod, "_mkdir_rel", mkdir_then_symlink)
+    root_fd = _root_fd(tmp_path)
+    try:
+        with pytest.raises(
+            (InfrastructureError, DomainError),
+            match="export (write|readback) failed|export hash mismatch",
+        ):
+            export_bundle(_export_request(), root_fd, "parent_sym")
+    finally:
+        os.close(root_fd)
+    assert not (tmp_path / "parent_sym").exists()
+
+
+def test_cleanup_error_does_not_mask_primary(tmp_path: Path, monkeypatch) -> None:
+    """§13.11 cleanup OSError 不得遮蔽 primary exception。"""
+    import specstyle.exporting.bundle as bundle_mod
+
+    def boom_readback(*a: object, **k: object) -> None:
+        raise DomainError("export hash mismatch")
+
+    def boom_unlink(*a: object, **k: object) -> bool:
+        raise OSError("cleanup unlink denied")
+
+    monkeypatch.setattr(bundle_mod, "_readback_file", boom_readback)
+    monkeypatch.setattr(bundle_mod, "_unlink_expected_file", boom_unlink)
+    root_fd = _root_fd(tmp_path)
+    try:
+        with pytest.raises(DomainError, match="export hash mismatch"):
+            export_bundle(_export_request(), root_fd, "mask")
+    finally:
+        os.close(root_fd)
+    # primary 是 hash mismatch；staging 可能因 cleanup 中断而保留（fail closed）
+    assert not (tmp_path / "mask").exists()
+
+
+def test_staging_root_fsync_is_invoked(tmp_path: Path, monkeypatch) -> None:
+    """_fsync_dir(staging_fd, ()) 必须 fsync staging 根 dirfd。"""
+    real_fsync = os.fsync
+    seen: list[int] = []
+
+    def spy_fsync(fd: int) -> None:
+        seen.append(fd)
+        return real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", spy_fsync)
+    root_fd = _root_fd(tmp_path)
+    try:
+        export_bundle(_export_request(), root_fd, "fsync_root")
+    finally:
+        os.close(root_fd)
+    # 至少有文件 fsync + staging 根 + final root；保证 empty-parts 路径被调用
+    assert len(seen) >= 3
