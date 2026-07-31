@@ -9,6 +9,7 @@ load_style_spec_file：路径安全（相对/无 ../逐组件拒 symlink/resolve
 异常：不存在/路径政策违反/输入错误=DomainError；权限/设备/短读/其它非输入 OSError=InfrastructureError（保 chain）。
 错误消息不含完整私密绝对路径、YAML 原文或字段值。
 """
+
 from __future__ import annotations
 
 import stat
@@ -22,7 +23,7 @@ from yaml.events import AliasEvent
 from pydantic import ValidationError
 
 from specstyle.errors import DomainError, InfrastructureError
-from specstyle.spec.models import StyleSpecV1
+from specstyle.spec.models import StyleSpec, StyleSpecV1, StyleSpecV11
 
 MAX_SPEC_BYTES = 1_048_576
 MAX_YAML_DEPTH = 32
@@ -79,7 +80,21 @@ def _list_to_tuple(obj: Any) -> Any:
     return obj
 
 
-def load_style_spec_text(text: str | bytes, *, max_bytes: int = MAX_SPEC_BYTES) -> StyleSpecV1:
+def _validate_style_spec(data: dict[str, Any]) -> StyleSpec:
+    version = data.get("schema_version")
+    try:
+        if version == "1.0":
+            return StyleSpecV1(**data)
+        if version == "1.1":
+            return StyleSpecV11(**data)
+    except ValidationError:
+        raise DomainError("spec failed schema validation") from None
+    raise DomainError("spec failed schema validation") from None
+
+
+def load_style_spec_text(
+    text: str | bytes, *, max_bytes: int = MAX_SPEC_BYTES
+) -> StyleSpec:
     if isinstance(text, str):
         raw = text.encode("utf-8")
     elif isinstance(text, (bytes, bytearray)):
@@ -113,10 +128,7 @@ def load_style_spec_text(text: str | bytes, *, max_bytes: int = MAX_SPEC_BYTES) 
         raise DomainError("YAML root must be a mapping")
 
     data = _list_to_tuple(data)
-    try:
-        return StyleSpecV1(**data)
-    except ValidationError:
-        raise DomainError("spec failed schema validation") from None
+    return _validate_style_spec(data)
 
 
 def load_style_spec_file(
@@ -124,7 +136,7 @@ def load_style_spec_file(
     relative_path: str | Path,
     *,
     max_bytes: int = MAX_SPEC_BYTES,
-) -> StyleSpecV1:
+) -> StyleSpec:
     root = Path(allowed_root)
     try:
         root_resolved = root.resolve(strict=True)

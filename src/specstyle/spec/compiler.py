@@ -1,4 +1,4 @@
-"""Pure fail-closed compiler from ``StyleSpecV1`` to immutable execution plans."""
+"""Pure fail-closed compiler from StyleSpec (1.0|1.1) to immutable execution plans."""
 
 from __future__ import annotations
 
@@ -27,17 +27,20 @@ from specstyle.spec.compiled_models import (
     StrengthMappingEntry,
     ThresholdProfileCapability,
 )
-from specstyle.spec.models import StyleSpecV1
+from specstyle.spec.models import StyleSpec, StyleSpecV1, StyleSpecV11
 from specstyle.verification.rule_models import GatePolicy, RuleDefinition
 
 _T = TypeVar("_T")
 
 
 def compile_style_spec(
-    raw: StyleSpecV1, context: CompilerContext, /
+    raw: StyleSpec, context: CompilerContext, /
 ) -> CompiledStyleSpec:
     """Resolve one fully pinned spec without I/O, fallback selection, or mutation."""
-    if type(raw) is not StyleSpecV1 or type(context) is not CompilerContext:
+    if (
+        type(raw) not in (StyleSpecV1, StyleSpecV11)
+        or type(context) is not CompilerContext
+    ):
         raise DomainError("raw and context must have exact contract types")
     runtime = _runtime(raw, context)
     models = _models(raw, context, runtime)
@@ -75,7 +78,7 @@ def _pin_matches(pin: object, identifier: str, revision: str, sha256: str) -> bo
     )
 
 
-def _runtime(raw: StyleSpecV1, context: CompilerContext) -> ResolvedRuntime:
+def _runtime(raw: StyleSpec, context: CompilerContext) -> ResolvedRuntime:
     capability = _one(
         context.runtime_capabilities,
         lambda item: (
@@ -107,7 +110,7 @@ def _runtime(raw: StyleSpecV1, context: CompilerContext) -> ResolvedRuntime:
 
 
 def _models(
-    raw: StyleSpecV1, context: CompilerContext, runtime: ResolvedRuntime
+    raw: StyleSpec, context: CompilerContext, runtime: ResolvedRuntime
 ) -> tuple[ResolvedModel, ResolvedModel, ResolvedModel]:
     specs = (
         ("base", raw.models.base, None),
@@ -150,7 +153,7 @@ def _model_matches(
 
 
 def _encoder(
-    raw: StyleSpecV1, context: CompilerContext, runtime: ResolvedRuntime
+    raw: StyleSpec, context: CompilerContext, runtime: ResolvedRuntime
 ) -> ResolvedEncoder:
     capability = _one(
         context.encoder_capabilities,
@@ -175,7 +178,7 @@ def _encoder(
     )
 
 
-def _mapping(raw: StyleSpecV1, context: CompilerContext) -> StrengthMappingCapability:
+def _mapping(raw: StyleSpec, context: CompilerContext) -> StrengthMappingCapability:
     preset = Identifier(raw.style.preset_id)
     capability = _one(
         context.strength_mappings,
@@ -196,7 +199,7 @@ def _mapping(raw: StyleSpecV1, context: CompilerContext) -> StrengthMappingCapab
 
 
 def _outputs(
-    raw: StyleSpecV1, context: CompilerContext
+    raw: StyleSpec, context: CompilerContext
 ) -> tuple[OutputProfileCapability, ...]:
     return tuple(
         _output(raw.domain.profile, output, context) for output in raw.outputs.profiles
@@ -218,7 +221,7 @@ def _output(
     return capability
 
 
-def _catalog(raw: StyleSpecV1, context: CompilerContext) -> RuleCatalogCapability:
+def _catalog(raw: StyleSpec, context: CompilerContext) -> RuleCatalogCapability:
     return _one(
         context.rule_catalogs,
         lambda item: item.ruleset_version == raw.verification.ruleset_version,
@@ -226,7 +229,7 @@ def _catalog(raw: StyleSpecV1, context: CompilerContext) -> RuleCatalogCapabilit
     )
 
 
-def _validate_catalog(catalog: RuleCatalogCapability, raw: StyleSpecV1) -> None:
+def _validate_catalog(catalog: RuleCatalogCapability, raw: StyleSpec) -> None:
     rules = catalog.rules
     fidelity = tuple(rule for rule in rules if rule.kind == "L2_STYLE_FIDELITY")
     batch = tuple(rule for rule in rules if rule.kind == "L2_BATCH_CONSISTENCY")
@@ -247,7 +250,7 @@ def _validate_catalog(catalog: RuleCatalogCapability, raw: StyleSpecV1) -> None:
 
 
 def _l2_profile(
-    raw: StyleSpecV1,
+    raw: StyleSpec,
     context: CompilerContext,
     encoder: ResolvedEncoder,
     catalog: RuleCatalogCapability,
@@ -279,7 +282,7 @@ def _l2_profile(
 def _expected_metrics(
     rules: tuple[RuleCapability, ...],
     source: str,
-    raw: StyleSpecV1,
+    raw: StyleSpec,
     plugin: L3PluginCapability | None = None,
 ) -> set[Identifier]:
     return {
@@ -297,7 +300,7 @@ def _expected_metrics(
 def _validate_threshold_status(
     profile: ThresholdProfileCapability,
     rules: tuple[RuleCapability, ...],
-    raw: StyleSpecV1,
+    raw: StyleSpec,
     plugin: L3PluginCapability | None = None,
 ) -> None:
     if profile.status == "REVOKED":
@@ -316,7 +319,7 @@ def _validate_threshold_status(
 
 
 def _l3_resolution(
-    raw: StyleSpecV1, context: CompilerContext
+    raw: StyleSpec, context: CompilerContext
 ) -> tuple[L3PluginCapability | None, ThresholdProfileCapability | None]:
     if raw.verification.l3 is None:
         if raw.domain.fidelity_required:
@@ -358,7 +361,7 @@ def _l3_resolution(
 
 
 def _validate_l3(
-    raw: StyleSpecV1,
+    raw: StyleSpec,
     plugin: L3PluginCapability | None,
     profile: ThresholdProfileCapability | None,
 ) -> None:
@@ -377,7 +380,7 @@ def _validate_l3(
 
 
 def _plan(
-    raw: StyleSpecV1,
+    raw: StyleSpec,
     output: OutputProfileCapability,
     catalog: RuleCatalogCapability,
     l2_profile: ThresholdProfileCapability,
@@ -436,7 +439,7 @@ def _plan(
 
 def _compiled_rule(
     rule: RuleCapability,
-    raw: StyleSpecV1,
+    raw: StyleSpec,
     output: str,
     l2_profile: ThresholdProfileCapability,
     plugin: L3PluginCapability | None,
@@ -468,7 +471,7 @@ def _compiled_rule(
     )
 
 
-def _required(rule: RuleCapability, raw: StyleSpecV1) -> bool:
+def _required(rule: RuleCapability, raw: StyleSpec) -> bool:
     return rule.requirement == "always_required" or (
         rule.requirement == "fidelity_required" and raw.domain.fidelity_required
     )
@@ -524,7 +527,7 @@ def _binding(
 
 
 def _validate_l1_coverage(
-    plans: tuple[CompiledVerificationPlan, ...], raw: StyleSpecV1
+    plans: tuple[CompiledVerificationPlan, ...], raw: StyleSpec
 ) -> None:
     for plan, output in zip(plans, raw.outputs.profiles):
         if not any(
@@ -537,7 +540,7 @@ def _validate_l1_coverage(
 
 
 def _graphs(
-    raw: StyleSpecV1,
+    raw: StyleSpec,
     outputs: tuple[OutputProfileCapability, ...],
     runtime: ResolvedRuntime,
     models: tuple[ResolvedModel, ResolvedModel, ResolvedModel],
@@ -556,7 +559,7 @@ def _graphs(
 
 
 def _graph(
-    raw: StyleSpecV1,
+    raw: StyleSpec,
     output: OutputProfileCapability,
     profile: str,
     runtime: ResolvedRuntime,

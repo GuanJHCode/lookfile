@@ -4,6 +4,7 @@
 无业务默认值；collection 保存为 tuple；未列字段禁止。
 字段集合冻结自 master-plan Module 2 合同，L3Config 内部字段对照 spec §4.1。
 """
+
 from __future__ import annotations
 
 import re
@@ -45,8 +46,12 @@ def _safe_text(value: str) -> str:
     return value
 
 
-SafeText = Annotated[str, StringConstraints(min_length=1, max_length=2048), AfterValidator(_safe_text)]
-NameStr = Annotated[str, StringConstraints(min_length=1, max_length=256), AfterValidator(_safe_text)]
+SafeText = Annotated[
+    str, StringConstraints(min_length=1, max_length=2048), AfterValidator(_safe_text)
+]
+NameStr = Annotated[
+    str, StringConstraints(min_length=1, max_length=256), AfterValidator(_safe_text)
+]
 AuthorStr = NameStr
 
 
@@ -58,7 +63,9 @@ def _id_like(value: str) -> str:
 
 IDLike = Annotated[
     str,
-    StringConstraints(min_length=1, max_length=128, pattern=r"[A-Za-z0-9][A-Za-z0-9_-]*"),
+    StringConstraints(
+        min_length=1, max_length=128, pattern=r"[A-Za-z0-9][A-Za-z0-9_-]*"
+    ),
     AfterValidator(_id_like),
 ]
 
@@ -75,7 +82,9 @@ def _rfc3339(value: str) -> str:
     return value
 
 
-Rfc3339Str = Annotated[str, StringConstraints(min_length=1, max_length=64), AfterValidator(_rfc3339)]
+Rfc3339Str = Annotated[
+    str, StringConstraints(min_length=1, max_length=64), AfterValidator(_rfc3339)
+]
 
 
 def _http_url(value: str) -> str:
@@ -84,7 +93,9 @@ def _http_url(value: str) -> str:
     return value
 
 
-HttpUrlStr = Annotated[str, StringConstraints(min_length=1, max_length=2083), AfterValidator(_http_url)]
+HttpUrlStr = Annotated[
+    str, StringConstraints(min_length=1, max_length=2083), AfterValidator(_http_url)
+]
 
 
 def _sha256_adapter(value: str) -> str:
@@ -122,7 +133,9 @@ def _num_coerce(value):
 ScaleValue = Annotated[float, Field(ge=0, le=1), BeforeValidator(_num_coerce)]
 GuidanceValue = Annotated[float, Field(ge=0, le=50), BeforeValidator(_num_coerce)]
 StepsValue = Annotated[int, Field(ge=1, le=200), AfterValidator(_reject_bool)]
-ResolutionMember = Annotated[int, Field(ge=64, le=4096, multiple_of=8), AfterValidator(_reject_bool)]
+ResolutionMember = Annotated[
+    int, Field(ge=64, le=4096, multiple_of=8), AfterValidator(_reject_bool)
+]
 
 
 # --- 模型 ---
@@ -244,9 +257,9 @@ class Domain(BaseModel):
 class Outputs(BaseModel):
     model_config = MODEL_CONFIG
 
-    profiles: tuple[Literal["xhs_grid", "talking_head_cover", "background_sequence"], ...] = Field(
-        min_length=1
-    )
+    profiles: tuple[
+        Literal["xhs_grid", "talking_head_cover", "background_sequence"], ...
+    ] = Field(min_length=1)
 
     @model_validator(mode="after")
     def _no_duplicates(self) -> "Outputs":
@@ -369,3 +382,56 @@ class StyleSpecV1(BaseModel):
     verification: Verification
     repair: Repair
     replay_contract: ReplayContract
+
+
+# --- Style Spec 1.1（contracts §14）---
+
+
+class StyleV11(BaseModel):
+    """1.1 style：在 1.0 Style 上增加 strength_mapping_version pin。"""
+
+    model_config = MODEL_CONFIG
+
+    preset_id: IDLike
+    user_strength: ScaleValue
+    preview_ip_adapter_scale: ScaleValue
+    production_ip_adapter_scale: ScaleValue
+    strength_mapping_version: SafeText
+
+
+class ReplayContractV11(BaseModel):
+    """1.1 replay：增加 environment_policy。"""
+
+    model_config = MODEL_CONFIG
+
+    mode: Literal["semantic"]
+    tolerated_metric_delta: ToleratedDelta
+    new_batch: NewBatch
+    environment_policy: Literal["advisory", "strict"]
+
+
+class StyleSpecV11(BaseModel):
+    model_config = MODEL_CONFIG
+
+    schema_version: Literal["1.1"]
+    schema_uri: Literal["schemas/style-spec-1.1.schema.json"]
+    metadata: Metadata
+    runtime: Runtime
+    models: Models
+    assets: Assets
+    profiles: Profiles
+    style: StyleV11
+    generation: Generation
+    domain: Domain
+    outputs: Outputs
+    verification: Verification
+    repair: Repair
+    replay_contract: ReplayContractV11
+
+
+StyleSpec = StyleSpecV1 | StyleSpecV11
+
+LEGACY_STRENGTH_MAPPING_VERSION = "legacy-unversioned"
+DEFAULT_ENVIRONMENT_POLICY_V11 = "advisory"
+SCHEMA_URI_V1 = "schemas/style-spec-1.0.schema.json"
+SCHEMA_URI_V11 = "schemas/style-spec-1.1.schema.json"

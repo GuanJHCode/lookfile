@@ -13,7 +13,7 @@ from typing import Literal
 from specstyle.domain.enums import RuleLevel, RuleScope, StaticApplicability
 from specstyle.domain.identifiers import Identifier, RuleId, Sha256
 from specstyle.errors import DomainError
-from specstyle.spec.models import StyleSpecV1
+from specstyle.spec.models import StyleSpec, StyleSpecV1, StyleSpecV11
 from specstyle.verification.rule_models import RuleDefinition
 
 DomainProfile = Literal["product_instance", "face_identity", "structure_only"]
@@ -729,7 +729,7 @@ class CompiledVerificationPlan:
 
 @dataclass(frozen=True, slots=True)
 class CompiledStyleSpec:
-    source_spec: StyleSpecV1
+    source_spec: StyleSpec
     compiler_pin: ResourcePin
     ruleset_pin: ResourcePin
     l2_encoder: ResolvedEncoder
@@ -740,7 +740,7 @@ class CompiledStyleSpec:
 
     def __post_init__(self) -> None:
         if (
-            type(self.source_spec) is not StyleSpecV1
+            type(self.source_spec) not in (StyleSpecV1, StyleSpecV11)
             or type(self.compiler_pin) is not ResourcePin
             or type(self.ruleset_pin) is not ResourcePin
             or type(self.l2_encoder) is not ResolvedEncoder
