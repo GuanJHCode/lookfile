@@ -91,11 +91,14 @@ TERMINAL_STATUSES = frozenset(
 
 class EventType(enum.StrEnum):
     JOB_STARTED = "JOB_STARTED"
+    SPEC_COMPILED = "SPEC_COMPILED"
     ATTEMPT_STARTED = "ATTEMPT_STARTED"
     ATTEMPT_FINISHED = "ATTEMPT_FINISHED"
     VERIFIER_FINISHED = "VERIFIER_FINISHED"
     REPAIR_STEP = "REPAIR_STEP"
+    EXPORT_STARTED = "EXPORT_STARTED"
     EXPORT_PUBLISHED = "EXPORT_PUBLISHED"
+    RECOVERABLE = "RECOVERABLE"
     CANCEL_REQUESTED = "CANCEL_REQUESTED"
     FATAL = "FATAL"
 
@@ -342,6 +345,34 @@ class CancelRequestedPayload:
 
 
 @dataclass(frozen=True, slots=True)
+class SpecCompiledPayload:
+    compiled_spec_hash: Sha256
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "compiled_spec_hash", _rebuild_sha(self.compiled_spec_hash)
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ExportStartedPayload:
+    bundle_name: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "bundle_name", _bundle_name(self.bundle_name))
+
+
+@dataclass(frozen=True, slots=True)
+class RecoverablePayload:
+    reason: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "reason", _safe_text(self.reason, "recoverable reason", limit=256)
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class FatalPayload:
     error_family: str
     reason: str
@@ -356,11 +387,14 @@ class FatalPayload:
 
 _PAYLOAD_BY_EVENT = {
     EventType.JOB_STARTED: JobStartedPayload,
+    EventType.SPEC_COMPILED: SpecCompiledPayload,
     EventType.ATTEMPT_STARTED: AttemptStartedPayload,
     EventType.ATTEMPT_FINISHED: AttemptFinishedPayload,
     EventType.VERIFIER_FINISHED: VerifierFinishedPayload,
     EventType.REPAIR_STEP: RepairStepPayload,
+    EventType.EXPORT_STARTED: ExportStartedPayload,
     EventType.EXPORT_PUBLISHED: ExportPublishedPayload,
+    EventType.RECOVERABLE: RecoverablePayload,
     EventType.CANCEL_REQUESTED: CancelRequestedPayload,
     EventType.FATAL: FatalPayload,
 }

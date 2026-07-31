@@ -25,11 +25,13 @@ from specstyle.workflow.job_models import (
     Event,
     EventType,
     ExportPublishedPayload,
+    ExportStartedPayload,
     FatalPayload,
     Job,
     JobBudget,
     JobSnapshot,
     JobStartedPayload,
+    SpecCompiledPayload,
     VerifierFinishedPayload,
 )
 from specstyle.workflow.job_store import JobStore
@@ -400,3 +402,141 @@ def test_terminal_states_have_no_exits() -> None:
 
     for status in (JobStatus.COMPLETED, JobStatus.JOB_FAILED, JobStatus.CANCELLED):
         assert TRANSITIONS[status] == frozenset()
+
+
+def test_full_lifecycle_created_to_completed(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    store.save_snapshot(
+        JobId("job1"),
+        JobSnapshot("specstyle.workflow.snapshot.v1", _job("CREATED"), 0, (), ()),
+    )
+    store.append_event(
+        JobId("job1"),
+        _event(1, EventType.JOB_STARTED, "CREATED", "SPEC_VALIDATED", _start_payload()),
+    )
+    store.append_event(
+        JobId("job1"),
+        _event(
+            2,
+            EventType.SPEC_COMPILED,
+            "SPEC_VALIDATED",
+            "SPEC_COMPILED",
+            SpecCompiledPayload(Sha256("a" * 64)),
+        ),
+    )
+    store.append_event(
+        JobId("job1"),
+        _event(
+            3,
+            EventType.ATTEMPT_STARTED,
+            "SPEC_COMPILED",
+            "GENERATING",
+            _attempt_payload("att1"),
+        ),
+    )
+    store.append_event(
+        JobId("job1"),
+        _event(
+            4,
+            EventType.ATTEMPT_FINISHED,
+            "GENERATING",
+            "VERIFYING",
+            _attempt_finished_payload("att1"),
+        ),
+    )
+    store.append_event(
+        JobId("job1"),
+        _event(
+            5,
+            EventType.VERIFIER_FINISHED,
+            "VERIFYING",
+            "APPROVED",
+            _verifier_payload("APPROVED"),
+        ),
+    )
+    store.append_event(
+        JobId("job1"),
+        _event(
+            6,
+            EventType.EXPORT_STARTED,
+            "APPROVED",
+            "EXPORTING",
+            ExportStartedPayload("bundle1"),
+        ),
+    )
+    store.append_event(
+        JobId("job1"),
+        _event(
+            7,
+            EventType.EXPORT_PUBLISHED,
+            "EXPORTING",
+            "COMPLETED",
+            _export_payload("bundle1"),
+        ),
+    )
+    state = store.load(JobId("job1"))
+    assert state.job.status.value == "COMPLETED"  # type: ignore[attr-defined]
+    assert state.last_sequence == 7  # type: ignore[attr-defined]
+    assert state.job.terminal is True  # type: ignore[attr-defined]
+    assert state.bundle_names == ("bundle1",)  # type: ignore[attr-defined]
+
+
+def test_corrupted_enum_value_fail_closed(tmp_path: Path) -> None:
+    from specstyle.workflow.job_store import _canonical_json, _event_to_primitive
+
+    store = _store(tmp_path)
+    store.save_snapshot(
+        JobId("job1"),
+        JobSnapshot("specstyle.workflow.snapshot.v1", _job("SPEC_COMPILED"), 0, (), ()),
+    )
+    directory = tmp_path / "jobs" / "job1"
+    good = _event(
+        1,
+        EventType.ATTEMPT_STARTED,
+        "SPEC_COMPILED",
+        "GENERATING",
+        _attempt_payload("att1"),
+    )
+    bad = _event_to_primitive(good)
+    bad["from_state"] = "NOT_A_STATE"
+    bad["sequence"] = 2
+    with open(directory / "events.ndjson", "wb") as handle:
+        handle.write(_canonical_json(_event_to_primitive(good)) + b"\n")
+        handle.write(_canonical_json(bad) + b"\n")
+    with pytest.raises(InfrastructureError, match="job store corrupted"):
+        store.load(JobId("job1"))
+
+
+def test_corrupted_attempt_ids_type_fail_closed(tmp_path: Path) -> None:
+    import json
+
+    store = _store(tmp_path)
+    store.save_snapshot(
+        JobId("job1"),
+        JobSnapshot("specstyle.workflow.snapshot.v1", _job("GENERATING"), 0, (), ()),
+    )
+    directory = tmp_path / "jobs" / "job1"
+    data = json.loads((directory / "snapshot.json").read_text())
+    data["attempt_ids"] = "abc"
+    (directory / "snapshot.json").write_text(json.dumps(data))
+    with pytest.raises(InfrastructureError, match="job store corrupted"):
+        store.load(JobId("job1"))
+
+
+def test_append_event_rejects_forged_from_state(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    store.save_snapshot(
+        JobId("job1"),
+        JobSnapshot("specstyle.workflow.snapshot.v1", _job("SPEC_COMPILED"), 0, (), ()),
+    )
+    with pytest.raises(DomainError, match="invalid job transition"):
+        store.append_event(
+            JobId("job1"),
+            _event(
+                1,
+                EventType.ATTEMPT_STARTED,
+                "CREATED",
+                "GENERATING",
+                _attempt_payload("att1"),
+            ),
+        )
