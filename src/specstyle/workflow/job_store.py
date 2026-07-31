@@ -35,13 +35,16 @@ from specstyle.workflow.job_models import (
     Event,
     EventType,
     ExportPublishedPayload,
+    ExportStartedPayload,
     FatalPayload,
     Job,
     JobBudget,
     JobSnapshot,
     JobStartedPayload,
     JobStatus,
+    RecoverablePayload,
     RepairStepPayload,
+    SpecCompiledPayload,
     VerifierFinishedPayload,
 )
 from specstyle.workflow.state_machine import replay_events, validate_transition
@@ -101,8 +104,8 @@ def _parse(data: bytes) -> object:
                 DomainError("invalid job snapshot")
             ),
         )
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        raise DomainError("invalid job snapshot") from None
+    except (UnicodeDecodeError, json.JSONDecodeError) as cause:
+        raise DomainError("invalid job snapshot") from cause
 
 
 def _exact_keys(data: object, keys: set[str]) -> dict[str, object]:
@@ -139,6 +142,22 @@ def _str_value(data: dict[str, object], key: str) -> str:
     return value
 
 
+def _enum_value(data: dict[str, object], key: str, cls: type) -> object:
+    value = data[key]
+    if type(value) is not str:
+        raise DomainError("invalid job snapshot")
+    try:
+        return cls(value)
+    except ValueError:
+        raise DomainError("invalid job snapshot") from None
+
+
+def _str_list(value: object, name: str) -> list[str]:
+    if type(value) is not list or any(type(v) is not str for v in value):
+        raise DomainError(f"invalid {name}")
+    return value
+
+
 def _job_to_primitive(job: Job) -> dict[str, object]:
     return {
         "job_id": job.job_id.value,
@@ -168,7 +187,7 @@ def _job_from_primitive(data: object) -> Job:
     return Job(
         _id_value(d, "job_id", JobId),
         _sha_value(d, "compiled_spec_hash"),
-        tuple(d["cohort_profiles"]),
+        tuple(_str_list(d["cohort_profiles"], "cohort profiles")),
         JobBudget(_int_value(budget, "max_attempts_per_item")),
         JobStatus(_str_value(d, "status")),
         _str_value(d, "created_at"),
@@ -179,13 +198,16 @@ def _job_from_primitive(data: object) -> Job:
 _PAYLOAD_BUILDERS = {
     EventType.JOB_STARTED: lambda d: JobStartedPayload(
         _sha_value(d, "compiled_spec_hash"),
-        tuple(d["cohort_profiles"]),
+        tuple(_str_list(d["cohort_profiles"], "cohort profiles")),
         JobBudget(
             _int_value(
                 _exact_keys(d["budget"], {"max_attempts_per_item"}),
                 "max_attempts_per_item",
             )
         ),
+    ),
+    EventType.SPEC_COMPILED: lambda d: SpecCompiledPayload(
+        _sha_value(d, "compiled_spec_hash")
     ),
     EventType.ATTEMPT_STARTED: lambda d: AttemptStartedPayload(
         _int_value(d, "cohort_index"),
@@ -206,11 +228,16 @@ _PAYLOAD_BUILDERS = {
         _int_value(d, "cohort_index"),
         _int_value(d, "item_index"),
         _id_value(d, "artifact_id", ArtifactId),
-        ArtifactStatus(d["artifact_status"]),
-        DecisionReason(d["decision_reason"]),
+        ArtifactStatus(d["artifact_status"])
+        if isinstance(d["artifact_status"], ArtifactStatus)
+        else _enum_value(d, "artifact_status", ArtifactStatus),
+        DecisionReason(d["decision_reason"])
+        if isinstance(d["decision_reason"], DecisionReason)
+        else _enum_value(d, "decision_reason", DecisionReason),
         RepairStopReason(d["repair_stop_reason"])
-        if d["repair_stop_reason"] is not None
-        else None,
+        if d["repair_stop_reason"] is None
+        or isinstance(d["repair_stop_reason"], RepairStopReason)
+        else _enum_value(d, "repair_stop_reason", RepairStopReason),
     ),
     EventType.REPAIR_STEP: lambda d: RepairStepPayload(
         _int_value(d, "cohort_index"),
@@ -227,6 +254,10 @@ _PAYLOAD_BUILDERS = {
         _sha_value(d, "payload_sha256"),
         _sha_value(d, "bundle_sha256"),
     ),
+    EventType.EXPORT_STARTED: lambda d: ExportStartedPayload(
+        _str_value(d, "bundle_name")
+    ),
+    EventType.RECOVERABLE: lambda d: RecoverablePayload(_str_value(d, "reason")),
     EventType.CANCEL_REQUESTED: lambda d: CancelRequestedPayload(
         _str_value(d, "reason")
     ),
@@ -275,6 +306,9 @@ def _payload_keys(event_type: EventType) -> set[str]:
             "payload_sha256",
             "bundle_sha256",
         },
+        EventType.EXPORT_STARTED: {"bundle_name"},
+        EventType.RECOVERABLE: {"reason"},
+        EventType.SPEC_COMPILED: {"compiled_spec_hash"},
         EventType.CANCEL_REQUESTED: {"reason"},
         EventType.FATAL: {"error_family", "reason"},
     }
@@ -328,15 +362,15 @@ def _event_from_primitive(data: object) -> Event:
             "payload",
         },
     )
-    event_type = EventType(_str_value(d, "event_type"))
-    payload_data = _exact_keys(d["payload"], _payload_keys(event_type))
-    payload = _PAYLOAD_BUILDERS[event_type](payload_data)
+    event_type = _enum_value(d, "event_type", EventType)  # type: ignore[assignment]
+    payload_data = _exact_keys(d["payload"], _payload_keys(event_type))  # type: ignore[arg-type]
+    payload = _PAYLOAD_BUILDERS[event_type](payload_data)  # type: ignore[index]
     return Event(
         _int_value(d, "sequence"),
         JobId(_str_value(d, "job_id")),
-        event_type,
-        JobStatus(_str_value(d, "from_state")),
-        JobStatus(_str_value(d, "to_state")),
+        event_type,  # type: ignore[arg-type]
+        _enum_value(d, "from_state", JobStatus),  # type: ignore[arg-type]
+        _enum_value(d, "to_state", JobStatus),  # type: ignore[arg-type]
         _str_value(d, "timestamp"),
         payload,
     )
@@ -363,8 +397,8 @@ class JobStore:
             return replay_events(snapshot, relevant)
         except DomainError:
             raise
-        except Exception:
-            raise InfrastructureError("job store corrupted") from None
+        except Exception as cause:
+            raise InfrastructureError("job store corrupted") from cause
 
     def get_snapshot(self, job_id: JobId, /) -> JobSnapshot | None:
         path = self._job_dir(job_id) / "snapshot.json"
@@ -389,8 +423,10 @@ class JobStore:
             if d["schema_version"] != _SNAPSHOT_VERSION:
                 raise DomainError("invalid job snapshot")
             job = _job_from_primitive(d["job"])
-            attempts = tuple(AttemptId(v) for v in d["attempt_ids"])
-            bundles = tuple(v for v in d["bundle_names"])
+            attempts = tuple(
+                AttemptId(v) for v in _str_list(d["attempt_ids"], "attempt ids")
+            )
+            bundles = tuple(_str_list(d["bundle_names"], "bundle names"))
             snapshot = JobSnapshot(
                 _SNAPSHOT_VERSION,
                 job,
@@ -398,8 +434,8 @@ class JobStore:
                 attempts,
                 bundles,
             )
-        except DomainError:
-            raise InfrastructureError("job store corrupted") from None
+        except Exception as cause:
+            raise InfrastructureError("job store corrupted") from cause
         return snapshot
 
     def save_snapshot(self, job_id: JobId, snapshot: JobSnapshot, /) -> None:
@@ -438,6 +474,10 @@ class JobStore:
         if event.event_type is EventType.EXPORT_PUBLISHED:
             if event.payload.bundle_name in bundles:
                 raise DomainError("duplicate job export") from None
+        if event.job_id != job_id:
+            raise DomainError("invalid job event") from None
+        if event.from_state is not state.job.status:  # type: ignore[attr-defined]
+            raise DomainError("invalid job transition") from None
         validate_transition(state.job.status, event.to_state, event.event_type)  # type: ignore[attr-defined]
         sequence = state.last_sequence + 1  # type: ignore[attr-defined]
         finalized = Event(
@@ -476,8 +516,8 @@ class JobStore:
                 continue
             try:
                 events.append(_event_from_primitive(_parse(line)))
-            except DomainError:
-                raise InfrastructureError("job store corrupted") from None
+            except Exception as cause:
+                raise InfrastructureError("job store corrupted") from cause
         return tuple(events)
 
 

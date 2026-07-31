@@ -87,6 +87,7 @@ TRANSITIONS: dict[JobStatus, frozenset[JobStatus]] = {
             JobStatus.REPAIR_SELECTING,
             JobStatus.REPAIRING,
             JobStatus.EXPORTING,
+            JobStatus.CANCELLED,
             JobStatus.JOB_FAILED,
         }
     ),
@@ -97,6 +98,7 @@ TRANSITIONS: dict[JobStatus, frozenset[JobStatus]] = {
 
 _EVENT_TO_STATE: dict[EventType, frozenset[JobStatus]] = {
     EventType.JOB_STARTED: frozenset({JobStatus.SPEC_VALIDATED}),
+    EventType.SPEC_COMPILED: frozenset({JobStatus.SPEC_COMPILED}),
     EventType.ATTEMPT_STARTED: frozenset({JobStatus.GENERATING}),
     EventType.ATTEMPT_FINISHED: frozenset({JobStatus.VERIFYING}),
     EventType.VERIFIER_FINISHED: frozenset(
@@ -108,7 +110,9 @@ _EVENT_TO_STATE: dict[EventType, frozenset[JobStatus]] = {
         }
     ),
     EventType.REPAIR_STEP: frozenset({JobStatus.REPAIRING, JobStatus.VERIFYING}),
+    EventType.EXPORT_STARTED: frozenset({JobStatus.EXPORTING}),
     EventType.EXPORT_PUBLISHED: frozenset({JobStatus.COMPLETED}),
+    EventType.RECOVERABLE: frozenset({JobStatus.RECOVERABLE_ERROR}),
     EventType.CANCEL_REQUESTED: frozenset({JobStatus.CANCELLED}),
     EventType.FATAL: frozenset({JobStatus.JOB_FAILED}),
 }
