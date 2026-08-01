@@ -38,6 +38,12 @@ from specstyle.spec.compiled_models import (
 )
 from specstyle.spec.compiler import compile_style_spec
 from specstyle.spec.loader import load_style_spec_text
+from specstyle.verification.production import (
+    _ProductionVerificationAllowlist,
+    _create_production_verifier_factory,
+)
+from specstyle.verification.protocols import Verifier, run_verifier
+from specstyle.verification.rule_models import VerificationReport
 from specstyle.workflow.job_models import (
     AttemptFinishedPayload,
     AttemptStartedPayload,
@@ -55,6 +61,7 @@ from specstyle.workflow.job_models import (
     _timestamp,
 )
 from specstyle.workflow.job_store import JobStore
+from specstyle.workflow.production_artifacts import _open_production_artifact_store
 
 __all__ = ("ProductionJobRequest",)
 
@@ -125,7 +132,18 @@ class _InitialAttemptResult:
     verification_plan: CompiledVerificationPlan
     request: GenerationRequest
     artifact: GeneratedArtifact
+    report: VerificationReport
     job_state: JobState
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedInitialAttempt:
+    compiled: CompiledStyleSpec
+    graph: CompiledExecutionGraph
+    verification_plan: CompiledVerificationPlan
+    request: GenerationRequest
+    repository: Any
+    verifier: Verifier
 
 
 def _select_initial_contract(
@@ -240,8 +258,6 @@ def _create_initial_job(
     compiled: CompiledStyleSpec,
     clock: Callable[[], str],
 ) -> JobBudget:
-    if store.get_snapshot(request.job_id) is not None:
-        raise DomainError("duplicate production job id")
     timestamp = clock()
     budget = JobBudget(1 + compiled.source_spec.repair.max_rounds)
     job = Job(
@@ -258,6 +274,11 @@ def _create_initial_job(
         JobSnapshot("specstyle.workflow.snapshot.v1", job, 0, (), ()),
     )
     return budget
+
+
+def _reject_duplicate_job(store: JobStore, job_id: JobId) -> None:
+    if store.get_snapshot(job_id) is not None:
+        raise DomainError("duplicate production job id")
 
 
 def _record_attempt_start(
@@ -345,20 +366,61 @@ def _record_attempt_finish(
     )
 
 
+def _record_verifier_fatal(
+    store: JobStore, job_id: JobId, clock: Callable[[], str]
+) -> None:
+    _append_event(
+        store,
+        job_id,
+        EventType.FATAL,
+        JobStatus.VERIFYING,
+        JobStatus.JOB_FAILED,
+        clock(),
+        FatalPayload("VERIFIER_UNAVAILABLE", "verifier unavailable"),
+    )
+
+
+def _run_initial_verification(
+    verifier: Verifier,
+    store: JobStore,
+    request: GenerationRequest,
+    artifact: GeneratedArtifact,
+    plan: CompiledVerificationPlan,
+    clock: Callable[[], str],
+) -> VerificationReport:
+    artifacts = (artifact.ref,)
+    rules = plan.applicable_rule_definitions
+    failed = False
+    try:
+        results = run_verifier(verifier, artifacts, rules)
+        report = VerificationReport(artifacts, rules, results)
+    except Exception:
+        failed = True
+    if failed:
+        _record_verifier_fatal(store, request.job_id, clock)
+        raise InfrastructureError("verifier unavailable") from None
+    return report
+
+
 class _ProductionGenerationRuntime:
     __slots__ = (
         "_loaded",
+        "_verifier_factory",
+        "_artifact_store",
         "_environment",
         "_compiler_context",
         "_style_assets",
         "_control_builder",
         "_job_store",
         "_clock",
+        "_closed",
     )
 
     def __init__(
         self,
         loaded: LoadedPipeline,
+        verifier_factory: Any,
+        artifact_store: Any,
         environment: EnvironmentSnapshot,
         compiler_context: CompilerContext,
         style_assets: StyleAssetResolver,
@@ -368,25 +430,46 @@ class _ProductionGenerationRuntime:
         /,
     ) -> None:
         self._loaded = loaded
+        self._verifier_factory = verifier_factory
+        self._artifact_store = artifact_store
         self._environment = environment
         self._compiler_context = compiler_context
         self._style_assets = style_assets
         self._control_builder = control_builder
         self._job_store = job_store
         self._clock = _NondecreasingAuditClock(clock)
+        self._closed = False
 
     def close(self) -> None:
-        self._loaded.close()
+        if self._closed:
+            return
+        self._closed = True
+        factory, self._verifier_factory = self._verifier_factory, None
+        cleanup = (
+            getattr(factory, "close", None),
+            self._loaded.close,
+            self._artifact_store.close,
+        )
+        first_error: Exception | None = None
+        for close in cleanup:
+            if not callable(close):
+                continue
+            try:
+                close()
+            except Exception as error:
+                if first_error is None:
+                    first_error = error
+        if first_error is not None:
+            raise first_error
 
-    def _execute_initial_attempt(
-        self, request: ProductionJobRequest, /
-    ) -> _InitialAttemptResult:
-        if type(request) is not ProductionJobRequest:
-            raise DomainError("invalid production job request")
+    def _prepare_initial_attempt(
+        self, request: ProductionJobRequest
+    ) -> _PreparedInitialAttempt:
         compiled, graph, verification_plan = _select_initial_contract(
             request, self._compiler_context
         )
         _preflight_bindings(request, graph, self._loaded)
+        _reject_duplicate_job(self._job_store, request.job_id)
         generation_request = _initial_generation_request(
             request,
             compiled,
@@ -394,12 +477,37 @@ class _ProductionGenerationRuntime:
             self._control_builder,
             self._environment,
         )
-        budget = _create_initial_job(self._job_store, request, compiled, self._clock)
+        repository = self._artifact_store.for_job(request.job_id)
+        try:
+            verifier = self._verifier_factory.create(
+                generation_request,
+                verification_plan,
+                repository,
+                self._style_assets,
+            )
+        except Exception:
+            repository.close()
+            raise
+        return _PreparedInitialAttempt(
+            compiled,
+            graph,
+            verification_plan,
+            generation_request,
+            repository,
+            verifier,
+        )
+
+    def _run_prepared_attempt(
+        self, request: ProductionJobRequest, prepared: _PreparedInitialAttempt
+    ) -> _InitialAttemptResult:
+        budget = _create_initial_job(
+            self._job_store, request, prepared.compiled, self._clock
+        )
         _record_attempt_start(
             self._job_store,
             request,
-            compiled,
-            generation_request,
+            prepared.compiled,
+            prepared.request,
             budget,
             self._clock,
         )
@@ -407,20 +515,74 @@ class _ProductionGenerationRuntime:
             self._loaded,
             self._style_assets,
             self._job_store,
-            generation_request,
+            prepared.request,
             self._clock,
         )
+        prepared.repository.put(artifact)
         _record_attempt_finish(
-            self._job_store, generation_request, artifact, self._clock()
+            self._job_store, prepared.request, artifact, self._clock()
+        )
+        report = _run_initial_verification(
+            prepared.verifier,
+            self._job_store,
+            prepared.request,
+            artifact,
+            prepared.verification_plan,
+            self._clock,
         )
         return _InitialAttemptResult(
-            compiled,
-            graph,
-            verification_plan,
-            generation_request,
+            prepared.compiled,
+            prepared.graph,
+            prepared.verification_plan,
+            prepared.request,
             artifact,
+            report,
             self._job_store.load(request.job_id),
         )
+
+    def _execute_initial_attempt(
+        self, request: ProductionJobRequest, /
+    ) -> _InitialAttemptResult:
+        if self._closed:
+            raise InfrastructureError("production runtime closed")
+        if type(request) is not ProductionJobRequest:
+            raise DomainError("invalid production job request")
+        prepared = self._prepare_initial_attempt(request)
+        try:
+            return self._run_prepared_attempt(request, prepared)
+        finally:
+            prepared.repository.close()
+
+
+def _cleanup_failed_open(loaded: LoadedPipeline, artifact_store: Any | None) -> None:
+    try:
+        loaded.close()
+    except Exception:
+        pass
+    if artifact_store is not None:
+        try:
+            artifact_store.close()
+        except Exception:
+            pass
+
+
+def _validate_runtime_dependencies(
+    compiler_context: object,
+    style_assets: object,
+    control_builder: object,
+    allowlist: object,
+    job_store: object,
+    clock: object,
+) -> None:
+    if (
+        type(compiler_context) is not CompilerContext
+        or not callable(style_assets)
+        or not callable(getattr(control_builder, "build", None))
+        or type(allowlist) is not _ProductionVerificationAllowlist
+        or type(job_store) is not JobStore
+        or not callable(clock)
+    ):
+        raise DomainError("invalid production runtime dependency")
 
 
 def _open_production_generation_runtime(
@@ -430,21 +592,18 @@ def _open_production_generation_runtime(
     compiler_context: CompilerContext,
     style_assets: StyleAssetResolver,
     control_builder: ControlInputBuilder,
+    allowlist: _ProductionVerificationAllowlist,
     job_store: JobStore,
+    artifact_root_fd: int,
     /,
     *,
     torch_module: Any | None = None,
     diffusers_module: Any | None = None,
     clock: Callable[[], str] = _utc_now,
 ) -> _ProductionGenerationRuntime:
-    if (
-        type(compiler_context) is not CompilerContext
-        or not callable(style_assets)
-        or not callable(getattr(control_builder, "build", None))
-        or type(job_store) is not JobStore
-        or not callable(clock)
-    ):
-        raise DomainError("invalid production runtime dependency")
+    _validate_runtime_dependencies(
+        compiler_context, style_assets, control_builder, allowlist, job_store, clock
+    )
     loaded = load_production_pipeline(
         supply,
         pipeline_graph,
@@ -452,12 +611,21 @@ def _open_production_generation_runtime(
         torch_module=torch_module,
         diffusers_module=diffusers_module,
     )
-    return _ProductionGenerationRuntime(
-        loaded,
-        environment,
-        compiler_context,
-        style_assets,
-        control_builder,
-        job_store,
-        clock,
-    )
+    artifact_store = None
+    try:
+        verifier_factory = _create_production_verifier_factory(loaded, allowlist)
+        artifact_store = _open_production_artifact_store(artifact_root_fd)
+        return _ProductionGenerationRuntime(
+            loaded,
+            verifier_factory,
+            artifact_store,
+            environment,
+            compiler_context,
+            style_assets,
+            control_builder,
+            job_store,
+            clock,
+        )
+    except Exception:
+        _cleanup_failed_open(loaded, artifact_store)
+        raise

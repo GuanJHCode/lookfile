@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import replace
 from io import BytesIO
 from pathlib import Path
@@ -13,9 +14,13 @@ from PIL import Image
 
 import specstyle.workflow.production_service as production_service
 from specstyle.domain.artifacts import AssetRef
-from specstyle.domain.enums import RuleScope
+from specstyle.domain.enums import RuleScope, RuleStatus
 from specstyle.domain.identifiers import AssetId, Identifier, JobId
 from specstyle.errors import DomainError, InfrastructureError
+from specstyle.generation.image_evidence import (
+    _build_processor_provenance,
+    _derive_preprocessing_version,
+)
 from specstyle.generation.preprocess import (
     PreprocessPlan,
     PreparedImage,
@@ -25,9 +30,11 @@ from specstyle.generation.requests import PreparedControlInput, RenderedPrompt
 from specstyle.observability.hashing import hash_bytes
 from specstyle.spec.compiled_models import (
     CompilerContext,
-    ModelCapability,
     ResourcePin,
-    RuntimeCapability,
+)
+from specstyle.verification.production import (
+    _L1RuleMapping,
+    _ProductionVerificationAllowlist,
 )
 from specstyle.workflow.job_models import EventType, JobStatus
 from specstyle.workflow.job_store import JobStore
@@ -36,13 +43,20 @@ from specstyle.workflow.production_service import (
     _open_production_generation_runtime,
 )
 from tests.unit.generation.test_diffusers_loader import (
+    _CLIPImageProcessor,
     _Diffusers,
     _Pipeline,
     _Torch,
+    _Transformers,
     _environment,
     _supply,
 )
-from tests.unit.spec.test_compiler import context, raw_spec
+from tests.unit.spec.test_compiler import context
+from tests.unit.verification._production_builders import (
+    _L1_MAPPINGS,
+    _compiler_context as _verification_compiler_context,
+    _raw_spec as _verification_raw_spec,
+)
 
 _TIMESTAMP = "2026-08-01T00:00:00.000Z"
 
@@ -59,105 +73,83 @@ def _compiler_inputs(
     *,
     applicable_batch: bool = False,
     mismatch: str | None = None,
-) -> tuple[str, CompilerContext]:
-    raw = raw_spec().model_dump(mode="json")
-    raw["runtime"] = {
-        "backend": "rocm",
-        "rocm_version": "7.2.0" if mismatch == "runtime" else "7.2.1",
-        "torch_version": "2.8.0",
-        "diffusers_version": "0.39.0",
-        "dtype": "float16",
-    }
-    for key, descriptor in (
-        ("base", pipeline_graph.base),
-        ("ip_adapter", pipeline_graph.ip_adapter),
-        ("controlnet", pipeline_graph.controlnet),
-    ):
-        raw["models"][key]["id"] = (
-            "other-base"
-            if mismatch == "model" and key == "base"
-            else descriptor.model_id
-        )
-        raw["models"][key]["revision"] = descriptor.revision
-        raw["models"][key]["sha256"] = descriptor.expected_sha256.value
-    if mismatch == "control":
-        raw["models"]["controlnet"]["type"] = "depth"
-    raw["assets"]["style_references"] = [
-        {
-            "asset_sha256": hash_bytes(content).value,
-            "source_url": f"https://example.com/style-{index}",
-            "license": "CC0",
-            "attribution": "author",
-            "consent": "not_applicable",
-        }
-        for index, content in enumerate(style_contents)
-    ]
+) -> tuple[str, CompilerContext, _ProductionVerificationAllowlist]:
+    provenance = _build_processor_provenance(
+        _Transformers, _CLIPImageProcessor(), _Transformers.__version__
+    )
+    compiler_context = _verification_compiler_context(
+        pipeline_graph,
+        _derive_preprocessing_version(provenance),
+        l2_status="DRAFT",
+        l3_status="DRAFT",
+        l3_kind="L3_DIAGNOSTIC",
+        l3_requirement="always_advisory",
+    )
+    raw = _verification_raw_spec(
+        pipeline_graph, compiler_context, style_contents, fidelity_required=False
+    ).model_dump(mode="json")
+    raw["profiles"]["production"]["resolution"] = [1024, 1024]
+    compiler_context, raw = _apply_compiler_mismatch(compiler_context, raw, mismatch)
+    if applicable_batch:
+        compiler_context = _add_applicable_batch_rule(compiler_context)
+    allowlist = _ProductionVerificationAllowlist(
+        "specstyle.production_verifier.v1",
+        compiler_context,
+        provenance,
+        tuple(_L1RuleMapping(*entry) for entry in _L1_MAPPINGS),
+    )
+    return json.dumps(raw), compiler_context, allowlist
 
-    base_context = context()
-    runtime_pin = ResourcePin(
-        "runtime", "r1", base_context.runtime_capabilities[0].pin.sha256
-    )
-    model_capabilities = tuple(
-        ModelCapability(
-            descriptor.role,
-            ResourcePin(
-                "other-base"
-                if mismatch == "model" and descriptor.role == "base"
-                else descriptor.model_id,
-                descriptor.revision,
-                descriptor.expected_sha256,
-            ),
-            ("depth" if mismatch == "control" else "canny")
-            if descriptor.role == "controlnet"
-            else None,
-            ("sdxl_turbo", "sdxl_base"),
-            ("float16",),
-            (runtime_pin.sha256,),
+
+def _apply_compiler_mismatch(
+    compiler_context: CompilerContext, raw: dict[str, Any], mismatch: str | None
+) -> tuple[CompilerContext, dict[str, Any]]:
+    if mismatch == "runtime":
+        runtime = compiler_context.runtime_capabilities[0]
+        compiler_context = replace(
+            compiler_context,
+            runtime_capabilities=(replace(runtime, rocm_version="7.2.0"),),
         )
-        for descriptor in (
-            pipeline_graph.base,
-            pipeline_graph.ip_adapter,
-            pipeline_graph.controlnet,
-        )
+        raw["runtime"]["rocm_version"] = "7.2.0"
+    if mismatch in {"model", "control"}:
+        changed = []
+        for capability in compiler_context.model_capabilities:
+            if mismatch == "model" and capability.role == "base":
+                changed.append(
+                    replace(
+                        capability,
+                        pin=replace(capability.pin, id="other-base"),
+                    )
+                )
+                raw["models"]["base"]["id"] = "other-base"
+            elif mismatch == "control" and capability.role == "controlnet":
+                changed.append(replace(capability, controlnet_type="depth"))
+                raw["models"]["controlnet"]["type"] = "depth"
+            else:
+                changed.append(capability)
+        compiler_context = replace(compiler_context, model_capabilities=tuple(changed))
+    return compiler_context, raw
+
+
+def _add_applicable_batch_rule(
+    compiler_context: CompilerContext,
+) -> CompilerContext:
+    legacy = context()
+    batch_rule = next(
+        rule for rule in legacy.rule_catalogs[0].rules if rule.scope is RuleScope.BATCH
     )
-    catalog = base_context.rule_catalogs[0]
-    rules = (
-        catalog.rules
-        if applicable_batch
-        else tuple(
-            replace(rule, supported_output_profiles=("talking_head_cover",))
-            if rule.scope is RuleScope.BATCH
-            else rule
-            for rule in catalog.rules
-        )
+    batch_metric = next(
+        metric
+        for metric in legacy.threshold_profiles[0].metrics
+        if metric.metric_id.value == "batch-metric"
     )
-    threshold = base_context.threshold_profiles[0]
-    if not applicable_batch:
-        threshold = replace(
-            threshold,
-            metrics=tuple(
-                metric
-                for metric in threshold.metrics
-                if metric.metric_id.value == "style-metric"
-            ),
-        )
-    compiler_context = replace(
-        base_context,
-        runtime_capabilities=(
-            RuntimeCapability(
-                runtime_pin,
-                "rocm",
-                "7.2.0" if mismatch == "runtime" else "7.2.1",
-                "2.8.0",
-                "0.39.0",
-                "float16",
-            ),
-        ),
-        model_capabilities=model_capabilities,
-        rule_catalogs=(replace(catalog, rules=rules),),
-        threshold_profiles=(threshold,),
+    catalog = compiler_context.rule_catalogs[0]
+    l2, l3 = compiler_context.threshold_profiles
+    return replace(
+        compiler_context,
+        rule_catalogs=(replace(catalog, rules=(*catalog.rules, batch_rule)),),
+        threshold_profiles=(replace(l2, metrics=(*l2.metrics, batch_metric)), l3),
     )
-    return json.dumps(raw), compiler_context
 
 
 def _source() -> PreparedImage:
@@ -214,12 +206,46 @@ def _job_request(
     )
 
 
+def _open_runtime(
+    tmp_path: Path,
+    supply: object,
+    pipeline_graph: object,
+    environment: object,
+    compiler_context: CompilerContext,
+    style_assets: object,
+    control_builder: object,
+    allowlist: _ProductionVerificationAllowlist,
+    job_store: JobStore,
+    **kwargs: object,
+):
+    artifact_root = tmp_path / "artifacts"
+    artifact_root.mkdir(exist_ok=True)
+    root_fd = os.open(artifact_root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        return _open_production_generation_runtime(
+            supply,
+            pipeline_graph,
+            environment,
+            compiler_context,
+            style_assets,
+            control_builder,
+            allowlist,
+            job_store,
+            root_fd,
+            **kwargs,
+        )
+    finally:
+        os.close(root_fd)
+
+
 def test_real_initial_attempt_reaches_verifying_with_exact_audit_history(
     tmp_path: Path, monkeypatch
 ) -> None:
     style_contents = (_png("red"), _png("blue"))
     supply, pipeline_graph = _supply(tmp_path / "weights")
-    spec_text, compiler_context = _compiler_inputs(pipeline_graph, style_contents)
+    spec_text, compiler_context, allowlist = _compiler_inputs(
+        pipeline_graph, style_contents
+    )
     style_references = tuple(
         AssetRef(AssetId(f"style-{index}"), hash_bytes(content))
         for index, content in enumerate(style_contents)
@@ -246,13 +272,15 @@ def test_real_initial_attempt_reaches_verifying_with_exact_audit_history(
         )()
 
     monkeypatch.setattr(_Pipeline, "__call__", generate, raising=False)
-    runtime = _open_production_generation_runtime(
+    runtime = _open_runtime(
+        tmp_path,
         supply,
         pipeline_graph,
         _environment(),
         compiler_context,
         dict(zip(style_references, style_contents)).__getitem__,
         builder,
+        allowlist,
         store,
         torch_module=torch,
         diffusers_module=diffusers,
@@ -266,6 +294,15 @@ def test_real_initial_attempt_reaches_verifying_with_exact_audit_history(
         assert result.request.attempt_id.value == "job-success-a0-xhs_grid-0"
         assert result.artifact.content.startswith(b"\x89PNG")
         assert result.artifact.request_hash == result.request.request_hash
+        assert result.report.artifacts == (result.artifact.ref,)
+        assert (
+            result.report.rules == result.verification_plan.applicable_rule_definitions
+        )
+        assert tuple(item.status for item in result.report.results) == (
+            *(RuleStatus.PASS for _ in range(4)),
+            RuleStatus.UNVERIFIABLE,
+            RuleStatus.UNVERIFIABLE,
+        )
         assert result.job_state.job.status is JobStatus.VERIFYING
         assert result.job_state.last_sequence == 4
         assert len(builder.calls) == 1
@@ -295,7 +332,7 @@ def test_preflight_rejects_before_genesis_and_inference(
 ) -> None:
     style_contents = (_png("red"), _png("blue"))
     supply, pipeline_graph = _supply(tmp_path / "weights")
-    spec_text, compiler_context = _compiler_inputs(
+    spec_text, compiler_context, allowlist = _compiler_inputs(
         pipeline_graph,
         style_contents,
         applicable_batch=case == "batch",
@@ -322,13 +359,15 @@ def test_preflight_rejects_before_genesis_and_inference(
         lambda self, **kwargs: inference_calls.append(kwargs),
         raising=False,
     )
-    runtime = _open_production_generation_runtime(
+    runtime = _open_runtime(
+        tmp_path,
         supply,
         pipeline_graph,
         _environment(),
         compiler_context,
         dict(zip(style_references, style_contents)).__getitem__,
         builder,
+        allowlist,
         store,
         torch_module=_Torch(),
         diffusers_module=_Diffusers(),
@@ -354,7 +393,9 @@ def test_generation_failure_is_fatal_and_reraises_the_same_error(
 ) -> None:
     style_contents = (_png("red"),)
     supply, pipeline_graph = _supply(tmp_path / "weights")
-    spec_text, compiler_context = _compiler_inputs(pipeline_graph, style_contents)
+    spec_text, compiler_context, allowlist = _compiler_inputs(
+        pipeline_graph, style_contents
+    )
     style_references = (AssetRef(AssetId("style-0"), hash_bytes(style_contents[0])),)
     request = _job_request(f"job-{failure}", spec_text, style_references)
     store_root = tmp_path / "store"
@@ -394,13 +435,15 @@ def test_generation_failure_is_fatal_and_reraises_the_same_error(
             raise
 
     monkeypatch.setattr(production_service, "run_generation", capture_error)
-    runtime = _open_production_generation_runtime(
+    runtime = _open_runtime(
+        tmp_path,
         supply,
         pipeline_graph,
         _environment(),
         compiler_context,
         resolver,
         _CannyBuilder(),
+        allowlist,
         store,
         torch_module=torch,
         diffusers_module=diffusers,
@@ -437,7 +480,9 @@ def test_duplicate_job_is_rejected_without_events_or_inference_and_backends_are_
 ) -> None:
     style_contents = (_png("red"),)
     supply, pipeline_graph = _supply(tmp_path / "weights")
-    spec_text, compiler_context = _compiler_inputs(pipeline_graph, style_contents)
+    spec_text, compiler_context, allowlist = _compiler_inputs(
+        pipeline_graph, style_contents
+    )
     style_references = (AssetRef(AssetId("style-0"), hash_bytes(style_contents[0])),)
     first = _job_request("job-first", spec_text, style_references)
     second = _job_request("job-second", spec_text, style_references)
@@ -465,13 +510,15 @@ def test_duplicate_job_is_rejected_without_events_or_inference_and_backends_are_
         return backend
 
     monkeypatch.setattr(production_service, "DiffusersBackend", create_backend)
-    runtime = _open_production_generation_runtime(
+    runtime = _open_runtime(
+        tmp_path,
         supply,
         pipeline_graph,
         _environment(),
         compiler_context,
         dict(zip(style_references, style_contents)).__getitem__,
         _CannyBuilder(),
+        allowlist,
         store,
         torch_module=torch,
         diffusers_module=diffusers,
@@ -502,7 +549,9 @@ def test_job_store_write_failure_propagates_the_original_infrastructure_error(
 ) -> None:
     style_contents = (_png("red"),)
     supply, pipeline_graph = _supply(tmp_path / "weights")
-    spec_text, compiler_context = _compiler_inputs(pipeline_graph, style_contents)
+    spec_text, compiler_context, allowlist = _compiler_inputs(
+        pipeline_graph, style_contents
+    )
     style_references = (AssetRef(AssetId("style-0"), hash_bytes(style_contents[0])),)
     request = _job_request(f"job-store-{failure_stage}", spec_text, style_references)
     store_root = tmp_path / "store"
@@ -531,13 +580,15 @@ def test_job_store_write_failure_propagates_the_original_infrastructure_error(
         return real_append(job_id, event)
 
     monkeypatch.setattr(store, "append_event", append_event)
-    runtime = _open_production_generation_runtime(
+    runtime = _open_runtime(
+        tmp_path,
         supply,
         pipeline_graph,
         _environment(),
         compiler_context,
         dict(zip(style_references, style_contents)).__getitem__,
         _CannyBuilder(),
+        allowlist,
         store,
         torch_module=torch,
         diffusers_module=diffusers,
@@ -603,7 +654,9 @@ def _open_clock_case(
 ) -> tuple[Any, Any, JobStore, ProductionJobRequest, dict[str, InfrastructureError]]:
     style_contents = (_png("red"),)
     supply, pipeline_graph = _supply(tmp_path / "weights")
-    spec_text, compiler_context = _compiler_inputs(pipeline_graph, style_contents)
+    spec_text, compiler_context, allowlist = _compiler_inputs(
+        pipeline_graph, style_contents
+    )
     style_references = (AssetRef(AssetId("style-0"), hash_bytes(style_contents[0])),)
     request = _job_request("job-clock", spec_text, style_references)
     store_root = tmp_path / "store"
@@ -612,13 +665,15 @@ def _open_clock_case(
     torch, diffusers = _Torch(), _Diffusers()
     observed = _configure_clock_pipeline(monkeypatch, torch, failure)
     clock = iter(timestamps).__next__
-    runtime = _open_production_generation_runtime(
+    runtime = _open_runtime(
+        tmp_path,
         supply,
         pipeline_graph,
         _environment(),
         compiler_context,
         dict(zip(style_references, style_contents)).__getitem__,
         _CannyBuilder(),
+        allowlist,
         store,
         torch_module=torch,
         diffusers_module=diffusers,
