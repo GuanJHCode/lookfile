@@ -23,7 +23,7 @@ class MetricThreshold:
     def __post_init__(self) -> None:
         if type(self.metric_id) is not str or not self.metric_id:
             raise DomainError("invalid metric threshold")
-        if self.operator not in ("gte", "lte"):
+        if type(self.operator) is not str or self.operator not in ("gte", "lte"):
             raise DomainError("invalid metric operator")
         if type(self.value) is not float or self.value != self.value:
             raise DomainError("invalid metric value")
@@ -48,7 +48,11 @@ class ThresholdProfile:
     thresholds: tuple[MetricThreshold, ...]
 
     def __post_init__(self) -> None:
-        if self.status not in ("DRAFT", "VALIDATED", "REVOKED"):
+        if type(self.status) is not str or self.status not in (
+            "DRAFT",
+            "VALIDATED",
+            "REVOKED",
+        ):
             raise DomainError("invalid threshold status")
         for name in (
             "profile_id",

@@ -41,6 +41,12 @@ def evaluate_style_fidelity(
         return RuleResult(
             RULE_STYLE_FIDELITY, RuleStatus.UNVERIFIABLE, (artifact_id,), None
         )
+    if profile.status == "REVOKED":
+        return RuleResult(RULE_STYLE_FIDELITY, RuleStatus.FAIL, (artifact_id,), score)
+    if profile.status == "DRAFT":
+        return RuleResult(
+            RULE_STYLE_FIDELITY, RuleStatus.UNVERIFIABLE, (artifact_id,), score
+        )
     metric = next(
         (
             t
@@ -53,7 +59,5 @@ def evaluate_style_fidelity(
         return RuleResult(
             RULE_STYLE_FIDELITY, RuleStatus.UNVERIFIABLE, (artifact_id,), score
         )
-    if profile.status == "REVOKED":
-        return RuleResult(RULE_STYLE_FIDELITY, RuleStatus.FAIL, (artifact_id,), score)
     status = _apply_threshold(score, metric)
     return RuleResult(RULE_STYLE_FIDELITY, status, (artifact_id,), score)

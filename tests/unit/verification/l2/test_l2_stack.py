@@ -4,8 +4,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from specstyle.domain.enums import RuleStatus
 from specstyle.domain.identifiers import ArtifactId, Sha256
+from specstyle.errors import DomainError
 from specstyle.observability.hashing import hash_bytes
 from specstyle.verification.l2.batch_consistency import evaluate_batch_consistency
 from specstyle.verification.l2.encoder import (
@@ -30,6 +33,13 @@ def _pin() -> EncoderPin:
 
 def _sha(ch: str = "a") -> Sha256:
     return Sha256((ch if ch in "0123456789abcdef" else "a") * 64)
+
+
+class _HostileString(str):
+    def __eq__(self, _other: object) -> bool:
+        return True
+
+    __hash__ = str.__hash__
 
 
 def _profile(**kwargs) -> ThresholdProfile:
@@ -80,6 +90,31 @@ def test_threshold_profile_roundtrip_and_required() -> None:
         assert "VALIDATED" in str(exc)
 
 
+@pytest.mark.parametrize(
+    "status",
+    [
+        pytest.param("UNKNOWN", id="unknown"),
+        pytest.param("CALIBRATED", id="calibrated"),
+        pytest.param(_HostileString("UNKNOWN"), id="hostile-subclass"),
+    ],
+)
+def test_threshold_profile_rejects_noncanonical_status(status: object) -> None:
+    with pytest.raises(DomainError, match="invalid threshold status"):
+        _profile(status=status)
+
+
+@pytest.mark.parametrize(
+    "operator",
+    [
+        pytest.param("unknown", id="unknown"),
+        pytest.param(_HostileString("unknown"), id="hostile-subclass"),
+    ],
+)
+def test_metric_threshold_rejects_noncanonical_operator(operator: object) -> None:
+    with pytest.raises(DomainError, match="invalid metric operator"):
+        MetricThreshold("reference_style_fidelity_min", operator, 0.0)
+
+
 def test_fidelity_empty_refs_unverifiable() -> None:
     enc = FakeStyleEncoder(_pin())
     out = enc.encode(b"img", _sha("1"))
@@ -87,13 +122,45 @@ def test_fidelity_empty_refs_unverifiable() -> None:
     assert result.status is RuleStatus.UNVERIFIABLE
 
 
-def test_fidelity_pass_with_self_reference() -> None:
+@pytest.mark.parametrize(
+    ("threshold_value", "expected_status"),
+    [(0.0, RuleStatus.PASS), (2.0, RuleStatus.FAIL)],
+)
+def test_validated_profile_applies_fidelity_threshold(
+    threshold_value: float, expected_status: RuleStatus
+) -> None:
     enc = FakeStyleEncoder(_pin())
     feat = enc.encode(b"same", _sha("2"))
-    result = evaluate_style_fidelity(ArtifactId("a1"), feat, (feat,), _profile())
-    assert result.status is RuleStatus.PASS
+    profile = _profile(
+        thresholds=(
+            MetricThreshold("reference_style_fidelity_min", "gte", threshold_value),
+        )
+    )
+
+    result = evaluate_style_fidelity(ArtifactId("a1"), feat, (feat,), profile)
+
+    assert result.status is expected_status
     assert result.score is not None
     assert cosine_similarity(feat, feat) > 0.99
+
+
+@pytest.mark.parametrize("threshold_value", [0.0, 2.0])
+def test_draft_profile_cannot_gate_reliable_fidelity_score(
+    threshold_value: float,
+) -> None:
+    enc = FakeStyleEncoder(_pin())
+    feat = enc.encode(b"same", _sha("2"))
+    profile = _profile(
+        status="DRAFT",
+        thresholds=(
+            MetricThreshold("reference_style_fidelity_min", "gte", threshold_value),
+        ),
+    )
+
+    result = evaluate_style_fidelity(ArtifactId("a1"), feat, (feat,), profile)
+
+    assert result.status is RuleStatus.UNVERIFIABLE
+    assert result.score is not None
 
 
 def test_batch_consistency_outlier_affected_ids() -> None:
@@ -134,9 +201,7 @@ def test_batch_consistency_outlier_affected_ids() -> None:
 
 
 def test_nan_feature_rejected_by_style_feature() -> None:
-    from specstyle.errors import DomainError
     from specstyle.verification.l2.encoder import StyleFeature
-    import pytest
 
     with pytest.raises(DomainError):
         StyleFeature((1.0, float("nan")), _pin(), _sha("1"))
@@ -149,9 +214,13 @@ def test_revoked_profile_fails_fidelity() -> None:
         ArtifactId("a1"),
         feat,
         (feat,),
-        _profile(status="REVOKED"),
+        _profile(
+            status="REVOKED",
+            thresholds=(MetricThreshold("batch_style_dispersion_max", "lte", 2.0),),
+        ),
     )
     assert result.status is RuleStatus.FAIL
+    assert result.score is not None
 
 
 def test_batch_permutation_stable_outliers() -> None:
