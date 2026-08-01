@@ -8,6 +8,7 @@ UNKNOWN/BLOCKED as production-ready.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import re
 from typing import Literal
 
 from specstyle.domain.identifiers import Sha256
@@ -17,10 +18,13 @@ from specstyle.generation.model_registry import (
     ModelDescriptor,
     ModelRegistry,
     ModelRole,
+    is_known_placeholder_digest,
+    validate_production_license,
 )
 
 Redistribution = Literal["allowed", "restricted", "forbidden", "unknown"]
 CommercialUse = Literal["allowed", "restricted", "forbidden", "unknown"]
+_FULL_REVISION = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
 
 
 @dataclass(frozen=True, slots=True)
@@ -249,6 +253,12 @@ def with_license_status(
         if type(item) is not CandidateModel:
             raise DomainError("invalid candidate")
         if item.model_id == model_id:
+            if status == "APPROVED" and _FULL_REVISION.fullmatch(item.revision) is None:
+                raise DomainError("placeholder or floating revision cannot be approved")
+            if status == "APPROVED":
+                validate_production_license(item.evidence.spdx)
+                if is_known_placeholder_digest(item.expected_sha256):
+                    raise DomainError("known placeholder digest cannot be approved")
             out.append(replace(item, license_status=status))
             found = True
         else:
@@ -260,21 +270,80 @@ def with_license_status(
 
 def approved_production_registry(
     candidates: tuple[CandidateModel, ...],
+    manifests: tuple[object, ...],
+    approvals: tuple[object, ...],
 ) -> ModelRegistry:
-    """Only APPROVED candidates become production registry entries."""
-    if type(candidates) is not tuple:
-        raise DomainError("invalid candidates")
-    approved: list[ModelDescriptor] = []
-    for item in candidates:
-        if type(item) is not CandidateModel:
-            raise DomainError("invalid candidate")
-        if item.license_status == "APPROVED":
-            if item.evidence.spdx in ("", "UNKNOWN"):
-                raise DomainError("APPROVED requires concrete license")
-            approved.append(item.to_descriptor())
-    if not approved:
-        raise DomainError("no APPROVED production models")
-    return ModelRegistry(tuple(approved))
+    """Build the production registry only from independently approved manifests."""
+    from specstyle.generation.model_approval import LicenseApproval
+    from specstyle.generation.weight_manifest import (
+        WeightManifest,
+        manifest_root_sha256,
+        manifest_sha256,
+    )
+
+    if (
+        type(candidates) is not tuple
+        or type(manifests) is not tuple
+        or type(approvals) is not tuple
+        or len(candidates) != 3
+        or len(manifests) != 3
+        or len(approvals) != 3
+        or any(type(item) is not CandidateModel for item in candidates)
+        or any(type(item) is not WeightManifest for item in manifests)
+        or any(type(item) is not LicenseApproval for item in approvals)
+    ):
+        raise DomainError("invalid independent production approval inputs")
+    required_roles = ("base", "ip_adapter", "controlnet")
+    candidate_by_role = _exact_role_map(candidates, required_roles)
+    manifest_by_role = _exact_role_map(manifests, required_roles)
+    approval_by_model = {item.model_id: item for item in approvals}
+    if len(approval_by_model) != 3:
+        raise DomainError("duplicate independent production approval")
+    descriptors: list[ModelDescriptor] = []
+    families: set[str] = set()
+    for role in required_roles:
+        candidate = candidate_by_role[role]
+        manifest = manifest_by_role[role]
+        approval = approval_by_model.get(candidate.model_id)
+        if approval is None:
+            raise DomainError("independent production approval missing")
+        if (
+            candidate.license_status != "APPROVED"
+            or candidate.model_id != manifest.model_id
+            or candidate.revision != manifest.revision
+            or candidate.weights_relpath != manifest.relative_root
+            or candidate.expected_sha256 != manifest.root_sha256
+            or manifest.root_sha256 != manifest_root_sha256(manifest)
+            or approval.revision != manifest.revision
+            or approval.manifest_sha256 != manifest_sha256(manifest)
+            or approval.license_spdx != candidate.evidence.spdx
+            or approval.evidence_url != candidate.evidence.license_url
+        ):
+            raise DomainError("independent production approval mismatch")
+        validate_production_license(candidate.evidence.spdx)
+        if is_known_placeholder_digest(candidate.expected_sha256):
+            raise DomainError("known placeholder digest cannot enter production")
+        descriptor = candidate.to_descriptor()
+        ModelRegistry((descriptor,)).require_production(candidate.model_id)
+        descriptors.append(descriptor)
+        families.add(candidate.family)
+    if len(families) != 1:
+        raise DomainError("production model family mismatch")
+    return ModelRegistry(tuple(descriptors))
+
+
+def _exact_role_map(
+    items: tuple[object, ...], required_roles: tuple[str, ...]
+) -> dict[str, object]:
+    by_role: dict[str, object] = {}
+    for item in items:
+        role = item.role  # type: ignore[attr-defined]
+        if role in by_role:
+            raise DomainError("duplicate production component role")
+        by_role[role] = item
+    if set(by_role) != set(required_roles):
+        raise DomainError("invalid production component roles")
+    return by_role
 
 
 def catalog_summary(

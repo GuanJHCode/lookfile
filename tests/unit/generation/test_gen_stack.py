@@ -23,30 +23,33 @@ def _sha(c: str = "a") -> Sha256:
     return Sha256(c * 64)
 
 
+_REVISION = "a" * 40
+
+
 def _registry() -> ModelRegistry:
     fam = "sdxl"
     return ModelRegistry(
         (
             ModelDescriptor(
-                "base1", "base", "rev1", _sha("1"), "Apache-2.0", "APPROVED", fam
+                "base1", "base", _REVISION, _sha("1"), "Apache-2.0", "APPROVED", fam
             ),
             ModelDescriptor(
-                "ip1", "ip_adapter", "rev1", _sha("2"), "Apache-2.0", "APPROVED", fam
+                "ip1", "ip_adapter", _REVISION, _sha("2"), "Apache-2.0", "APPROVED", fam
             ),
             ModelDescriptor(
-                "cn1", "controlnet", "rev1", _sha("3"), "Apache-2.0", "APPROVED", fam
+                "cn1", "controlnet", _REVISION, _sha("3"), "Apache-2.0", "APPROVED", fam
             ),
             ModelDescriptor(
                 "prev1",
                 "preview_adapter",
-                "rev1",
+                _REVISION,
                 _sha("4"),
                 "Apache-2.0",
                 "APPROVED",
                 fam,
             ),
             ModelDescriptor(
-                "bad", "base", "rev1", _sha("5"), "Unknown", "UNKNOWN", fam
+                "bad", "base", _REVISION, _sha("5"), "Unknown", "UNKNOWN", fam
             ),
         )
     )
@@ -124,19 +127,25 @@ def test_family_mismatch_blocked() -> None:
     reg = ModelRegistry(
         (
             ModelDescriptor(
-                "base1", "base", "rev1", _sha("1"), "Apache-2.0", "APPROVED", "sdxl"
+                "base1", "base", _REVISION, _sha("1"), "Apache-2.0", "APPROVED", "sdxl"
             ),
             ModelDescriptor(
                 "ip1",
                 "ip_adapter",
-                "rev1",
+                _REVISION,
                 _sha("2"),
                 "Apache-2.0",
                 "APPROVED",
                 "other",
             ),
             ModelDescriptor(
-                "cn1", "controlnet", "rev1", _sha("3"), "Apache-2.0", "APPROVED", "sdxl"
+                "cn1",
+                "controlnet",
+                _REVISION,
+                _sha("3"),
+                "Apache-2.0",
+                "APPROVED",
+                "sdxl",
             ),
         )
     )
@@ -149,7 +158,7 @@ def test_blocked_license_not_production() -> None:
     reg = ModelRegistry(
         (
             ModelDescriptor(
-                "base1", "base", "rev1", _sha("1"), "Proprietary", "BLOCKED", "sdxl"
+                "base1", "base", _REVISION, _sha("1"), "Proprietary", "BLOCKED", "sdxl"
             ),
         )
     )

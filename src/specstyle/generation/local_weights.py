@@ -17,7 +17,7 @@ class ResolvedWeight:
     model_id: str
     path: Path
     content_sha256: Sha256
-    kind: str  # file | directory_marker
+    kind: str  # legacy_single_file only; not a production authorization
 
 
 def _validate_relpath(relpath: str) -> str:
@@ -33,19 +33,15 @@ def resolve_weight(
     cache_root: Path,
     descriptor: ModelDescriptor,
     relpath: str,
-    *,
-    marker_name: str = "WEIGHTS.sha256",
 ) -> ResolvedWeight:
     """Resolve a model under ``cache_root/relpath``.
 
-    Accepts either a single regular file whose SHA matches ``expected_sha256``,
-    or a directory containing ``marker_name`` whose first 64 hex chars match.
-    Never follows the final path component as a symlink (O_NOFOLLOW when open).
+    Legacy/test-only helper for a single regular file whose SHA matches
+    ``expected_sha256``. Directory markers are explicitly refused and this
+    result is not a production-loading capability.
     """
     if not isinstance(cache_root, Path) or type(descriptor) is not ModelDescriptor:
         raise DomainError("invalid weight resolve inputs")
-    if type(marker_name) is not str or not marker_name or "/" in marker_name:
-        raise DomainError("invalid marker name")
     safe = _validate_relpath(relpath)
     root = cache_root
     if not root.is_dir():
@@ -61,21 +57,9 @@ def resolve_weight(
         digest = hash_file(root, safe)
         if digest != descriptor.expected_sha256:
             raise InfrastructureError("model weight hash mismatch")
-        return ResolvedWeight(descriptor.model_id, target, digest, "file")
+        return ResolvedWeight(descriptor.model_id, target, digest, "legacy_single_file")
     if stat_is_dir(st):
-        marker_rel = f"{safe}/{marker_name}"
-        marker = root.joinpath(*marker_rel.split("/"))
-        try:
-            mst = os.lstat(marker)
-        except OSError as exc:
-            raise InfrastructureError("model weight marker missing") from exc
-        if stat_is_symlink(mst) or not stat_is_file(mst):
-            raise InfrastructureError("model weight marker invalid")
-        text = _read_marker(marker)
-        digest = Sha256(text[:64].lower())
-        if digest != descriptor.expected_sha256:
-            raise InfrastructureError("model weight hash mismatch")
-        return ResolvedWeight(descriptor.model_id, target, digest, "directory_marker")
+        raise InfrastructureError("legacy directory marker production loading disabled")
     raise InfrastructureError("model weights unsupported type")
 
 
@@ -94,27 +78,6 @@ def resolve_graph_weights(
             raise DomainError("missing weights relpath")
         out.append(resolve_weight(cache_root, desc, relpaths[desc.model_id]))
     return tuple(out)
-
-
-def _read_marker(path: Path) -> str:
-    try:
-        flags = os.O_RDONLY
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        fd = os.open(path, flags)
-    except OSError as exc:
-        raise InfrastructureError("model weight marker open failed") from exc
-    try:
-        raw = os.read(fd, 128)
-    finally:
-        os.close(fd)
-    try:
-        text = raw.decode("ascii").strip()
-    except UnicodeDecodeError as exc:
-        raise InfrastructureError("model weight marker corrupt") from exc
-    if len(text) < 64:
-        raise InfrastructureError("model weight marker corrupt")
-    return text
 
 
 def stat_is_symlink(st: os.stat_result) -> bool:
