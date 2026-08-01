@@ -9,7 +9,11 @@ from __future__ import annotations
 
 import json
 import os
+import threading
+import weakref
 from collections.abc import Mapping
+from contextlib import contextmanager
+from dataclasses import fields, is_dataclass
 from pathlib import Path
 
 from specstyle.domain.enums import (
@@ -41,6 +45,7 @@ from specstyle.workflow.job_models import (
     JobBudget,
     JobSnapshot,
     JobStartedPayload,
+    JobState,
     JobStatus,
     RecoverablePayload,
     RepairStepPayload,
@@ -50,6 +55,17 @@ from specstyle.workflow.job_models import (
 from specstyle.workflow.state_machine import replay_events, validate_transition
 
 _SNAPSHOT_VERSION = "specstyle.workflow.snapshot.v1"
+_JOB_LOCKS_GUARD = threading.Lock()
+
+
+class _JobLockHolder:
+    def __init__(self) -> None:
+        self.lock = threading.RLock()
+
+
+_JOB_LOCKS: weakref.WeakValueDictionary[tuple[str, str], _JobLockHolder] = (
+    weakref.WeakValueDictionary()
+)
 _ID_FIELDS = {
     "job_id": JobId,
     "attempt_id": AttemptId,
@@ -376,6 +392,129 @@ def _event_from_primitive(data: object) -> Event:
     )
 
 
+def _canonical_genesis(job: Job) -> JobSnapshot:
+    """从 snapshot 所携带的不可变 Job 材料重建唯一的 seq=0 genesis。"""
+    if type(job) is not Job:
+        raise DomainError("invalid job snapshot") from None
+    genesis_job = Job(
+        job.job_id,
+        job.compiled_spec_hash,
+        job.cohort_profiles,
+        JobBudget(job.budget.max_attempts_per_item),
+        JobStatus.CREATED,
+        job.created_at,
+        job.created_at,
+    )
+    return JobSnapshot(_SNAPSHOT_VERSION, genesis_job, 0, (), ())
+
+
+def _snapshot_to_primitive(snapshot: JobSnapshot) -> dict[str, object]:
+    return {
+        "schema_version": _SNAPSHOT_VERSION,
+        "job": _job_to_primitive(snapshot.job),
+        "last_sequence": snapshot.last_sequence,
+        "attempt_ids": [attempt.value for attempt in snapshot.attempt_ids],
+        "bundle_names": list(snapshot.bundle_names),
+    }
+
+
+def _snapshot_from_primitive(primitive: object) -> JobSnapshot:
+    d = _exact_keys(
+        primitive,
+        {
+            "schema_version",
+            "job",
+            "last_sequence",
+            "attempt_ids",
+            "bundle_names",
+        },
+    )
+    if type(d["schema_version"]) is not str or d["schema_version"] != _SNAPSHOT_VERSION:
+        raise DomainError("invalid job snapshot")
+    return JobSnapshot(
+        _SNAPSHOT_VERSION,
+        _job_from_primitive(d["job"]),
+        _int_value(d, "last_sequence"),
+        tuple(AttemptId(value) for value in _str_list(d["attempt_ids"], "attempt ids")),
+        tuple(_str_list(d["bundle_names"], "bundle names")),
+    )
+
+
+def _rebuild_snapshot(snapshot: object, /) -> JobSnapshot:
+    if type(snapshot) is not JobSnapshot:
+        raise DomainError("invalid job snapshot") from None
+    try:
+        rebuilt = _snapshot_from_primitive(_snapshot_to_primitive(snapshot))
+    except Exception:
+        raise DomainError("invalid job snapshot") from None
+    if not _same_exact_structure(snapshot, rebuilt):
+        raise DomainError("invalid job snapshot") from None
+    return rebuilt
+
+
+def _validated_snapshot(
+    job_id: JobId, snapshot: JobSnapshot, events: tuple[Event, ...], /
+) -> JobState:
+    """验证完整、不截断的事件流，并证明 snapshot 是其精确 prefix。"""
+    if (
+        type(job_id) is not JobId
+        or type(snapshot) is not JobSnapshot
+        or type(events) is not tuple
+        or type(snapshot.last_sequence) is not int
+        or snapshot.job.job_id != job_id
+        or not 0 <= snapshot.last_sequence <= len(events)
+    ):
+        raise DomainError("invalid job snapshot") from None
+    genesis = _canonical_genesis(snapshot.job)
+    prefix = replay_events(genesis, events[: snapshot.last_sequence])
+    expected = JobSnapshot(
+        _SNAPSHOT_VERSION,
+        prefix.job,
+        prefix.last_sequence,
+        prefix.attempt_ids,
+        prefix.bundle_names,
+    )
+    if snapshot != expected:
+        raise DomainError("invalid job snapshot") from None
+    return replay_events(expected, events[snapshot.last_sequence :])
+
+
+def _safe_job_id(job_id: object, message: str, /) -> JobId:
+    try:
+        if type(job_id) is not JobId or type(job_id.value) is not str:
+            raise DomainError(message)
+        return JobId(str.__str__(job_id.value))
+    except (AttributeError, TypeError, ValueError, DomainError):
+        raise DomainError(message) from None
+
+
+def _rebuild_event(event: object, /) -> Event:
+    if type(event) is not Event:
+        raise DomainError("invalid job event") from None
+    try:
+        rebuilt = _event_from_primitive(_event_to_primitive(event))
+    except Exception:
+        raise DomainError("invalid job event") from None
+    if not _same_exact_structure(event, rebuilt):
+        raise DomainError("invalid job event") from None
+    return rebuilt
+
+
+def _same_exact_structure(left: object, right: object, /) -> bool:
+    if type(left) is not type(right):
+        return False
+    if is_dataclass(left):
+        return all(
+            _same_exact_structure(getattr(left, field.name), getattr(right, field.name))
+            for field in fields(left)
+        )
+    if type(left) is tuple:
+        return len(left) == len(right) and all(
+            _same_exact_structure(item, other) for item, other in zip(left, right)
+        )
+    return left == right
+
+
 class JobStore:
     def __init__(self, root: Path, /) -> None:
         if not isinstance(root, Path):
@@ -383,91 +522,134 @@ class JobStore:
         if not root.is_dir():
             raise DomainError("invalid job store root")
         self._root = root
+        self._lock_root = os.path.realpath(os.fspath(root))
+
+    @contextmanager
+    def _job_lock(self, job_id: JobId, /):
+        key = (self._lock_root, job_id.value)
+        with _JOB_LOCKS_GUARD:
+            holder = _JOB_LOCKS.get(key)
+            if holder is None:
+                holder = _JobLockHolder()
+                _JOB_LOCKS[key] = holder
+        with holder.lock:
+            yield
 
     def _job_dir(self, job_id: JobId) -> Path:
         return self._root / "jobs" / job_id.value
 
-    def load(self, job_id: JobId, /) -> object:
-        snapshot = self.get_snapshot(job_id)
+    def load(self, job_id: JobId, /) -> JobState:
+        job_id = _safe_job_id(job_id, "invalid job event")
+        snapshot, events = self._read_disk(job_id)
         if snapshot is None:
             raise DomainError("job not found") from None
-        events = self.list_events(job_id)
-        relevant = tuple(e for e in events if e.sequence > snapshot.last_sequence)
         try:
-            return replay_events(snapshot, relevant)
-        except DomainError:
-            raise
-        except Exception as cause:
-            raise InfrastructureError("job store corrupted") from cause
+            return _validated_snapshot(job_id, snapshot, events)
+        except Exception:
+            raise InfrastructureError("job store corrupted") from None
 
     def get_snapshot(self, job_id: JobId, /) -> JobSnapshot | None:
-        path = self._job_dir(job_id) / "snapshot.json"
-        if not path.exists():
+        job_id = _safe_job_id(job_id, "invalid job event")
+        snapshot, events = self._read_disk(job_id)
+        if snapshot is None:
             return None
         try:
+            _validated_snapshot(job_id, snapshot, events)
+        except Exception:
+            raise InfrastructureError("job store corrupted") from None
+        return snapshot
+
+    def _read_disk(
+        self, job_id: JobId, /
+    ) -> tuple[JobSnapshot | None, tuple[Event, ...]]:
+        job_id = _safe_job_id(job_id, "invalid job event")
+        snapshot = self._read_snapshot(job_id)
+        events = self._read_events(job_id)
+        if snapshot is None and events:
+            raise InfrastructureError("job store corrupted") from None
+        return snapshot, events
+
+    def _read_snapshot(self, job_id: JobId, /) -> JobSnapshot | None:
+        try:
+            path = self._job_dir(job_id) / "snapshot.json"
+            if not path.exists():
+                return None
             data = path.read_bytes()
         except OSError as cause:
             raise InfrastructureError("job store io failed") from cause
         try:
-            primitive = _parse(data)
-            d = _exact_keys(
-                primitive,
-                {
-                    "schema_version",
-                    "job",
-                    "last_sequence",
-                    "attempt_ids",
-                    "bundle_names",
-                },
-            )
-            if d["schema_version"] != _SNAPSHOT_VERSION:
-                raise DomainError("invalid job snapshot")
-            job = _job_from_primitive(d["job"])
-            attempts = tuple(
-                AttemptId(v) for v in _str_list(d["attempt_ids"], "attempt ids")
-            )
-            bundles = tuple(_str_list(d["bundle_names"], "bundle names"))
-            snapshot = JobSnapshot(
-                _SNAPSHOT_VERSION,
-                job,
-                _int_value(d, "last_sequence"),
-                attempts,
-                bundles,
-            )
-        except Exception as cause:
-            raise InfrastructureError("job store corrupted") from cause
-        return snapshot
+            return _snapshot_from_primitive(_parse(data))
+        except Exception:
+            raise InfrastructureError("job store corrupted") from None
 
     def save_snapshot(self, job_id: JobId, snapshot: JobSnapshot, /) -> None:
-        if snapshot.schema_version != _SNAPSHOT_VERSION:
+        try:
+            snapshot = _rebuild_snapshot(snapshot)
+            valid = (
+                type(job_id) is JobId
+                and type(job_id.value) is str
+                and type(snapshot.job) is Job
+                and snapshot.job.job_id == job_id
+            )
+        except (AttributeError, TypeError):
+            valid = False
+        if not valid:
             raise DomainError("invalid job snapshot") from None
+        job_id = _safe_job_id(job_id, "invalid job snapshot")
+        existing, events = self._read_disk(job_id)
+        try:
+            candidate_state = _validated_snapshot(job_id, snapshot, events)
+            if existing is None:
+                if snapshot != _canonical_genesis(snapshot.job):
+                    raise DomainError("invalid job snapshot")
+            else:
+                _validated_snapshot(job_id, existing, events)
+                if _canonical_genesis(existing.job) != _canonical_genesis(snapshot.job):
+                    raise DomainError("invalid job snapshot")
+                if snapshot.last_sequence < existing.last_sequence:
+                    raise DomainError("invalid job snapshot")
+                if (
+                    snapshot.last_sequence == existing.last_sequence
+                    and snapshot != existing
+                ):
+                    raise DomainError("invalid job snapshot")
+            del candidate_state
+        except (DomainError, TypeError, AttributeError):
+            raise DomainError("invalid job snapshot") from None
+        data = _canonical_json(_snapshot_to_primitive(snapshot))
         directory = self._job_dir(job_id)
-        directory.mkdir(parents=True, exist_ok=True)
-        primitive = {
-            "schema_version": _SNAPSHOT_VERSION,
-            "job": _job_to_primitive(snapshot.job),
-            "last_sequence": snapshot.last_sequence,
-            "attempt_ids": [a.value for a in snapshot.attempt_ids],
-            "bundle_names": list(snapshot.bundle_names),
-        }
-        data = _canonical_json(primitive)
         tmp = directory / "snapshot.tmp"
         try:
+            directory.mkdir(parents=True, exist_ok=True)
             with open(tmp, "wb") as handle:
                 handle.write(data)
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(tmp, directory / "snapshot.json")
-            _fsync_dir(directory)
+            _fsync_dir(directory, require=True)
         except OSError as cause:
             raise InfrastructureError("job store io failed") from cause
 
     def append_event(self, job_id: JobId, event: Event, /) -> Event:
+        if type(job_id) is not JobId or type(event) is not Event:
+            raise DomainError("invalid job event") from None
+        job_id = _safe_job_id(job_id, "invalid job event")
+        event = _rebuild_event(event)
+        with self._job_lock(job_id):
+            return self._append_event_locked(job_id, event)
+
+    def _append_event_locked(self, job_id: JobId, event: Event, /) -> Event:
+        try:
+            return self._append_event_locked_impl(job_id, event)
+        except (AttributeError, TypeError, ValueError):
+            raise DomainError("invalid job event") from None
+
+    def _append_event_locked_impl(self, job_id: JobId, event: Event, /) -> Event:
         state = self.load(job_id)
-        if state.job.terminal:  # type: ignore[attr-defined]
+        if state.job.terminal:
             raise DomainError("job is terminal") from None
-        attempts = {a.value for a in state.attempt_ids}  # type: ignore[attr-defined]
-        bundles = set(state.bundle_names)  # type: ignore[attr-defined]
+        attempts = {a.value for a in state.attempt_ids}
+        bundles = set(state.bundle_names)
         if event.event_type is EventType.ATTEMPT_STARTED:
             if event.payload.attempt_id.value in attempts:
                 raise DomainError("duplicate job attempt") from None
@@ -476,10 +658,10 @@ class JobStore:
                 raise DomainError("duplicate job export") from None
         if event.job_id != job_id:
             raise DomainError("invalid job event") from None
-        if event.from_state is not state.job.status:  # type: ignore[attr-defined]
+        if event.from_state is not state.job.status:
             raise DomainError("invalid job transition") from None
-        validate_transition(state.job.status, event.to_state, event.event_type)  # type: ignore[attr-defined]
-        sequence = state.last_sequence + 1  # type: ignore[attr-defined]
+        validate_transition(state.job.status, event.to_state, event.event_type)
+        sequence = state.last_sequence + 1
         finalized = Event(
             sequence,
             event.job_id,
@@ -489,11 +671,24 @@ class JobStore:
             event.timestamp,
             event.payload,
         )
+        try:
+            replay_events(
+                JobSnapshot(
+                    _SNAPSHOT_VERSION,
+                    state.job,
+                    state.last_sequence,
+                    state.attempt_ids,
+                    state.bundle_names,
+                ),
+                (finalized,),
+            )
+        except (DomainError, TypeError, AttributeError):
+            raise DomainError("invalid job event") from None
         directory = self._job_dir(job_id)
-        directory.mkdir(parents=True, exist_ok=True)
         path = directory / "events.ndjson"
         line = _canonical_json(_event_to_primitive(finalized)) + b"\n"
         try:
+            directory.mkdir(parents=True, exist_ok=True)
             with open(path, "ab") as handle:
                 handle.write(line)
                 handle.flush()
@@ -505,30 +700,44 @@ class JobStore:
         return finalized
 
     def list_events(self, job_id: JobId, /) -> tuple[Event, ...]:
-        path = self._job_dir(job_id) / "events.ndjson"
-        if not path.exists():
-            return ()
+        job_id = _safe_job_id(job_id, "invalid job event")
+        snapshot, events = self._read_disk(job_id)
+        if snapshot is not None:
+            try:
+                _validated_snapshot(job_id, snapshot, events)
+            except Exception:
+                raise InfrastructureError("job store corrupted") from None
+        return events
+
+    def _read_events(self, job_id: JobId, /) -> tuple[Event, ...]:
         try:
+            path = self._job_dir(job_id) / "events.ndjson"
+            if not path.exists():
+                return ()
             data = path.read_bytes()
         except OSError as cause:
             raise InfrastructureError("job store io failed") from cause
+        if data and not data.endswith(b"\n"):
+            raise InfrastructureError("job store corrupted") from None
         events: list[Event] = []
-        for line in data.split(b"\n"):
+        for line in data.splitlines():
             if not line:
-                continue
+                raise InfrastructureError("job store corrupted") from None
             try:
-                events.append(_event_from_primitive(_parse(line)))
-            except Exception as cause:
-                raise InfrastructureError("job store corrupted") from cause
+                event = _event_from_primitive(_parse(line))
+                if event.job_id != job_id:
+                    raise DomainError("invalid job event")
+                events.append(event)
+            except Exception:
+                raise InfrastructureError("job store corrupted") from None
         return tuple(events)
 
 
 def _fsync_dir(directory: Path, *, require: bool = False) -> None:
     """fsync 目录项。
 
-    ``require=True`` 时 open/fsync 失败向上抛 OSError（由调用方映射为
-    InfrastructureError），用于 append_event 耐久性；默认 best-effort 兼容
-    snapshot 路径的既有语义。
+    所有当前调用均以 ``require=True`` 要求目录项落盘；保留参数仅用于明确
+    表达调用方的耐久性要求。
     """
     try:
         fd = os.open(str(directory), os.O_RDONLY | os.O_DIRECTORY)
