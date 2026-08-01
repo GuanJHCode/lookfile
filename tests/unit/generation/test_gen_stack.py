@@ -10,7 +10,6 @@ from specstyle.domain.identifiers import Sha256
 from specstyle.errors import DomainError
 from specstyle.generation.diffusers_backend import (
     DiffusersBackend,
-    MockDiffusersPipeline,
 )
 from specstyle.generation.model_registry import ModelDescriptor, ModelRegistry
 from specstyle.generation.output_profiles import PROFILES, render_output_profile
@@ -108,19 +107,9 @@ def test_output_profiles_sizes_and_deterministic() -> None:
         assert img.size == layout.size
 
 
-def test_mock_diffusers_backend_parameter_mapping() -> None:
-    from tests.unit.exporting.test_manifest import _production_request
-
-    request = _production_request()
-    pipe = MockDiffusersPipeline()
-    reg = _registry()
-    factory = PipelineFactory(reg, Path("cache"))
-    graph = factory.build_production("base1", "ip1", "cn1")
-    backend = DiffusersBackend(graph, pipe)
-    artifact = backend.generate(request)
-    assert artifact.content.startswith(b"\x89PNG")
-    assert pipe.calls
-    assert pipe.calls[0]["generator_seed"] == request.seed.seed
+def test_diffusers_backend_rejects_unsealed_pipeline_injection() -> None:
+    with pytest.raises(DomainError, match="loaded production pipeline"):
+        DiffusersBackend(object(), lambda _ref: b"")
 
 
 def test_family_mismatch_blocked() -> None:
