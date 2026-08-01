@@ -97,3 +97,18 @@ def test_job_snapshot_rejects_wrong_schema_version() -> None:
 def test_job_state_rejects_non_tuple_fields() -> None:
     with pytest.raises(DomainError):
         JobState(_job(), 0, [], [])  # type: ignore[arg-type]
+
+
+def test_snapshot_and_state_reject_duplicate_ids_and_bundle_names() -> None:
+    from specstyle.domain.identifiers import AttemptId
+
+    with pytest.raises(DomainError, match="invalid job snapshot"):
+        JobSnapshot(
+            "specstyle.workflow.snapshot.v1",
+            _job(),
+            0,
+            (AttemptId("att1"), AttemptId("att1")),
+            (),
+        )
+    with pytest.raises(DomainError, match="invalid job state"):
+        JobState(_job(), 0, (), ("bundle1", "bundle1"))

@@ -440,7 +440,11 @@ class JobSnapshot:
     bundle_names: tuple[str, ...]
 
     def __post_init__(self) -> None:
-        if self.schema_version != "specstyle.workflow.snapshot.v1":
+        if (
+            type(self.schema_version) is not str
+            or self.schema_version != "specstyle.workflow.snapshot.v1"
+            or type(self.job) is not Job
+        ):
             _invalid("invalid job snapshot")
         last = _exact_int(self.last_sequence, "last sequence")
         if last < 0:
@@ -449,6 +453,10 @@ class JobSnapshot:
             _invalid("invalid job snapshot")
         attempts = tuple(_rebuild_id(item, AttemptId) for item in self.attempt_ids)
         bundles = tuple(_bundle_name(item) for item in self.bundle_names)
+        if len({item.value for item in attempts}) != len(attempts) or len(
+            set(bundles)
+        ) != len(bundles):
+            _invalid("invalid job snapshot")
         object.__setattr__(self, "last_sequence", last)
         object.__setattr__(self, "attempt_ids", attempts)
         object.__setattr__(self, "bundle_names", bundles)
@@ -471,6 +479,10 @@ class JobState:
             _invalid("invalid job state")
         attempts = tuple(_rebuild_id(item, AttemptId) for item in self.attempt_ids)
         bundles = tuple(_bundle_name(item) for item in self.bundle_names)
+        if len({item.value for item in attempts}) != len(attempts) or len(
+            set(bundles)
+        ) != len(bundles):
+            _invalid("invalid job state")
         object.__setattr__(self, "last_sequence", last)
         object.__setattr__(self, "attempt_ids", attempts)
         object.__setattr__(self, "bundle_names", bundles)

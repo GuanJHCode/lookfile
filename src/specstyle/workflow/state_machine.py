@@ -10,11 +10,14 @@ from __future__ import annotations
 from specstyle.errors import DomainError
 
 from specstyle.workflow.job_models import (
+    Event,
     EventType,
     Job,
     JobSnapshot,
     JobState,
     JobStatus,
+    JobStartedPayload,
+    SpecCompiledPayload,
 )
 
 TRANSITIONS: dict[JobStatus, frozenset[JobStatus]] = {
@@ -137,36 +140,51 @@ def replay_events(snapshot: JobSnapshot, events: tuple[object, ...], /) -> JobSt
     重复 sequence/attempt_id/bundle_name、乱序（非连续递增）→
     ``DomainError("invalid job event") from None``。
     """
-    status = snapshot.job.status
-    last = snapshot.last_sequence
-    attempts: list[str] = [a.value for a in snapshot.attempt_ids]
-    bundles: list[str] = list(snapshot.bundle_names)
-    updated_at = snapshot.job.updated_at
-    for event in events:
-        if event.sequence != last + 1:  # type: ignore[attr-defined]
-            raise DomainError("invalid job event") from None
-        validate_transition(status, event.to_state, event.event_type)  # type: ignore[attr-defined]
-        _check_idempotent(event, attempts, bundles)  # type: ignore[arg-type]
-        status = event.to_state  # type: ignore[attr-defined]
-        last = event.sequence  # type: ignore[attr-defined]
-        updated_at = event.timestamp  # type: ignore[attr-defined]
-    new_job = Job(
-        snapshot.job.job_id,
-        snapshot.job.compiled_spec_hash,
-        snapshot.job.cohort_profiles,
-        snapshot.job.budget,
-        status,
-        snapshot.job.created_at,
-        updated_at,
-    )
-    from specstyle.domain.identifiers import AttemptId
+    try:
+        if type(snapshot) is not JobSnapshot or type(events) is not tuple:
+            raise DomainError("invalid job event")
+        if type(snapshot.job) is not Job:
+            raise DomainError("invalid job event")
+        status = snapshot.job.status
+        last = snapshot.last_sequence
+        attempts: list[str] = [a.value for a in snapshot.attempt_ids]
+        bundles: list[str] = list(snapshot.bundle_names)
+        updated_at = snapshot.job.updated_at
+        for event in events:
+            if type(event) is not Event:
+                raise DomainError("invalid job event")
+            if (
+                event.job_id != snapshot.job.job_id
+                or event.sequence != last + 1
+                or event.from_state is not status
+                or event.timestamp < updated_at
+            ):
+                raise DomainError("invalid job event")
+            _check_bound_payload(snapshot.job, event)
+            validate_transition(status, event.to_state, event.event_type)
+            _check_idempotent(event, attempts, bundles)
+            status = event.to_state
+            last = event.sequence
+            updated_at = event.timestamp
+        new_job = Job(
+            snapshot.job.job_id,
+            snapshot.job.compiled_spec_hash,
+            snapshot.job.cohort_profiles,
+            snapshot.job.budget,
+            status,
+            snapshot.job.created_at,
+            updated_at,
+        )
+        from specstyle.domain.identifiers import AttemptId
 
-    return JobState(
-        new_job,
-        last,
-        tuple(AttemptId(a) for a in attempts),
-        tuple(bundles),
-    )
+        return JobState(
+            new_job,
+            last,
+            tuple(AttemptId(a) for a in attempts),
+            tuple(bundles),
+        )
+    except (DomainError, AttributeError, TypeError, ValueError):
+        raise DomainError("invalid job event") from None
 
 
 def _check_idempotent(event: object, attempts: list[str], bundles: list[str]) -> None:
@@ -180,3 +198,23 @@ def _check_idempotent(event: object, attempts: list[str], bundles: list[str]) ->
         if bn in bundles:
             raise DomainError("invalid job event") from None
         bundles.append(bn)
+
+
+def _check_bound_payload(job: Job, event: Event) -> None:
+    """验证 genesis 不可变材料不会被事件日志替换。"""
+    if event.event_type is EventType.JOB_STARTED:
+        payload = event.payload
+        if (
+            type(payload) is not JobStartedPayload
+            or payload.compiled_spec_hash != job.compiled_spec_hash
+            or payload.cohort_profiles != job.cohort_profiles
+            or payload.budget != job.budget
+        ):
+            raise DomainError("invalid job event") from None
+    elif event.event_type is EventType.SPEC_COMPILED:
+        payload = event.payload
+        if (
+            type(payload) is not SpecCompiledPayload
+            or payload.compiled_spec_hash != job.compiled_spec_hash
+        ):
+            raise DomainError("invalid job event") from None
