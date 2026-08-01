@@ -111,19 +111,35 @@ def _official_registry_inputs() -> tuple[
             entrypoint = ModelLoadEntrypoint(
                 "diffusers_ip_adapter", "pipeline", "model.safetensors"
             )
+        files = [
+            WeightFile(
+                "pipeline/model.safetensors",
+                len(payload),
+                hash_bytes(payload),
+            )
+        ]
+        if role == "ip_adapter":
+            files.extend(
+                (
+                    WeightFile(
+                        "pipeline/image_encoder/config.json",
+                        2,
+                        hash_bytes(b"{}"),
+                    ),
+                    WeightFile(
+                        "pipeline/image_encoder/model.safetensors",
+                        7,
+                        hash_bytes(b"encoder"),
+                    ),
+                )
+            )
         manifest = WeightManifest(
             model_id,
             role,
             _REVISION,
             relative_root,
             entrypoint,
-            (
-                WeightFile(
-                    "pipeline/model.safetensors",
-                    len(payload),
-                    hash_bytes(payload),
-                ),
-            ),
+            tuple(files),
             Sha256("0" * 64),
         ).with_computed_root()
         evidence_url = f"https://licenses.example/{model_id}"

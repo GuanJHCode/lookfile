@@ -6,21 +6,39 @@ import importlib
 import gc
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from importlib import metadata as importlib_metadata
 from pathlib import Path
 from typing import Any
 
 from specstyle.domain.identifiers import Sha256
 from specstyle.errors import DomainError, InfrastructureError
+from specstyle.generation.image_evidence import (
+    _EVIDENCE_CONTRACT_ERROR,
+    _ProcessorProvenance,
+    _VerifiedImageEvidence,
+    _build_processor_provenance,
+    _classify_encoding_failure,
+    _close_image_quietly,
+    _decode_image_evidence_input,
+    _derive_preprocessing_version,
+    _encoder_placement,
+    _run_image_evidence_encoder,
+    _validate_frozen_encoder_placement,
+    _validate_image_processor,
+)
 from specstyle.generation.local_weights import ResolvedWeight
 from specstyle.generation.model_approval import VerifiedPipelineSupply
 from specstyle.generation.pipeline_factory import PipelineGraph
 from specstyle.generation.rocm_probe import RocmProbeResult
 from specstyle.observability.environment import EnvironmentSnapshot, hash_environment
+from specstyle.spec.compiled_models import ResourcePin
 
 PipelineBuilder = Callable[[PipelineGraph, tuple[ResolvedWeight, ...]], Any]
 _CAPABILITY_SEAL = object()
 _ROCM_VERSION = "7.2.1"
 _DIFFUSERS_VERSION = "0.39.0"
+_IMAGE_EVIDENCE_CAPABILITY_SEAL = object()
+_EVIDENCE_LAYER = "hidden_states[-2]"
 
 
 @dataclass(frozen=True, slots=True, init=False)
@@ -28,10 +46,18 @@ class LoadedPipeline:
     """A loader-issued capability; the verified model supply remains caller-owned."""
 
     _pipeline: Any = field(repr=False, compare=False)
+    _pipeline_identity: Any = field(repr=False, compare=False)
     _graph: PipelineGraph = field(repr=False, compare=False)
     _environment_hash: Sha256 = field(repr=False, compare=False)
     _runtime: tuple[str, str, str, str] = field(repr=False, compare=False)
     _torch: Any = field(repr=False, compare=False)
+    _image_encoder: Any = field(repr=False, compare=False)
+    _image_processor: Any = field(repr=False, compare=False)
+    _image_encoder_device: Any = field(repr=False, compare=False)
+    _image_encoder_dtype: Any = field(repr=False, compare=False)
+    _image_encoder_pin: ResourcePin = field(repr=False, compare=False)
+    _transformers: Any = field(repr=False, compare=False)
+    _processor_provenance: _ProcessorProvenance = field(repr=False, compare=False)
     _closed: bool = field(repr=False, compare=False)
     _seal: object = field(repr=False, compare=False)
 
@@ -42,6 +68,13 @@ class LoadedPipeline:
         _validate_loaded_pipeline(self, require_open=True)
         return self._pipeline
 
+    def _borrow_image_evidence_encoder(self, /) -> _VerifiedImageEvidenceEncoder:
+        _validate_image_evidence_owner(self)
+        capability = object.__new__(_VerifiedImageEvidenceEncoder)
+        object.__setattr__(capability, "_owner", self)
+        object.__setattr__(capability, "_seal", _IMAGE_EVIDENCE_CAPABILITY_SEAL)
+        return capability
+
     def close(self) -> None:
         _validate_loaded_pipeline(self, require_open=False)
         if self._closed:
@@ -49,6 +82,11 @@ class LoadedPipeline:
         pipeline = self._pipeline
         object.__setattr__(self, "_closed", True)
         object.__setattr__(self, "_pipeline", None)
+        object.__setattr__(self, "_pipeline_identity", None)
+        object.__setattr__(self, "_image_encoder", None)
+        object.__setattr__(self, "_image_processor", None)
+        object.__setattr__(self, "_image_encoder_device", None)
+        object.__setattr__(self, "_image_encoder_dtype", None)
         failure: InfrastructureError | None = None
         try:
             _release_resource(pipeline)
@@ -68,6 +106,50 @@ class LoadedPipeline:
 
     def __reduce_ex__(self, _protocol: int) -> object:
         raise TypeError("loaded pipelines cannot be serialized")
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class _VerifiedImageEvidenceEncoder:
+    _owner: LoadedPipeline = field(repr=False, compare=False)
+    _seal: object = field(repr=False, compare=False)
+
+    def __init__(self, *_: object, **__: object) -> None:
+        raise TypeError("image evidence encoders are issued only by loaded pipelines")
+
+    @property
+    def pin(self) -> ResourcePin:
+        _validate_image_evidence_encoder(self)
+        return self._owner._image_encoder_pin
+
+    @property
+    def processor_provenance(self) -> _ProcessorProvenance:
+        _validate_image_evidence_encoder(self)
+        return self._owner._processor_provenance
+
+    @property
+    def preprocessing_version(self) -> str:
+        _validate_image_evidence_encoder(self)
+        return _derive_preprocessing_version(self._owner._processor_provenance)
+
+    @property
+    def layer(self) -> str:
+        _validate_image_evidence_encoder(self)
+        return _EVIDENCE_LAYER
+
+    def encode(
+        self, image_bytes: bytes, asset_sha256: Sha256, /
+    ) -> _VerifiedImageEvidence:
+        _validate_image_evidence_encoder(self)
+        return _encode_image_evidence(self._owner, image_bytes, asset_sha256)
+
+    def __copy__(self) -> _VerifiedImageEvidenceEncoder:
+        raise TypeError("image evidence encoders cannot be copied")
+
+    def __deepcopy__(self, _memo: dict[int, object]) -> _VerifiedImageEvidenceEncoder:
+        raise TypeError("image evidence encoders cannot be copied")
+
+    def __reduce_ex__(self, _protocol: int) -> object:
+        raise TypeError("image evidence encoders cannot be serialized")
 
 
 @dataclass(frozen=True, slots=True)
@@ -201,6 +283,48 @@ def _ip_adapter_kwargs(entrypoint: Any) -> dict[str, Any]:
     return kwargs
 
 
+def _import_transformers() -> Any:
+    return importlib.import_module("transformers")
+
+
+def _installed_transformers_version() -> str:
+    return importlib_metadata.version("transformers")
+
+
+def _map_encoding_failure(error: BaseException, torch: Any) -> InfrastructureError:
+    failure_kind = _classify_encoding_failure(error, torch)
+    if failure_kind == "oom":
+        gc.collect()
+        _empty_cache(torch)
+        return InfrastructureError("image evidence OOM")
+    if failure_kind == "contract":
+        return InfrastructureError("image evidence contract violation")
+    return InfrastructureError("image evidence encoding failed")
+
+
+def _encode_image_evidence(
+    owner: LoadedPipeline, image_bytes: object, asset_sha256: object
+) -> _VerifiedImageEvidence:
+    image = _decode_image_evidence_input(image_bytes, asset_sha256)
+    failure: InfrastructureError | None = None
+    try:
+        patch, projected = _run_image_evidence_encoder(
+            owner._image_processor,
+            owner._image_encoder,
+            owner._torch,
+            owner._image_encoder_device,
+            owner._image_encoder_dtype,
+            image,
+        )
+    except Exception as error:
+        failure = _map_encoding_failure(error, owner._torch)
+    finally:
+        _close_image_quietly(image)
+    if failure is not None:
+        raise failure
+    return _VerifiedImageEvidence(asset_sha256, patch, projected)
+
+
 def _empty_cache(torch: Any) -> None:
     try:
         torch.cuda.empty_cache()
@@ -249,11 +373,76 @@ def _validate_loaded_pipeline(value: object, *, require_open: bool) -> None:
         or len(value._runtime) != 4
         or any(type(item) is not str for item in value._runtime)
         or value._runtime[3] != "float16"
+        or type(getattr(value, "_image_encoder_pin", None)) is not ResourcePin
+        or type(getattr(value, "_processor_provenance", None))
+        is not _ProcessorProvenance
         or type(getattr(value, "_closed", None)) is not bool
     ):
         raise DomainError("invalid loaded pipeline capability")
     if require_open and (value._closed or value._pipeline is None):
         raise DomainError("loaded pipeline is closed")
+    if require_open and (
+        value._pipeline is not value._pipeline_identity
+        or type(value._image_encoder)
+        is not getattr(value._transformers, "CLIPVisionModelWithProjection", None)
+        or type(value._image_processor)
+        is not getattr(value._transformers, "CLIPImageProcessor", None)
+        or getattr(value._pipeline, "image_encoder", None) is not value._image_encoder
+        or getattr(value._pipeline, "feature_extractor", None)
+        is not value._image_processor
+    ):
+        raise DomainError("invalid loaded pipeline capability")
+
+
+def _validate_image_evidence_owner(owner: object) -> None:
+    if (
+        type(owner) is not LoadedPipeline
+        or getattr(owner, "_seal", None) is not _CAPABILITY_SEAL
+    ):
+        raise DomainError("invalid image evidence encoder capability")
+    if getattr(owner, "_closed", None) is True:
+        refs = (
+            getattr(owner, field, object())
+            for field in (
+                "_pipeline",
+                "_pipeline_identity",
+                "_image_encoder",
+                "_image_processor",
+                "_image_encoder_device",
+                "_image_encoder_dtype",
+            )
+        )
+        if all(item is None for item in refs):
+            raise DomainError("loaded pipeline is closed")
+        raise InfrastructureError(_EVIDENCE_CONTRACT_ERROR) from None
+    try:
+        _validate_loaded_pipeline(owner, require_open=True)
+        _validate_image_processor(owner._image_processor, owner._image_encoder)
+        _validate_frozen_encoder_placement(
+            owner._image_encoder,
+            owner._torch,
+            owner._image_encoder_device,
+            owner._image_encoder_dtype,
+        )
+        provenance = _build_processor_provenance(
+            owner._transformers,
+            owner._image_processor,
+            _installed_transformers_version(),
+        )
+        if provenance != owner._processor_provenance:
+            raise InfrastructureError("image evidence contract violation")
+    except Exception:
+        raise InfrastructureError("image evidence contract violation") from None
+
+
+def _validate_image_evidence_encoder(value: object) -> None:
+    if (
+        type(value) is not _VerifiedImageEvidenceEncoder
+        or getattr(value, "_seal", None) is not _IMAGE_EVIDENCE_CAPABILITY_SEAL
+        or type(getattr(value, "_owner", None)) is not LoadedPipeline
+    ):
+        raise DomainError("invalid image evidence encoder capability")
+    _validate_image_evidence_owner(value._owner)
 
 
 def load_production_pipeline(
@@ -276,8 +465,9 @@ def load_production_pipeline(
             if diffusers_module is None
             else diffusers_module
         )
+        transformers = _import_transformers()
     except Exception:
-        torch = diffusers = None
+        torch = diffusers = transformers = None
         runtime_failure = InfrastructureError("production runtime unavailable")
     if runtime_failure is not None:
         raise runtime_failure
@@ -300,9 +490,32 @@ def load_production_pipeline(
             pipeline.scheduler.config
         )
         pipeline.to("cuda:0", torch.float16)
+        if (
+            getattr(pipeline, "image_encoder", object()) is not None
+            or getattr(pipeline, "feature_extractor", object()) is not None
+        ):
+            raise InfrastructureError("pipeline loading failed")
         pipeline.load_ip_adapter(
             components["ip_adapter"].borrow_loader_path(),
             **_ip_adapter_kwargs(components["ip_adapter"].manifest.entrypoint),
+        )
+        image_encoder_type = transformers.CLIPVisionModelWithProjection
+        image_processor_type = transformers.CLIPImageProcessor
+        image_encoder = getattr(pipeline, "image_encoder", None)
+        image_processor = getattr(pipeline, "feature_extractor", None)
+        if (
+            type(image_encoder_type) is not type
+            or type(image_processor_type) is not type
+            or type(image_encoder) is not image_encoder_type
+            or type(image_processor) is not image_processor_type
+        ):
+            raise InfrastructureError("pipeline loading failed")
+        _validate_image_processor(image_processor, image_encoder)
+        image_encoder_device, image_encoder_dtype = _encoder_placement(
+            image_encoder, torch
+        )
+        processor_provenance = _build_processor_provenance(
+            transformers, image_processor, _installed_transformers_version()
         )
     except Exception:
         failure = InfrastructureError("pipeline loading failed")
@@ -318,6 +531,7 @@ def load_production_pipeline(
     try:
         instance = object.__new__(LoadedPipeline)
         object.__setattr__(instance, "_pipeline", pipeline)
+        object.__setattr__(instance, "_pipeline_identity", pipeline)
         object.__setattr__(instance, "_graph", graph)
         object.__setattr__(instance, "_environment_hash", environment_hash)
         object.__setattr__(
@@ -331,6 +545,22 @@ def load_production_pipeline(
             ),
         )
         object.__setattr__(instance, "_torch", torch)
+        object.__setattr__(instance, "_image_encoder", image_encoder)
+        object.__setattr__(instance, "_image_processor", image_processor)
+        object.__setattr__(instance, "_image_encoder_device", image_encoder_device)
+        object.__setattr__(instance, "_image_encoder_dtype", image_encoder_dtype)
+        object.__setattr__(instance, "_transformers", transformers)
+        object.__setattr__(instance, "_processor_provenance", processor_provenance)
+        ip_component = components["ip_adapter"]
+        object.__setattr__(
+            instance,
+            "_image_encoder_pin",
+            ResourcePin(
+                ip_component.model_id,
+                ip_component.manifest.revision,
+                ip_component.manifest.root_sha256,
+            ),
+        )
         object.__setattr__(instance, "_closed", False)
         object.__setattr__(instance, "_seal", _CAPABILITY_SEAL)
         _validate_loaded_pipeline(instance, require_open=True)

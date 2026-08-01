@@ -10,7 +10,9 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
+from PIL import Image
 
+import specstyle.generation.diffusers_loader as diffusers_loader_module
 from specstyle.domain.identifiers import Sha256
 from specstyle.errors import DomainError, InfrastructureError
 from specstyle.generation.diffusers_loader import load_production_pipeline
@@ -33,6 +35,95 @@ from specstyle.observability.hashing import hash_bytes
 
 
 _REVISION = "a" * 40
+_FLOAT16 = object()
+_FLOAT32 = object()
+_INT64 = object()
+
+
+class _Device:
+    __slots__ = ("name",)
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+    def __eq__(self, other: object) -> bool:
+        return type(other) is _Device and self.name == other.name
+
+    def __str__(self) -> str:
+        return self.name
+
+
+class _ModelTensor:
+    def __init__(
+        self, device: str = "cuda:0", dtype: object = _FLOAT16, *, floating: bool = True
+    ) -> None:
+        self.device = _Device(device)
+        self.dtype = dtype
+        self.floating = floating
+
+    def is_floating_point(self) -> bool:
+        return self.floating
+
+
+class _CLIPVisionModelWithProjection:
+    def __init__(self) -> None:
+        self.config = type("Config", (), {"image_size": 224})()
+        self._parameters = [_ModelTensor()]
+        self._buffers = [_ModelTensor(), _ModelTensor(dtype=_INT64, floating=False)]
+
+    def __call__(self, *args: object, **kwargs: object) -> object:
+        return self.call_impl(*args, **kwargs)
+
+    def parameters(self):
+        return iter(self._parameters)
+
+    def buffers(self):
+        return iter(self._buffers)
+
+
+class _CLIPImageProcessor:
+    def __init__(self) -> None:
+        self.size = {"shortest_edge": 224}
+        self.crop_size = {"height": 224, "width": 224}
+        self.do_resize = True
+        self.do_center_crop = True
+        self.do_rescale = True
+        self.do_normalize = True
+        self.do_convert_rgb = True
+        self.resample = Image.Resampling.BICUBIC
+        self.rescale_factor = 1 / 255
+        self.image_mean = [0.48145466, 0.4578275, 0.40821073]
+        self.image_std = [0.26862954, 0.26130258, 0.27577711]
+
+    def __call__(self, *args: object, **kwargs: object) -> object:
+        return self.call_impl(*args, **kwargs)
+
+    def to_dict(self) -> dict[str, object]:
+        result = {
+            "crop_size": dict(self.crop_size),
+            "do_center_crop": self.do_center_crop,
+            "do_convert_rgb": self.do_convert_rgb,
+            "do_normalize": self.do_normalize,
+            "do_rescale": self.do_rescale,
+            "do_resize": self.do_resize,
+            "image_mean": list(self.image_mean),
+            "image_std": list(self.image_std),
+            "resample": self.resample,
+            "rescale_factor": self.rescale_factor,
+            "size": dict(self.size),
+        }
+        if hasattr(self, "provenance_extra"):
+            result["provenance_extra"] = self.provenance_extra
+        return result
+
+
+_CLIPImageProcessor.__module__ = "transformers.models.clip.image_processing_clip"
+
+
+class _Transformers:
+    __version__ = "4.57.3"
+    CLIPVisionModelWithProjection = _CLIPVisionModelWithProjection
+    CLIPImageProcessor = _CLIPImageProcessor
 
 
 class _Cuda:
@@ -59,7 +150,9 @@ class _Cuda:
 
 class _Torch:
     __version__ = "2.8.0"
-    float16 = object()
+    device = _Device
+    float16 = _FLOAT16
+    float32 = _FLOAT32
     version = type("Version", (), {"hip": "7.2.1"})()
 
     def __init__(self) -> None:
@@ -69,6 +162,8 @@ class _Torch:
 class _Pipeline:
     def __init__(self) -> None:
         self.scheduler = type("Scheduler", (), {"config": {"x": 1}})()
+        self.image_encoder = None
+        self.feature_extractor = None
         self.to_calls: list[tuple[object, ...]] = []
         self.ip_calls: list[tuple[object, dict[str, object]]] = []
         self.hooks = 0
@@ -79,6 +174,8 @@ class _Pipeline:
 
     def load_ip_adapter(self, *args: object, **kwargs: object) -> None:
         self.ip_calls.append((args, kwargs))
+        self.image_encoder = _CLIPVisionModelWithProjection()
+        self.feature_extractor = _CLIPImageProcessor()
 
     def maybe_free_model_hooks(self) -> None:
         self.hooks += 1
@@ -88,9 +185,15 @@ class _Diffusers:
     __version__ = "0.39.0"
 
     def __init__(self) -> None:
+        diffusers_loader_module._import_transformers = lambda: _Transformers
+        diffusers_loader_module._installed_transformers_version = lambda: (
+            _Transformers.__version__
+        )
         self.control_calls: list[tuple[object, dict[str, object]]] = []
         self.pipeline_calls: list[tuple[object, dict[str, object]]] = []
         self.scheduler_calls: list[object] = []
+        self.issued_pipelines: list[_Pipeline] = []
+        self.track_issued_pipelines = False
         outer = self
 
         class ControlNetModel:
@@ -103,7 +206,10 @@ class _Diffusers:
             @classmethod
             def from_pretrained(cls, *args: object, **kwargs: object) -> _Pipeline:
                 outer.pipeline_calls.append((args, kwargs))
-                return _Pipeline()
+                pipeline = _Pipeline()
+                if outer.track_issued_pipelines:
+                    outer.issued_pipelines.append(pipeline)
+                return pipeline
 
         class EulerDiscreteScheduler:
             @classmethod
@@ -151,8 +257,18 @@ def _supply(tmp_path: Path):
     ):
         payload = model_id.encode()
         root = tmp_path / model_id
-        (root / "pipeline").mkdir(parents=True)
-        (root / "pipeline" / "model.safetensors").write_bytes(payload)
+        payloads = {"pipeline/model.safetensors": payload}
+        if role == "ip_adapter":
+            payloads.update(
+                {
+                    "pipeline/image_encoder/config.json": b"{}",
+                    "pipeline/image_encoder/model.safetensors": b"encoder",
+                }
+            )
+        for relative_path, content in payloads.items():
+            path = root / relative_path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content)
         entrypoint = ModelLoadEntrypoint(
             "diffusers_ip_adapter" if role == "ip_adapter" else "diffusers_pretrained",
             "pipeline",
@@ -164,10 +280,9 @@ def _supply(tmp_path: Path):
             _REVISION,
             model_id,
             entrypoint,
-            (
-                WeightFile(
-                    "pipeline/model.safetensors", len(payload), hash_bytes(payload)
-                ),
+            tuple(
+                WeightFile(relative_path, len(content), hash_bytes(content))
+                for relative_path, content in payloads.items()
             ),
             Sha256("0" * 64),
         ).with_computed_root()
@@ -490,3 +605,162 @@ def test_failed_load_releases_pipeline_before_empty_cache(
         )
     assert supply.borrow_component("base").model_id == "base"
     supply.close()
+
+
+def _inject_transformers(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        diffusers_loader_module,
+        "_import_transformers",
+        lambda: _Transformers,
+        raising=False,
+    )
+
+
+def _assert_failed_pipeline_released(diffusers: _Diffusers, torch: _Torch) -> None:
+    assert len(diffusers.issued_pipelines) == 1
+    pipeline = diffusers.issued_pipelines[0]
+    assert pipeline.hooks == 1
+    assert pipeline.to_calls[-1] == ("cpu",)
+    assert torch.cuda.empty_cache_calls >= 1
+
+
+@pytest.mark.parametrize("field", ["image_encoder", "feature_extractor"])
+def test_loader_rejects_preloaded_image_evidence_objects_and_releases_pipeline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, field: str
+) -> None:
+    supply, graph = _supply(tmp_path)
+    torch, diffusers = _Torch(), _Diffusers()
+    diffusers.track_issued_pipelines = True
+    _inject_transformers(monkeypatch)
+    original_factory = (
+        diffusers.StableDiffusionXLControlNetImg2ImgPipeline.from_pretrained
+    )
+
+    def issue_preloaded(cls, *args: object, **kwargs: object) -> _Pipeline:
+        pipeline = original_factory(*args, **kwargs)
+        setattr(pipeline, field, object())
+        return pipeline
+
+    monkeypatch.setattr(
+        diffusers.StableDiffusionXLControlNetImg2ImgPipeline,
+        "from_pretrained",
+        classmethod(issue_preloaded),
+    )
+    try:
+        with pytest.raises(InfrastructureError, match="pipeline loading failed"):
+            load_production_pipeline(
+                supply,
+                graph,
+                _environment(),
+                torch_module=torch,
+                diffusers_module=diffusers,
+            )
+        _assert_failed_pipeline_released(diffusers, torch)
+    finally:
+        supply.close()
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "missing_encoder",
+        "wrong_encoder",
+        "subclass_encoder",
+        "missing_processor",
+        "wrong_processor",
+        "subclass_processor",
+    ],
+)
+def test_loader_rejects_missing_or_nonexact_postload_image_evidence_objects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    supply, graph = _supply(tmp_path)
+    torch, diffusers = _Torch(), _Diffusers()
+    diffusers.track_issued_pipelines = True
+    _inject_transformers(monkeypatch)
+
+    class EncoderSubclass(_CLIPVisionModelWithProjection):
+        pass
+
+    class ProcessorSubclass(_CLIPImageProcessor):
+        pass
+
+    def load_invalid(self: _Pipeline, *args: object, **kwargs: object) -> None:
+        self.ip_calls.append((args, kwargs))
+        self.image_encoder = {
+            "missing_encoder": None,
+            "wrong_encoder": object(),
+            "subclass_encoder": EncoderSubclass(),
+        }.get(mode, _CLIPVisionModelWithProjection())
+        self.feature_extractor = {
+            "missing_processor": None,
+            "wrong_processor": object(),
+            "subclass_processor": ProcessorSubclass(),
+        }.get(mode, _CLIPImageProcessor())
+
+    monkeypatch.setattr(_Pipeline, "load_ip_adapter", load_invalid)
+    try:
+        with pytest.raises(InfrastructureError, match="pipeline loading failed"):
+            load_production_pipeline(
+                supply,
+                graph,
+                _environment(),
+                torch_module=torch,
+                diffusers_module=diffusers,
+            )
+        _assert_failed_pipeline_released(diffusers, torch)
+    finally:
+        supply.close()
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid_value"),
+    [
+        ("image_size", 0),
+        ("size", {"shortest_edge": 225}),
+        ("crop_size", {"height": 224, "width": 225}),
+        ("do_resize", False),
+        ("do_center_crop", False),
+        ("do_rescale", False),
+        ("do_normalize", False),
+        ("do_convert_rgb", False),
+        ("resample", Image.Resampling.NEAREST),
+        ("rescale_factor", 0.5),
+        ("image_mean", [0.1, 0.2, 0.3]),
+        ("image_std", [0.1, 0.2, 0.3]),
+    ],
+)
+def test_loader_rejects_each_unfrozen_image_processor_attribute(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    invalid_value: object,
+) -> None:
+    supply, graph = _supply(tmp_path)
+    torch, diffusers = _Torch(), _Diffusers()
+    diffusers.track_issued_pipelines = True
+    _inject_transformers(monkeypatch)
+    original_load = _Pipeline.load_ip_adapter
+
+    def load_invalid(self: _Pipeline, *args: object, **kwargs: object) -> None:
+        original_load(self, *args, **kwargs)
+        target = (
+            self.image_encoder.config
+            if field == "image_size"
+            else self.feature_extractor
+        )
+        setattr(target, field, invalid_value)
+
+    monkeypatch.setattr(_Pipeline, "load_ip_adapter", load_invalid)
+    try:
+        with pytest.raises(InfrastructureError, match="pipeline loading failed"):
+            load_production_pipeline(
+                supply,
+                graph,
+                _environment(),
+                torch_module=torch,
+                diffusers_module=diffusers,
+            )
+        _assert_failed_pipeline_released(diffusers, torch)
+    finally:
+        supply.close()

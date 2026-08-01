@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+import specstyle.generation.weight_manifest as weight_manifest_module
 from specstyle.domain.identifiers import Sha256
 from specstyle.errors import DomainError, InfrastructureError
 from specstyle.generation.weight_manifest import (
@@ -209,11 +210,145 @@ def test_ip_adapter_weight_name_is_resolved_below_subfolder() -> None:
         REVISION,
         "component",
         ModelLoadEntrypoint("diffusers_ip_adapter", "adapter", "model.safetensors"),
-        (WeightFile("adapter/model.safetensors", 1, _sha(b"x")),),
+        (
+            WeightFile("adapter/model.safetensors", 1, _sha(b"x")),
+            WeightFile("adapter/image_encoder/config.json", 2, _sha(b"{}")),
+            WeightFile("adapter/image_encoder/model.safetensors", 1, _sha(b"e")),
+        ),
         Sha256("0" * 64),
     )
 
     assert manifest.entrypoint.weight_name == "model.safetensors"
+
+
+@pytest.mark.parametrize(
+    ("entrypoint", "expected"),
+    [
+        (
+            ModelLoadEntrypoint("diffusers_ip_adapter", "adapter", "model.safetensors"),
+            "adapter/image_encoder",
+        ),
+        (
+            ModelLoadEntrypoint(
+                "diffusers_ip_adapter", "adapter", "model.safetensors", "vision"
+            ),
+            "adapter/vision",
+        ),
+        (
+            ModelLoadEntrypoint(
+                "diffusers_ip_adapter",
+                "adapter",
+                "model.safetensors",
+                "shared/vision",
+            ),
+            "shared/vision",
+        ),
+    ],
+)
+def test_effective_image_encoder_subfolder_follows_diffusers_resolution(
+    entrypoint: ModelLoadEntrypoint, expected: str
+) -> None:
+    resolver = getattr(
+        weight_manifest_module, "effective_image_encoder_subfolder", None
+    )
+
+    assert callable(resolver)
+    assert resolver(entrypoint) == expected
+
+
+def _ip_manifest(
+    entrypoint: ModelLoadEntrypoint, relative_paths: tuple[str, ...]
+) -> WeightManifest:
+    return WeightManifest(
+        "ip-model",
+        "ip_adapter",
+        REVISION,
+        "component",
+        entrypoint,
+        tuple(
+            WeightFile(path, len(path.encode()), _sha(path.encode()))
+            for path in relative_paths
+        ),
+        Sha256("0" * 64),
+    )
+
+
+@pytest.mark.parametrize(
+    ("entrypoint", "encoder_root"),
+    [
+        (
+            ModelLoadEntrypoint("diffusers_ip_adapter", "adapter", "model.safetensors"),
+            "adapter/image_encoder",
+        ),
+        (
+            ModelLoadEntrypoint(
+                "diffusers_ip_adapter", "adapter", "model.safetensors", "vision"
+            ),
+            "adapter/vision",
+        ),
+        (
+            ModelLoadEntrypoint(
+                "diffusers_ip_adapter",
+                "adapter",
+                "model.safetensors",
+                "shared/vision",
+            ),
+            "shared/vision",
+        ),
+    ],
+)
+def test_ip_manifest_accepts_exact_image_encoder_files_and_listed_extras(
+    entrypoint: ModelLoadEntrypoint, encoder_root: str
+) -> None:
+    manifest = _ip_manifest(
+        entrypoint,
+        (
+            "adapter/model.safetensors",
+            f"{encoder_root}/config.json",
+            f"{encoder_root}/model.safetensors",
+            f"{encoder_root}/preprocessor_config.json",
+            "adapter/extra.safetensors",
+        ),
+    )
+
+    assert manifest.entrypoint == entrypoint
+
+
+@pytest.mark.parametrize(
+    ("image_encoder_folder", "encoder_files"),
+    [
+        (None, ("adapter/image_encoder/model.safetensors",)),
+        (None, ("adapter/image_encoder/config.json",)),
+        (
+            None,
+            (
+                "wrong/image_encoder/config.json",
+                "wrong/image_encoder/model.safetensors",
+            ),
+        ),
+        ("vision", ("adapter/vision/model.safetensors",)),
+        (
+            "shared/vision",
+            (
+                "shared/vision/config.json",
+                "shared/vision/other.safetensors",
+            ),
+        ),
+        ("shared/vision", ("shared/vision/model.safetensors",)),
+    ],
+)
+def test_ip_manifest_requires_exact_image_encoder_config_and_weight(
+    image_encoder_folder: str | None, encoder_files: tuple[str, ...]
+) -> None:
+    entrypoint = ModelLoadEntrypoint(
+        "diffusers_ip_adapter",
+        "adapter",
+        "model.safetensors",
+        image_encoder_folder,
+    )
+
+    with pytest.raises(DomainError, match="image encoder"):
+        _ip_manifest(entrypoint, ("adapter/model.safetensors", *encoder_files))
 
 
 @pytest.mark.parametrize(

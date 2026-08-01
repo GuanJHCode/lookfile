@@ -39,9 +39,16 @@ def _sha(data: bytes) -> Sha256:
 def _manifest(model_id: str, role: str, folder: str) -> WeightManifest:
     data = f"{model_id}-safe".encode()
     entrypoint = ModelLoadEntrypoint("diffusers_pretrained", "pipeline")
+    payloads = {"pipeline/model.safetensors": data}
     if role == "ip_adapter":
         entrypoint = ModelLoadEntrypoint(
             "diffusers_ip_adapter", "pipeline", "model.safetensors"
+        )
+        payloads.update(
+            {
+                "pipeline/image_encoder/config.json": b"{}",
+                "pipeline/image_encoder/model.safetensors": b"encoder",
+            }
         )
     return WeightManifest(
         model_id,
@@ -49,7 +56,10 @@ def _manifest(model_id: str, role: str, folder: str) -> WeightManifest:
         REVISION,
         folder,
         entrypoint,
-        (WeightFile("pipeline/model.safetensors", len(data), _sha(data)),),
+        tuple(
+            WeightFile(path, len(content), _sha(content))
+            for path, content in payloads.items()
+        ),
         Sha256("0" * 64),
     ).with_computed_root()
 
@@ -85,9 +95,14 @@ def _prepare_supply(tmp_path: Path, roots: tuple[str, str, str] = ("base", "ip",
         for manifest in manifests
     )
     for manifest in manifests:
-        path = tmp_path / manifest.relative_root / manifest.files[0].relative_path
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(f"{manifest.model_id}-safe".encode())
+        for item in manifest.files:
+            path = tmp_path / manifest.relative_root / item.relative_path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            content = {
+                "pipeline/image_encoder/config.json": b"{}",
+                "pipeline/image_encoder/model.safetensors": b"encoder",
+            }.get(item.relative_path, f"{manifest.model_id}-safe".encode())
+            path.write_bytes(content)
     return graph, manifests, approvals
 
 

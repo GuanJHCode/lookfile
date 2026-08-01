@@ -75,6 +75,13 @@ class ModelLoadEntrypoint:
             raise DomainError("ip adapter entrypoint requires weight name")
 
 
+def effective_image_encoder_subfolder(entrypoint: ModelLoadEntrypoint, /) -> str:
+    if type(entrypoint) is not ModelLoadEntrypoint:
+        raise DomainError("invalid model entrypoint")
+    folder = entrypoint.image_encoder_folder or "image_encoder"
+    return folder if "/" in folder else f"{entrypoint.subfolder}/{folder}"
+
+
 @dataclass(frozen=True, slots=True)
 class WeightManifest:
     model_id: str
@@ -132,11 +139,15 @@ class WeightManifest:
                 raise DomainError(
                     "weight manifest ip weight must reference safetensors"
                 )
-        if self.entrypoint.image_encoder_folder is not None and not any(
-            path.startswith(f"{self.entrypoint.image_encoder_folder}/")
-            for path in safetensor_paths
-        ):
-            raise DomainError("weight manifest image encoder requires safetensors")
+            encoder_root = effective_image_encoder_subfolder(self.entrypoint)
+            required_encoder_files = {
+                f"{encoder_root}/config.json",
+                f"{encoder_root}/model.safetensors",
+            }
+            if not required_encoder_files.issubset(paths):
+                raise DomainError(
+                    "weight manifest image encoder config.json and model.safetensors required"
+                )
         if type(self.root_sha256) is not Sha256:
             raise DomainError("invalid weight manifest root")
 
