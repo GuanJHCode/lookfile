@@ -5,7 +5,7 @@ from __future__ import annotations
 from io import BytesIO
 
 import pytest
-from PIL import Image
+from PIL import Image, PngImagePlugin
 
 from specstyle.domain.artifacts import ArtifactRef
 from specstyle.domain.enums import RuleStatus
@@ -53,6 +53,44 @@ def test_decode_accepts_rgb() -> None:
     decoded = decode_png_bytes(data)
     assert decoded.size == (32, 32)
     assert decoded.n_frames == 1
+
+
+@pytest.mark.parametrize("image_format", ("JPEG", "WEBP"))
+def test_decode_rejects_real_non_png_images(image_format: str) -> None:
+    image = Image.new("RGB", (16, 16), (10, 20, 30))
+    encoded = BytesIO()
+    image.save(encoded, format=image_format)
+
+    with pytest.raises(DomainError):
+        decode_png_bytes(encoded.getvalue())
+    assert rule_decode(_aid(), encoded.getvalue()).status is RuleStatus.FAIL
+
+
+def test_decode_rejects_non_rgb_png() -> None:
+    encoded = BytesIO()
+    Image.new("L", (16, 16), 128).save(encoded, format="PNG")
+
+    with pytest.raises(DomainError):
+        decode_png_bytes(encoded.getvalue())
+    assert rule_decode(_aid(), encoded.getvalue()).status is RuleStatus.FAIL
+
+
+@pytest.mark.parametrize("metadata_kind", ("text", "icc"))
+def test_decode_rejects_png_with_metadata(metadata_kind: str) -> None:
+    encoded = BytesIO()
+    image = Image.new("RGB", (16, 16), (10, 20, 30))
+    if metadata_kind == "text":
+        metadata = PngImagePlugin.PngInfo()
+        metadata.add_text("comment", "metadata must be rejected")
+        image.save(encoded, format="PNG", pnginfo=metadata)
+    else:
+        image.save(encoded, format="PNG", icc_profile=b"test-icc-profile")
+
+    with Image.open(BytesIO(encoded.getvalue())) as decoded:
+        assert decoded.info
+    with pytest.raises(DomainError):
+        decode_png_bytes(encoded.getvalue())
+    assert rule_decode(_aid(), encoded.getvalue()).status is RuleStatus.FAIL
 
 
 def test_dimensions_exact_match_and_fail() -> None:

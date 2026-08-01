@@ -25,7 +25,7 @@ class DecodedImage:
 
 
 def decode_png_bytes(data: object) -> DecodedImage:
-    """Decode single-frame RGB(A) PNG; raise DomainError on hard decode failures."""
+    """Decode a clean, single-frame RGB PNG or raise a hard-contract error."""
     if type(data) is not bytes or not data:
         raise DomainError("L1_DECODE_EMPTY")
     try:
@@ -34,9 +34,13 @@ def decode_png_bytes(data: object) -> DecodedImage:
             n_frames = int(getattr(image, "n_frames", 1) or 1)
             if n_frames != 1:
                 raise DomainError("L1_DECODE_MULTI_FRAME")
+            if image.format != "PNG":
+                raise DomainError("L1_DECODE_FORMAT")
             mode = image.mode
-            if mode not in ("RGB", "RGBA", "L", "P"):
+            if mode != "RGB":
                 raise DomainError("L1_DECODE_MODE")
+            if image.info or getattr(image, "text", {}):
+                raise DomainError("L1_DECODE_METADATA")
             width, height = image.size
             if width < 1 or height < 1:
                 raise DomainError("L1_DECODE_EMPTY")
@@ -59,13 +63,7 @@ def decode_png_bytes(data: object) -> DecodedImage:
 
 def rule_decode(artifact_id: ArtifactId, data: bytes, /) -> RuleResult:
     try:
-        decoded = decode_png_bytes(data)
+        decode_png_bytes(data)
     except DomainError:
         return RuleResult(RULE_DECODE, RuleStatus.FAIL, (artifact_id,), None)
-    if decoded.has_transparency and decoded.mode != "RGB":
-        # Transparent not allowed for hard production RGB gate.
-        return RuleResult(RULE_DECODE, RuleStatus.FAIL, (artifact_id,), None)
-    if decoded.mode != "RGB" and decoded.mode not in ("L", "P"):
-        return RuleResult(RULE_DECODE, RuleStatus.FAIL, (artifact_id,), None)
-    # Require convertible RGB single frame — PASS when decode succeeded.
     return RuleResult(RULE_DECODE, RuleStatus.PASS, (artifact_id,), 1.0)
