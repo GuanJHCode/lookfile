@@ -515,6 +515,18 @@ def _validate_artifact_ref(artifact_ref: ArtifactRef) -> ArtifactRef:
         raise DomainError("invalid production artifact reference") from None
 
 
+def _validate_artifact_id(artifact_id: ArtifactId) -> ArtifactId:
+    try:
+        if type(artifact_id) is not ArtifactId:
+            raise ValueError
+        rebuilt = ArtifactId(artifact_id.value)
+        if rebuilt != artifact_id:
+            raise ValueError
+        return rebuilt
+    except Exception:
+        raise DomainError("invalid production artifact id") from None
+
+
 def _read_committed(
     artifact_fd: int,
     identity: _Identity,
@@ -723,22 +735,27 @@ class _ProductionArtifactRepository:
             raise InfrastructureError("production artifact repository closed")
         artifact_ref = _validate_artifact_ref(artifact_ref)
         with holder.lock:
-            return self._read_locked(artifact_ref)
+            artifact = self._read_by_id_locked(artifact_ref.artifact_id)
+            return (
+                artifact if artifact is None or artifact.ref == artifact_ref else None
+            )
 
-    def _read_locked(self, artifact_ref: ArtifactRef) -> GeneratedArtifact | None:
+    def get_by_id(self, artifact_id: ArtifactId, /) -> GeneratedArtifact | None:
+        holder = self._holder
+        if holder is None:
+            raise InfrastructureError("production artifact repository closed")
+        artifact_id = _validate_artifact_id(artifact_id)
+        with holder.lock:
+            return self._read_by_id_locked(artifact_id)
+
+    def _read_by_id_locked(self, artifact_id: ArtifactId) -> GeneratedArtifact | None:
         root_fd, identity = self._store._open_root()
-        fds = _open_scope(
-            root_fd, identity, self._job_id, artifact_ref.artifact_id, False
-        )
+        fds = _open_scope(root_fd, identity, self._job_id, artifact_id, False)
         if not fds:
             return None
         try:
             _recover_namespace(fds[-1], identity)
-            artifact = _read_committed(
-                fds[-1], identity, self._job_id, artifact_ref.artifact_id
-            )
-            if artifact is not None and artifact.ref != artifact_ref:
-                artifact = None
+            artifact = _read_committed(fds[-1], identity, self._job_id, artifact_id)
         except Exception:
             _close_quietly(*reversed(fds))
             raise

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import threading
 import weakref
 from collections.abc import Mapping
@@ -56,6 +57,17 @@ from specstyle.workflow.state_machine import replay_events, validate_transition
 
 _SNAPSHOT_VERSION = "specstyle.workflow.snapshot.v1"
 _JOB_LOCKS_GUARD = threading.Lock()
+_DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+_READ_FLAGS = os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC
+_MAX_SNAPSHOT_BYTES = 1024 * 1024
+_MAX_EVENTS_BYTES = 64 * 1024 * 1024
+_READ_CHUNK = 64 * 1024
+_STATE_FILE_LIMITS = {
+    "snapshot.json": (1, _MAX_SNAPSHOT_BYTES),
+    "events.ndjson": (0, _MAX_EVENTS_BYTES),
+}
+_DirectoryIdentity = tuple[int, int, int, int, int, int, int, int]
+_FileIdentity = tuple[int, int, int, int, int, int, int, int]
 
 
 class _JobLockHolder:
@@ -515,6 +527,304 @@ def _same_exact_structure(left: object, right: object, /) -> bool:
     return left == right
 
 
+def _job_store_corrupted() -> InfrastructureError:
+    return InfrastructureError("job store corrupted")
+
+
+def _directory_identity(result: os.stat_result) -> _DirectoryIdentity:
+    if not stat.S_ISDIR(result.st_mode):
+        raise _job_store_corrupted()
+    return (
+        result.st_dev,
+        result.st_ino,
+        result.st_uid,
+        result.st_mode,
+        result.st_nlink,
+        result.st_size,
+        result.st_mtime_ns,
+        result.st_ctime_ns,
+    )
+
+
+def _close_quietly(fd: int) -> None:
+    if fd < 0:
+        return
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+
+
+def _open_checked_directory(
+    name: os.PathLike[str] | str,
+    /,
+    *,
+    parent_fd: int | None = None,
+    missing_ok: bool = False,
+) -> tuple[int, _DirectoryIdentity] | None:
+    try:
+        before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        if missing_ok:
+            return None
+        raise _job_store_corrupted() from None
+    except OSError:
+        raise _job_store_corrupted() from None
+    fd = -1
+    try:
+        fd = os.open(name, _DIRECTORY_FLAGS, dir_fd=parent_fd)
+        opened = os.fstat(fd)
+        after = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        identity = _directory_identity(before)
+        if identity != _directory_identity(opened) or identity != _directory_identity(
+            after
+        ):
+            raise _job_store_corrupted()
+        return fd, identity
+    except InfrastructureError:
+        _close_quietly(fd)
+        raise
+    except OSError:
+        _close_quietly(fd)
+        raise _job_store_corrupted() from None
+
+
+@contextmanager
+def _closing_fd(fd: int, /):
+    try:
+        yield
+    except BaseException:
+        _close_quietly(fd)
+        raise
+    else:
+        try:
+            os.close(fd)
+        except OSError:
+            raise InfrastructureError("job store io failed") from None
+
+
+def _directory_names(fd: int, /) -> tuple[str, ...]:
+    try:
+        with os.scandir(fd) as entries:
+            names = tuple(entry.name for entry in entries)
+    except OSError as cause:
+        raise InfrastructureError("job store io failed") from cause
+    if any(type(name) is not str for name in names):
+        raise _job_store_corrupted()
+    return names
+
+
+def _named_directory_identity(
+    parent_fd: int | None, name: os.PathLike[str] | str, /
+) -> _DirectoryIdentity:
+    try:
+        named = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError:
+        raise _job_store_corrupted() from None
+    return _directory_identity(named)
+
+
+def _require_directory_identity(
+    fd: int,
+    parent_fd: int | None,
+    name: os.PathLike[str] | str,
+    identity: _DirectoryIdentity,
+) -> None:
+    try:
+        opened = os.fstat(fd)
+    except OSError:
+        raise _job_store_corrupted() from None
+    named = _named_directory_identity(parent_fd, name)
+    if identity != _directory_identity(opened) or identity != named:
+        raise _job_store_corrupted()
+
+
+def _file_identity(
+    result: os.stat_result,
+    directory_identity: _DirectoryIdentity,
+    minimum: int,
+    maximum: int,
+) -> _FileIdentity:
+    if (
+        not stat.S_ISREG(result.st_mode)
+        or result.st_dev != directory_identity[0]
+        or result.st_uid != directory_identity[2]
+        or result.st_nlink != 1
+        or not minimum <= result.st_size <= maximum
+    ):
+        raise _job_store_corrupted()
+    return (
+        result.st_dev,
+        result.st_ino,
+        result.st_uid,
+        result.st_mode,
+        result.st_nlink,
+        result.st_size,
+        result.st_mtime_ns,
+        result.st_ctime_ns,
+    )
+
+
+def _named_file_identity(
+    directory_fd: int,
+    name: str,
+    directory_identity: _DirectoryIdentity,
+    minimum: int,
+    maximum: int,
+) -> _FileIdentity:
+    try:
+        named = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except OSError:
+        raise _job_store_corrupted() from None
+    return _file_identity(named, directory_identity, minimum, maximum)
+
+
+def _opened_file_identity(
+    fd: int,
+    directory_fd: int,
+    name: str,
+    directory_identity: _DirectoryIdentity,
+    minimum: int,
+    maximum: int,
+) -> _FileIdentity:
+    try:
+        opened = os.fstat(fd)
+    except OSError:
+        raise _job_store_corrupted() from None
+    opened_identity = _file_identity(opened, directory_identity, minimum, maximum)
+    named_identity = _named_file_identity(
+        directory_fd, name, directory_identity, minimum, maximum
+    )
+    if opened_identity != named_identity:
+        raise _job_store_corrupted()
+    return opened_identity
+
+
+def _state_namespace(
+    directory_fd: int, directory_identity: _DirectoryIdentity, /
+) -> dict[str, _FileIdentity]:
+    names = _directory_names(directory_fd)
+    if set(names) not in (
+        {"snapshot.json"},
+        {"snapshot.json", "events.ndjson"},
+    ):
+        raise _job_store_corrupted()
+    return {
+        name: _named_file_identity(
+            directory_fd,
+            name,
+            directory_identity,
+            *_STATE_FILE_LIMITS[name],
+        )
+        for name in names
+    }
+
+
+def _read_exact(fd: int, size: int, /) -> bytes:
+    chunks: list[bytes] = []
+    remaining = size
+    while remaining:
+        amount = min(remaining, _READ_CHUNK)
+        try:
+            chunk = os.read(fd, amount)
+        except OSError as cause:
+            raise InfrastructureError("job store io failed") from cause
+        if type(chunk) is not bytes or not chunk or len(chunk) > amount:
+            raise _job_store_corrupted()
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    try:
+        extra = os.read(fd, 1)
+    except OSError as cause:
+        raise InfrastructureError("job store io failed") from cause
+    if type(extra) is not bytes or extra:
+        raise _job_store_corrupted()
+    return b"".join(chunks)
+
+
+def _read_state_file(
+    directory_fd: int,
+    directory_identity: _DirectoryIdentity,
+    name: str,
+    expected_identity: _FileIdentity,
+    /,
+) -> bytes:
+    minimum, maximum = _STATE_FILE_LIMITS[name]
+    try:
+        fd = os.open(name, _READ_FLAGS, dir_fd=directory_fd)
+    except OSError:
+        raise _job_store_corrupted() from None
+    with _closing_fd(fd):
+        before = _opened_file_identity(
+            fd, directory_fd, name, directory_identity, minimum, maximum
+        )
+        if before != expected_identity:
+            raise _job_store_corrupted()
+        content = _read_exact(fd, before[5])
+        after = _opened_file_identity(
+            fd, directory_fd, name, directory_identity, minimum, maximum
+        )
+        if before != after:
+            raise _job_store_corrupted()
+        return content
+
+
+def _snapshot_from_bytes(data: bytes, /) -> JobSnapshot:
+    try:
+        return _snapshot_from_primitive(_parse(data))
+    except Exception:
+        raise _job_store_corrupted() from None
+
+
+def _events_from_bytes(job_id: JobId, data: bytes, /) -> tuple[Event, ...]:
+    if data and not data.endswith(b"\n"):
+        raise _job_store_corrupted()
+    events: list[Event] = []
+    for line in data.splitlines():
+        if not line:
+            raise _job_store_corrupted()
+        try:
+            event = _event_from_primitive(_parse(line))
+            if event.job_id != job_id:
+                raise DomainError("invalid job event")
+        except Exception:
+            raise _job_store_corrupted() from None
+        events.append(event)
+    return tuple(events)
+
+
+def _validated_state_from_fd(
+    job_fd: int,
+    directory_identity: _DirectoryIdentity,
+    job_id: JobId,
+    /,
+) -> JobState:
+    namespace = _state_namespace(job_fd, directory_identity)
+    snapshot_data = _read_state_file(
+        job_fd,
+        directory_identity,
+        "snapshot.json",
+        namespace["snapshot.json"],
+    )
+    events_data = b""
+    if "events.ndjson" in namespace:
+        events_data = _read_state_file(
+            job_fd,
+            directory_identity,
+            "events.ndjson",
+            namespace["events.ndjson"],
+        )
+    snapshot = _snapshot_from_bytes(snapshot_data)
+    events = _events_from_bytes(job_id, events_data)
+    try:
+        state = _validated_snapshot(job_id, snapshot, events)
+    except Exception:
+        raise _job_store_corrupted() from None
+    if _state_namespace(job_fd, directory_identity) != namespace:
+        raise _job_store_corrupted()
+    return state
+
+
 class JobStore:
     def __init__(self, root: Path, /) -> None:
         if not isinstance(root, Path):
@@ -537,6 +847,43 @@ class JobStore:
 
     def _job_dir(self, job_id: JobId) -> Path:
         return self._root / "jobs" / job_id.value
+
+    def list_job_ids(self, /) -> tuple[JobId, ...]:
+        jobs_path = self._root / "jobs"
+        opened = _open_checked_directory(jobs_path, missing_ok=True)
+        if opened is None:
+            return ()
+        jobs_fd, jobs_identity = opened
+        with _closing_fd(jobs_fd):
+            names = _directory_names(jobs_fd)
+            listed = tuple(self._validated_listed_job(jobs_fd, name) for name in names)
+            if set(_directory_names(jobs_fd)) != set(names):
+                raise _job_store_corrupted()
+            if any(
+                _named_directory_identity(jobs_fd, name) != identity
+                for name, (_, identity) in zip(names, listed, strict=True)
+            ):
+                raise _job_store_corrupted()
+            _require_directory_identity(jobs_fd, None, jobs_path, jobs_identity)
+        return tuple(
+            sorted((item[0] for item in listed), key=lambda job_id: job_id.value)
+        )
+
+    def _validated_listed_job(
+        self, jobs_fd: int, name: str, /
+    ) -> tuple[JobId, _DirectoryIdentity]:
+        try:
+            job_id = JobId(name)
+        except DomainError:
+            raise _job_store_corrupted() from None
+        opened = _open_checked_directory(name, parent_fd=jobs_fd)
+        if opened is None:
+            raise _job_store_corrupted()
+        job_fd, identity = opened
+        with _closing_fd(job_fd):
+            _validated_state_from_fd(job_fd, identity, job_id)
+            _require_directory_identity(job_fd, jobs_fd, name, identity)
+        return job_id, identity
 
     def load(self, job_id: JobId, /) -> JobState:
         job_id = _safe_job_id(job_id, "invalid job event")
@@ -577,10 +924,7 @@ class JobStore:
             data = path.read_bytes()
         except OSError as cause:
             raise InfrastructureError("job store io failed") from cause
-        try:
-            return _snapshot_from_primitive(_parse(data))
-        except Exception:
-            raise InfrastructureError("job store corrupted") from None
+        return _snapshot_from_bytes(data)
 
     def save_snapshot(self, job_id: JobId, snapshot: JobSnapshot, /) -> None:
         try:
@@ -720,20 +1064,7 @@ class JobStore:
             data = path.read_bytes()
         except OSError as cause:
             raise InfrastructureError("job store io failed") from cause
-        if data and not data.endswith(b"\n"):
-            raise InfrastructureError("job store corrupted") from None
-        events: list[Event] = []
-        for line in data.splitlines():
-            if not line:
-                raise InfrastructureError("job store corrupted") from None
-            try:
-                event = _event_from_primitive(_parse(line))
-                if event.job_id != job_id:
-                    raise DomainError("invalid job event")
-                events.append(event)
-            except Exception:
-                raise InfrastructureError("job store corrupted") from None
-        return tuple(events)
+        return _events_from_bytes(job_id, data)
 
 
 def _fsync_dir(directory: Path, *, require: bool = False) -> None:

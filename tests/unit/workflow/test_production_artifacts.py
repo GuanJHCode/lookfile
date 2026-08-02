@@ -89,6 +89,9 @@ def test_private_surface_signature_and_for_job_performs_no_io(tmp_path) -> None:
         assert str(inspect.signature(repository.__call__)) == (
             "(artifact_ref: 'ArtifactRef', /) -> 'GeneratedArtifact | None'"
         )
+        assert str(inspect.signature(repository.get_by_id)) == (
+            "(artifact_id: 'ArtifactId', /) -> 'GeneratedArtifact | None'"
+        )
     finally:
         store.close()
 
@@ -125,6 +128,63 @@ def test_put_is_durable_commit_and_readback_is_exact(tmp_path) -> None:
         assert metadata == json.dumps(
             expected, sort_keys=True, separators=(",", ":"), ensure_ascii=True
         ).encode("ascii")
+    finally:
+        store.close()
+
+
+def test_get_by_id_reads_committed_artifact_without_a_known_hash(tmp_path) -> None:
+    artifact = _artifact()
+    store, repository = _open_repository(tmp_path)
+    try:
+        assert repository.get_by_id(ArtifactId("missing")) is None
+
+        repository.put(artifact)
+
+        assert repository.get_by_id(ArtifactId("artifact-1")) == artifact
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("mutation", ["job_id", "artifact_id", "content_hash"])
+def test_get_by_id_fails_closed_on_bound_identity_or_hash_mismatch(
+    tmp_path, mutation: str
+) -> None:
+    artifact = _artifact()
+    store, repository = _open_repository(tmp_path)
+    try:
+        repository.put(artifact)
+        directory = _artifact_directory(tmp_path)
+        if mutation == "content_hash":
+            (directory / "artifact.png").write_bytes(b"x" * len(artifact.content))
+        else:
+            path = directory / "metadata.json"
+            metadata = json.loads(path.read_bytes())
+            metadata[mutation] = "other"
+            path.write_bytes(
+                json.dumps(
+                    metadata,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=True,
+                ).encode("ascii")
+            )
+
+        with pytest.raises(
+            InfrastructureError, match="^production artifact store corrupted$"
+        ):
+            repository.get_by_id(ArtifactId("artifact-1"))
+    finally:
+        store.close()
+
+
+def test_get_by_id_rejects_a_forged_artifact_identifier(tmp_path) -> None:
+    store, repository = _open_repository(tmp_path)
+    hostile = ArtifactId("artifact-1")
+    object.__setattr__(hostile, "value", "../artifact-1")
+    try:
+        with pytest.raises(DomainError, match="^invalid production artifact id$"):
+            repository.get_by_id(hostile)
+        assert list(tmp_path.iterdir()) == []
     finally:
         store.close()
 
