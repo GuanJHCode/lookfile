@@ -10,7 +10,7 @@ from typing import Any, Callable
 
 from specstyle.domain.artifacts import AssetRef
 from specstyle.domain.enums import ArtifactStatus
-from specstyle.domain.identifiers import AttemptId, JobId
+from specstyle.domain.identifiers import AttemptId, JobId, RuleId
 from specstyle.errors import DomainError, InfrastructureError, _GpuOutOfMemoryError
 from specstyle.generation.diffusers_backend import DiffusersBackend, StyleAssetResolver
 from specstyle.generation.diffusers_loader import (
@@ -44,9 +44,11 @@ from specstyle.spec.compiled_models import (
 from specstyle.spec.compiler import compile_style_spec
 from specstyle.spec.loader import load_style_spec_text
 from specstyle.verification.production import (
+    _L1RuleMapping,
     _ProductionVerificationAllowlist,
     _create_production_verifier_factory,
 )
+from specstyle.verification.production_contracts import _clone_compiler_context
 from specstyle.verification.protocols import Verifier, run_verifier
 from specstyle.verification.rule_models import VerificationReport
 from specstyle.workflow.job_models import (
@@ -72,7 +74,16 @@ from specstyle.workflow.job_store import JobStore
 from specstyle.workflow.production_artifacts import _open_production_artifact_store
 from specstyle.workflow.production_export import (
     ProductionExportCommand,
+    ProductionExportResult,
+    ProductionRecoveryEntry,
     _prepare_production_export_command,
+)
+from specstyle.workflow.production_export_lifecycle import (
+    _ExportPhase,
+    _export_lock_holder,
+    _prepare_publish_arguments,
+    _publish_export,
+    _recover_exports,
 )
 from specstyle.workflow.production_repair import (
     _compose_initial_repair,
@@ -82,7 +93,16 @@ from specstyle.workflow.production_repair import (
 )
 from specstyle.workflow.production_reports import _open_production_report_store
 
-__all__ = ("ProductionJobRequest", "ProductionJobResult")
+__all__ = (
+    "ProductionJobRequest",
+    "ProductionJobResult",
+    "ProductionL1RuleBinding",
+    "production_l1_rule_bindings",
+    "ProductionRuntime",
+    "ProductionRuntimeReadiness",
+    "ProductionRuntimeFailureKind",
+    "open_production_runtime",
+)
 
 _OUTPUT_PROFILES = {"xhs_grid", "talking_head_cover", "background_sequence"}
 _PRODUCTION_BACKEND_TYPE = DiffusersBackend
@@ -91,17 +111,71 @@ _CLOSE_GUARD = threading.Lock()
 _CLOSE_DONE: dict[int, threading.Event] = {}
 _SET_EVENT = threading.Event()
 _SET_EVENT.set()
+_L1_RULE_BINDING_VALUES = (
+    ("l1_bundle", "technical_rgb_png_bundle_v1"),
+    ("l1_decode", "decode_png_rgb_no_metadata_v1"),
+    ("l1_dimensions", "dimensions_exact_v1"),
+    ("l1_pixels", "pixels_nonblank_v1"),
+)
+_L1_IMPLEMENTATIONS = frozenset(item[1] for item in _L1_RULE_BINDING_VALUES)
+_CONTEXT_FACTORY_ACTIVE = threading.local()
 
 
-class _RuntimeReadiness(StrEnum):
+class ProductionRuntimeReadiness(StrEnum):
     READY = "READY"
     BUSY = "BUSY"
     QUARANTINED = "QUARANTINED"
     CLOSED = "CLOSED"
 
 
-class _RuntimeFailureKind(StrEnum):
+class ProductionRuntimeFailureKind(StrEnum):
     GPU_OOM = "GPU_OOM"
+
+
+_RuntimeReadiness = ProductionRuntimeReadiness
+_RuntimeFailureKind = ProductionRuntimeFailureKind
+
+
+@dataclass(frozen=True, slots=True)
+class ProductionL1RuleBinding:
+    rule_id: RuleId
+    implementation: str
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.rule_id) is not RuleId
+            or type(self.rule_id.value) is not str
+            or type(self.implementation) is not str
+            or self.implementation not in _L1_IMPLEMENTATIONS
+        ):
+            raise DomainError("invalid production runtime dependency") from None
+        object.__setattr__(self, "rule_id", RuleId(str.__str__(self.rule_id.value)))
+        object.__setattr__(self, "implementation", str.__str__(self.implementation))
+
+
+def production_l1_rule_bindings() -> tuple[ProductionL1RuleBinding, ...]:
+    return tuple(
+        ProductionL1RuleBinding(RuleId(rule_id), implementation)
+        for rule_id, implementation in _L1_RULE_BINDING_VALUES
+    )
+
+
+def _rebuild_l1_rule_bindings(value: object, /) -> tuple[ProductionL1RuleBinding, ...]:
+    if type(value) is not tuple:
+        raise DomainError("invalid production runtime dependency") from None
+    try:
+        rebuilt = tuple(
+            ProductionL1RuleBinding(item.rule_id, item.implementation)
+            if type(item) is ProductionL1RuleBinding
+            else (_ for _ in ()).throw(ValueError())
+            for item in value
+        )
+    except Exception:
+        raise DomainError("invalid production runtime dependency") from None
+    values = tuple((item.rule_id.value, item.implementation) for item in rebuilt)
+    if values != _L1_RULE_BINDING_VALUES:
+        raise DomainError("invalid production runtime dependency") from None
+    return rebuilt
 
 
 def _utc_now() -> str:
@@ -649,7 +723,7 @@ def _close_all(
     return first
 
 
-class _ProductionGenerationRuntime:
+class ProductionRuntime:
     __slots__ = (
         "_loaded",
         "_load_pipeline",
@@ -720,6 +794,15 @@ class _ProductionGenerationRuntime:
         with self._state_lock:
             return self._failure_kind_value
 
+    @property
+    def compiler_context(self) -> CompilerContext:
+        with self._state_lock:
+            context = self._compiler_context
+        try:
+            return _rebuild_compiler_context(context)
+        except Exception:
+            raise InfrastructureError("production runtime corrupted") from None
+
     def prepare_export(
         self,
         request: ProductionJobRequest,
@@ -734,6 +817,58 @@ class _ProductionGenerationRuntime:
         return _prepare_production_export_command(
             request, result, self._environment, asset_credits, recompiled
         )
+
+    def publish_export(
+        self, command: ProductionExportCommand, target_root_fd: int, /
+    ) -> ProductionExportResult:
+        with self._state_lock:
+            if self._closed:
+                raise InfrastructureError("production runtime closed")
+        command, target_root_fd = _prepare_publish_arguments(command, target_root_fd)
+        self._start_export(command.job_id)
+        previous = getattr(_ACTIVE_RUNTIME, "current", None)
+        _ACTIVE_RUNTIME.current = self
+        try:
+            return _publish_export(self, command, target_root_fd)
+        finally:
+            _ACTIVE_RUNTIME.current = previous
+            self._finish_run()
+
+    def _append_export_event(
+        self,
+        job_id: JobId,
+        event_type: EventType,
+        from_state: JobStatus,
+        to_state: JobStatus,
+        payload: object,
+    ) -> None:
+        _append_event(
+            self._job_store,
+            job_id,
+            event_type,
+            from_state,
+            to_state,
+            self._clock(),
+            payload,
+        )
+
+    def recover_exports(
+        self,
+        commands: tuple[ProductionExportCommand, ...],
+        target_root_fd: int,
+        /,
+    ) -> tuple[ProductionRecoveryEntry, ...]:
+        with self._state_lock:
+            if self._closed:
+                raise InfrastructureError("production runtime closed")
+        self._start_recovery()
+        previous = getattr(_ACTIVE_RUNTIME, "current", None)
+        _ACTIVE_RUNTIME.current = self
+        try:
+            return _recover_exports(self, commands, target_root_fd)
+        finally:
+            _ACTIVE_RUNTIME.current = previous
+            self._finish_run()
 
     def _close_resources(self) -> None:
         with self._state_lock:
@@ -839,6 +974,32 @@ class _ProductionGenerationRuntime:
             self._active_cancel = threading.Event()
             self._active_cancel_reason = None
 
+    def _start_export(self, job_id: JobId) -> None:
+        with self._state_lock:
+            if self._closed:
+                raise InfrastructureError("production runtime closed")
+            if self._readiness_value is not _RuntimeReadiness.READY:
+                raise InfrastructureError("production runtime busy")
+            if not self._run_lock.acquire(blocking=False):
+                raise InfrastructureError("production runtime busy")
+            self._readiness_value = _RuntimeReadiness.BUSY
+            self._active_job_id = job_id
+            self._active_cancel = threading.Event()
+            self._active_cancel_reason = None
+
+    def _start_recovery(self) -> None:
+        with self._state_lock:
+            if self._closed:
+                raise InfrastructureError("production runtime closed")
+            if self._readiness_value is not _RuntimeReadiness.READY:
+                raise InfrastructureError("production runtime busy")
+            if not self._run_lock.acquire(blocking=False):
+                raise InfrastructureError("production runtime busy")
+            self._readiness_value = _RuntimeReadiness.BUSY
+            self._active_job_id = None
+            self._active_cancel = None
+            self._active_cancel_reason = None
+
     def _finish_run(self) -> None:
         with self._state_lock:
             self._active_job_id = None
@@ -860,31 +1021,39 @@ class _ProductionGenerationRuntime:
     def _cancel_durable(
         self, job_id: JobId, payload: CancelRequestedPayload
     ) -> JobState:
-        stalled_status: JobStatus | None = None
-        while True:
-            state = self._job_store.load(job_id)
-            terminal = self._cancel_terminal(state)
-            if terminal is not None:
+        holder = _export_lock_holder(self._job_store, job_id)
+        with holder.lock:
+            stalled_status: JobStatus | None = None
+            while True:
+                state = self._job_store.load(job_id)
+                terminal = self._cancel_terminal(state)
+                if terminal is not None:
+                    self._mark_durable_cancel(job_id, payload.reason)
+                    return terminal
+                if (
+                    state.job.status is JobStatus.EXPORTING
+                    and holder.phase is not _ExportPhase.STAGING
+                ):
+                    raise InfrastructureError(
+                        "production export recovery required"
+                    ) from None
                 self._mark_durable_cancel(job_id, payload.reason)
-                return terminal
-            self._mark_durable_cancel(job_id, payload.reason)
-            try:
-                _append_event(
-                    self._job_store,
-                    job_id,
-                    EventType.CANCEL_REQUESTED,
-                    state.job.status,
-                    JobStatus.CANCELLED,
-                    self._clock(),
-                    payload,
-                )
-            except DomainError:
-                if state.job.status is stalled_status:
-                    raise
-                stalled_status = state.job.status
-                continue
-            state = self._job_store.load(job_id)
-            return state
+                try:
+                    _append_event(
+                        self._job_store,
+                        job_id,
+                        EventType.CANCEL_REQUESTED,
+                        state.job.status,
+                        JobStatus.CANCELLED,
+                        self._clock(),
+                        payload,
+                    )
+                except DomainError:
+                    if state.job.status is stalled_status:
+                        raise
+                    stalled_status = state.job.status
+                    continue
+                return self._job_store.load(job_id)
 
     def _mark_durable_cancel(self, job_id: JobId, reason: str) -> None:
         with self._state_lock:
@@ -960,12 +1129,21 @@ class _ProductionGenerationRuntime:
             self._run_lock.release()
 
     def _reopen_under_run_lock(self) -> None:
-        loaded = factory = None
+        loaded = allowlist = factory = None
         failure: Exception | None = None
         with _GPU_LEASE:
             try:
                 loaded = self._load_pipeline()
-                factory = _create_production_verifier_factory(loaded, self._allowlist)
+                if type(self._allowlist) is _ProductionVerificationAllowlist:
+                    allowlist = _ProductionVerificationAllowlist(
+                        self._allowlist.schema_version,
+                        self._compiler_context,
+                        loaded._processor_provenance,
+                        self._allowlist.l1_rule_mappings,
+                    )
+                else:
+                    allowlist = self._allowlist
+                factory = _create_production_verifier_factory(loaded, allowlist)
             except Exception as error:
                 failure = error
             if failure is None:
@@ -973,8 +1151,11 @@ class _ProductionGenerationRuntime:
                     if self._closed:
                         failure = InfrastructureError("production runtime closed")
                     else:
-                        self._loaded = loaded
-                        self._verifier_factory = factory
+                        self._loaded, self._allowlist, self._verifier_factory = (
+                            loaded,
+                            allowlist,
+                            factory,
+                        )
                         self._failure_kind_value = None
                         self._readiness_value = _RuntimeReadiness.READY
             if failure is not None:
@@ -1348,7 +1529,7 @@ def _cleanup_failed_open(
     report_store: Any | None,
     artifact_store: Any | None,
 ) -> None:
-    for resource in (factory, loaded, report_store, artifact_store):
+    for resource in (report_store, artifact_store, factory, loaded):
         close = getattr(resource, "close", None)
         if not callable(close):
             continue
@@ -1359,22 +1540,75 @@ def _cleanup_failed_open(
 
 
 def _validate_runtime_dependencies(
-    compiler_context: object,
+    compiler_context_factory: object,
     style_assets: object,
     control_builder: object,
-    allowlist: object,
+    l1_rule_bindings: object,
     job_store: object,
     clock: object,
-) -> None:
+) -> tuple[ProductionL1RuleBinding, ...]:
+    _reject_context_factory_reentry()
+    bindings = _rebuild_l1_rule_bindings(l1_rule_bindings)
     if (
-        type(compiler_context) is not CompilerContext
+        not callable(compiler_context_factory)
         or not callable(style_assets)
         or not callable(getattr(control_builder, "build", None))
-        or type(allowlist) is not _ProductionVerificationAllowlist
         or type(job_store) is not JobStore
         or not callable(clock)
     ):
         raise DomainError("invalid production runtime dependency")
+    return bindings
+
+
+def _compiler_context_for_loaded(
+    compiler_context_factory: Callable[[str], CompilerContext],
+    loaded: LoadedPipeline,
+    /,
+) -> CompilerContext:
+    evidence = loaded._borrow_image_evidence_encoder()
+    preprocessing_version = evidence.preprocessing_version
+    _reject_context_factory_reentry()
+    _CONTEXT_FACTORY_ACTIVE.current = True
+    try:
+        candidate = compiler_context_factory(preprocessing_version)
+    finally:
+        _CONTEXT_FACTORY_ACTIVE.current = False
+    try:
+        context = _rebuild_compiler_context(candidate)
+    except Exception:
+        raise DomainError("invalid production runtime dependency") from None
+    matching = tuple(
+        capability
+        for capability in context.encoder_capabilities
+        if capability.pin == evidence.pin
+    )
+    if (
+        len(matching) != 1
+        or matching[0].preprocessing_version != preprocessing_version
+        or matching[0].layer != evidence.layer
+    ):
+        raise DomainError("invalid production runtime dependency") from None
+    return context
+
+
+def _reject_context_factory_reentry() -> None:
+    if getattr(_CONTEXT_FACTORY_ACTIVE, "current", False):
+        raise DomainError("invalid production runtime dependency") from None
+
+
+def _rebuild_compiler_context(value: object, /) -> CompilerContext:
+    cloned = _clone_compiler_context(value)
+    return CompilerContext(
+        cloned.compiler_pin,
+        cloned.runtime_capabilities,
+        cloned.model_capabilities,
+        cloned.encoder_capabilities,
+        cloned.strength_mappings,
+        cloned.output_profile_capabilities,
+        cloned.rule_catalogs,
+        cloned.threshold_profiles,
+        cloned.l3_plugins,
+    )
 
 
 def _bind_pipeline_loader(
@@ -1397,15 +1631,24 @@ def _bind_pipeline_loader(
 
 
 def _open_runtime_owned_resources(
-    load_pipeline: Callable[[], LoadedPipeline],
-    allowlist: _ProductionVerificationAllowlist,
+    loaded: LoadedPipeline,
+    compiler_context: CompilerContext,
+    l1_rule_bindings: tuple[ProductionL1RuleBinding, ...],
     artifact_root_fd: int,
-) -> tuple[LoadedPipeline, Any, Any, Any]:
+) -> tuple[LoadedPipeline, _ProductionVerificationAllowlist, Any, Any, Any]:
     artifact_store = None
     report_store = None
     with _GPU_LEASE:
-        loaded = load_pipeline()
         try:
+            allowlist = _ProductionVerificationAllowlist(
+                "specstyle.production_verifier.v1",
+                compiler_context,
+                loaded._processor_provenance,
+                tuple(
+                    _L1RuleMapping(binding.rule_id, binding.implementation)
+                    for binding in l1_rule_bindings
+                ),
+            )
             verifier_factory = _create_production_verifier_factory(loaded, allowlist)
         except Exception:
             _cleanup_failed_open(loaded, None, None, None)
@@ -1416,17 +1659,32 @@ def _open_runtime_owned_resources(
     except Exception:
         _cleanup_failed_open(loaded, verifier_factory, report_store, artifact_store)
         raise
-    return loaded, verifier_factory, report_store, artifact_store
+    return loaded, allowlist, verifier_factory, report_store, artifact_store
 
 
-def _open_production_generation_runtime(
+def _load_runtime_context(
+    load_pipeline: Callable[[], LoadedPipeline],
+    compiler_context_factory: Callable[[str], CompilerContext],
+    /,
+) -> tuple[LoadedPipeline, CompilerContext]:
+    with _GPU_LEASE:
+        loaded = load_pipeline()
+    try:
+        context = _compiler_context_for_loaded(compiler_context_factory, loaded)
+    except Exception:
+        _cleanup_failed_open(loaded, None, None, None)
+        raise
+    return loaded, context
+
+
+def open_production_runtime(
     supply: VerifiedPipelineSupply,
     pipeline_graph: PipelineGraph,
     environment: EnvironmentSnapshot,
-    compiler_context: CompilerContext,
+    compiler_context_factory: Callable[[str], CompilerContext],
     style_assets: StyleAssetResolver,
     control_builder: ControlInputBuilder,
-    allowlist: _ProductionVerificationAllowlist,
+    l1_rule_bindings: tuple[ProductionL1RuleBinding, ...],
     job_store: JobStore,
     artifact_root_fd: int,
     /,
@@ -1434,17 +1692,27 @@ def _open_production_generation_runtime(
     torch_module: Any | None = None,
     diffusers_module: Any | None = None,
     clock: Callable[[], str] = _utc_now,
-) -> _ProductionGenerationRuntime:
-    _validate_runtime_dependencies(
-        compiler_context, style_assets, control_builder, allowlist, job_store, clock
+) -> ProductionRuntime:
+    l1_rule_bindings = _validate_runtime_dependencies(
+        compiler_context_factory,
+        style_assets,
+        control_builder,
+        l1_rule_bindings,
+        job_store,
+        clock,
     )
     load_pipeline = _bind_pipeline_loader(
         supply, pipeline_graph, environment, torch_module, diffusers_module
     )
-    loaded, verifier_factory, report_store, artifact_store = (
-        _open_runtime_owned_resources(load_pipeline, allowlist, artifact_root_fd)
+    loaded, compiler_context = _load_runtime_context(
+        load_pipeline, compiler_context_factory
     )
-    return _ProductionGenerationRuntime(
+    loaded, allowlist, verifier_factory, report_store, artifact_store = (
+        _open_runtime_owned_resources(
+            loaded, compiler_context, l1_rule_bindings, artifact_root_fd
+        )
+    )
+    return ProductionRuntime(
         loaded,
         load_pipeline,
         allowlist,
@@ -1458,3 +1726,7 @@ def _open_production_generation_runtime(
         job_store,
         clock,
     )
+
+
+_ProductionGenerationRuntime = ProductionRuntime
+_open_production_generation_runtime = open_production_runtime

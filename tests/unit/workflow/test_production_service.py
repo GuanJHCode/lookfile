@@ -8,7 +8,7 @@ import inspect
 import os
 import threading
 from dataclasses import fields
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -62,6 +62,10 @@ class _HostileTuple(tuple):
 
 
 class _HostileJobId(JobId):
+    pass
+
+
+class _HostileRuleId(RuleId):
     pass
 
 
@@ -134,12 +138,26 @@ def _request_kwargs() -> dict[str, object]:
     }
 
 
-def test_request_and_result_are_the_only_public_frozen_slotted_surfaces() -> None:
+def test_production_service_exposes_one_public_runtime_surface() -> None:
     module, request_type = _request_type()
 
     request = request_type(**_request_kwargs())
 
-    assert module.__all__ == ("ProductionJobRequest", "ProductionJobResult")
+    assert module.__all__ == (
+        "ProductionJobRequest",
+        "ProductionJobResult",
+        "ProductionL1RuleBinding",
+        "production_l1_rule_bindings",
+        "ProductionRuntime",
+        "ProductionRuntimeReadiness",
+        "ProductionRuntimeFailureKind",
+        "open_production_runtime",
+    )
+    assert module._ProductionGenerationRuntime is module.ProductionRuntime
+    assert module._RuntimeReadiness is module.ProductionRuntimeReadiness
+    assert module._RuntimeFailureKind is module.ProductionRuntimeFailureKind
+    assert module._open_production_generation_runtime is module.open_production_runtime
+    assert callable(module.open_production_runtime)
     assert tuple(field.name for field in fields(module.ProductionJobResult)) == (
         "compiled",
         "graph",
@@ -155,6 +173,66 @@ def test_request_and_result_are_the_only_public_frozen_slotted_surfaces() -> Non
     assert request.style_references == _style_references()
     with pytest.raises(FrozenInstanceError):
         request.bundle_name = "other"
+
+
+def test_production_runtime_exposes_only_named_export_entrypoints() -> None:
+    module = _request_type()[0]
+
+    assert not hasattr(module.ProductionRuntime, "export")
+    assert callable(module.ProductionRuntime.publish_export)
+    assert callable(module.ProductionRuntime.recover_exports)
+    assert tuple(
+        inspect.signature(module.ProductionRuntime.publish_export).parameters
+    ) == (
+        "self",
+        "command",
+        "target_root_fd",
+    )
+    assert tuple(
+        inspect.signature(module.ProductionRuntime.recover_exports).parameters
+    ) == (
+        "self",
+        "commands",
+        "target_root_fd",
+    )
+
+
+def test_public_l1_bindings_are_frozen_slotted_and_exact() -> None:
+    module = _request_type()[0]
+    binding = module.ProductionL1RuleBinding(
+        RuleId("l1_bundle"), "technical_rgb_png_bundle_v1"
+    )
+
+    assert tuple(field.name for field in fields(binding)) == (
+        "rule_id",
+        "implementation",
+    )
+    assert not hasattr(binding, "__dict__")
+    with pytest.raises(FrozenInstanceError):
+        binding.implementation = "decode_png_rgb_no_metadata_v1"
+    with pytest.raises(DomainError):
+        module.ProductionL1RuleBinding(
+            _HostileRuleId("l1_bundle"), "technical_rgb_png_bundle_v1"
+        )
+    with pytest.raises(DomainError):
+        module.ProductionL1RuleBinding(
+            RuleId("l1_bundle"), _HostileStr("technical_rgb_png_bundle_v1")
+        )
+
+    first = module.production_l1_rule_bindings()
+    second = module.production_l1_rule_bindings()
+    assert tuple((item.rule_id.value, item.implementation) for item in first) == (
+        ("l1_bundle", "technical_rgb_png_bundle_v1"),
+        ("l1_decode", "decode_png_rgb_no_metadata_v1"),
+        ("l1_dimensions", "dimensions_exact_v1"),
+        ("l1_pixels", "pixels_nonblank_v1"),
+    )
+    assert first is not second
+    assert all(left is not right for left, right in zip(first, second, strict=True))
+    object.__setattr__(first[0], "implementation", "tampered")
+    assert module.production_l1_rule_bindings()[0].implementation == (
+        "technical_rgb_png_bundle_v1"
+    )
 
 
 def test_prepare_export_builds_one_approved_xhs_item_without_expanding_public_api(
@@ -214,7 +292,16 @@ def test_prepare_export_builds_one_approved_xhs_item_without_expanding_public_ap
 
     command = runtime.prepare_export(job_request, result, prepared.asset_credits)
 
-    assert module.__all__ == ("ProductionJobRequest", "ProductionJobResult")
+    assert module.__all__ == (
+        "ProductionJobRequest",
+        "ProductionJobResult",
+        "ProductionL1RuleBinding",
+        "production_l1_rule_bindings",
+        "ProductionRuntime",
+        "ProductionRuntimeReadiness",
+        "ProductionRuntimeFailureKind",
+        "open_production_runtime",
+    )
     assert command.job_id == generation_request.job_id
     assert command.bundle_name == "bundle"
     assert len(command.export_request.cohorts) == 1
@@ -411,19 +498,12 @@ def test_private_factory_loads_and_owns_only_the_loaded_pipeline(
     assert callable(factory)
 
     from tests.unit.generation.test_diffusers_loader import (
-        _CLIPImageProcessor,
         _Diffusers,
         _Torch,
-        _Transformers,
         _environment,
         _supply,
     )
     from tests.unit.spec.test_compiler import context
-    from specstyle.generation.image_evidence import _build_processor_provenance
-    from specstyle.verification.production import (
-        _L1RuleMapping,
-        _ProductionVerificationAllowlist,
-    )
 
     supply, graph = _supply(tmp_path / "weights")
     store_root = tmp_path / "store"
@@ -432,18 +512,14 @@ def test_private_factory_loads_and_owns_only_the_loaded_pipeline(
     artifact_root.mkdir()
     artifact_root_fd = os.open(artifact_root, os.O_RDONLY | os.O_DIRECTORY)
     diffusers = _Diffusers()
-    allowlist = _ProductionVerificationAllowlist(
-        "specstyle.production_verifier.v1",
-        context(),
-        _build_processor_provenance(
-            _Transformers, _CLIPImageProcessor(), _Transformers.__version__
-        ),
-        (
-            _L1RuleMapping(RuleId("l1_bundle"), "technical_rgb_png_bundle_v1"),
-            _L1RuleMapping(RuleId("l1_decode"), "decode_png_rgb_no_metadata_v1"),
-            _L1RuleMapping(RuleId("l1_dimensions"), "dimensions_exact_v1"),
-            _L1RuleMapping(RuleId("l1_pixels"), "pixels_nonblank_v1"),
-        ),
+    l1_rule_bindings = tuple(
+        module.ProductionL1RuleBinding(RuleId(rule_id), implementation)
+        for rule_id, implementation in (
+            ("l1_bundle", "technical_rgb_png_bundle_v1"),
+            ("l1_decode", "decode_png_rgb_no_metadata_v1"),
+            ("l1_dimensions", "dimensions_exact_v1"),
+            ("l1_pixels", "pixels_nonblank_v1"),
+        )
     )
     issued_factories: list[object] = []
     create_factory = module._create_production_verifier_factory
@@ -456,14 +532,36 @@ def test_private_factory_loads_and_owns_only_the_loaded_pipeline(
     monkeypatch.setattr(
         module, "_create_production_verifier_factory", tracked_create_factory
     )
+    callback_versions: list[str] = []
+    base_context = context()
+
+    def compiler_context_factory(preprocessing_version: str):
+        callback_versions.append(preprocessing_version)
+        encoder = base_context.encoder_capabilities[0]
+        return replace(
+            base_context,
+            encoder_capabilities=(
+                replace(
+                    encoder,
+                    pin=ResourcePin(
+                        graph.ip_adapter.model_id,
+                        graph.ip_adapter.revision,
+                        graph.ip_adapter.expected_sha256,
+                    ),
+                    preprocessing_version=preprocessing_version,
+                    layer="hidden_states[-2]",
+                ),
+            ),
+        )
+
     runtime = factory(
         supply,
         graph,
         _environment(),
-        context(),
+        compiler_context_factory,
         lambda _reference: b"",
         _UnusedControlBuilder(),
-        allowlist,
+        l1_rule_bindings,
         JobStore(store_root),
         artifact_root_fd,
         torch_module=_Torch(),
@@ -471,10 +569,27 @@ def test_private_factory_loads_and_owns_only_the_loaded_pipeline(
     )
     os.close(artifact_root_fd)
     initial_loaded = runtime._loaded
+    initial_allowlist = runtime._allowlist
     pipeline = initial_loaded.borrow_pipeline()
     owned_factory = runtime._verifier_factory
     assert callable(runtime._load_pipeline)
-    assert runtime._allowlist is allowlist
+    assert callback_versions == [
+        runtime._loaded._borrow_image_evidence_encoder().preprocessing_version
+    ]
+    assert runtime.compiler_context == runtime._compiler_context
+    assert runtime.compiler_context is not runtime._compiler_context
+    external_context = runtime.compiler_context
+    object.__setattr__(external_context, "encoder_capabilities", ())
+    assert runtime.compiler_context.encoder_capabilities
+    assert (
+        runtime._allowlist.processor_provenance is runtime._loaded._processor_provenance
+    )
+    assert tuple(
+        (mapping.rule_id.value, mapping.implementation)
+        for mapping in runtime._allowlist.l1_rule_mappings
+    ) == tuple(
+        (binding.rule_id.value, binding.implementation) for binding in l1_rule_bindings
+    )
 
     runtime._loaded.close()
     runtime._verifier_factory = None
@@ -482,8 +597,14 @@ def test_private_factory_loads_and_owns_only_the_loaded_pipeline(
     runtime._failure_kind_value = module._RuntimeFailureKind.GPU_OOM
     runtime.reopen()
     reopened_loaded = runtime._loaded
+    reopened_allowlist = runtime._allowlist
     reopened_pipeline = reopened_loaded.borrow_pipeline()
     reopened_factory = runtime._verifier_factory
+    assert reopened_allowlist is not initial_allowlist
+    assert (
+        reopened_allowlist.processor_provenance is reopened_loaded._processor_provenance
+    )
+    assert reopened_factory._allowlist is reopened_allowlist
     with pytest.raises(DomainError, match="closed"):
         initial_loaded.borrow_pipeline()
 
@@ -501,17 +622,30 @@ def test_private_factory_loads_and_owns_only_the_loaded_pipeline(
 
     primary = InfrastructureError("reopen factory failed")
     runtime._load_pipeline = tracked_load
+    failed_bindings: list[tuple[object, object]] = []
+
+    def fail_factory(loaded, allowlist):
+        failed_bindings.append((loaded, allowlist))
+        raise primary
+
     monkeypatch.setattr(
         module,
         "_create_production_verifier_factory",
-        lambda *_args: (_ for _ in ()).throw(primary),
+        fail_factory,
     )
     with pytest.raises(InfrastructureError) as raised:
         runtime.reopen()
     assert raised.value is primary
     assert runtime._loaded is reopened_loaded
+    assert runtime._allowlist is reopened_allowlist
+    assert runtime._verifier_factory is None
     assert runtime.readiness is module._RuntimeReadiness.QUARANTINED
     assert runtime.failure_kind is module._RuntimeFailureKind.GPU_OOM
+    assert failed_bindings[0][0] is failed_loaded[0]
+    assert (
+        failed_bindings[0][1].processor_provenance
+        is failed_loaded[0]._processor_provenance
+    )
     with pytest.raises(DomainError, match="closed"):
         failed_loaded[0].borrow_pipeline()
 
@@ -524,23 +658,290 @@ def test_private_factory_loads_and_owns_only_the_loaded_pipeline(
     assert reopened_pipeline is not pipeline
     assert reopened_pipeline.hooks == 1
     assert failed_loaded[0]._closed is True
+    assert len(callback_versions) == 1
     assert supply.borrow_component("base").model_id == "base"
     supply.close()
 
 
-def test_private_factory_and_runtime_shapes_are_frozen() -> None:
+@pytest.mark.parametrize(
+    "failure_kind",
+    (
+        "raises",
+        "wrong_type",
+        "missing_encoder",
+        "wrong_version",
+        "wrong_layer",
+        "duplicate_encoder",
+        "mutated_sequence",
+    ),
+)
+def test_context_factory_runs_once_outside_gpu_lease_and_failure_closes_loaded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_kind: str,
+) -> None:
     module = _request_type()[0]
-    signature = inspect.signature(module._open_production_generation_runtime)
+    from tests.unit.spec.test_compiler import context
+
+    class Evidence:
+        pin = context().encoder_capabilities[0].pin
+        preprocessing_version = "processor-v1"
+        layer = "layer"
+
+    class Loaded:
+        closed = False
+
+        def _borrow_image_evidence_encoder(self):
+            return Evidence()
+
+        def close(self) -> None:
+            self.closed = True
+
+    loaded = Loaded()
+    loads: list[str] = []
+    monkeypatch.setattr(
+        module,
+        "_bind_pipeline_loader",
+        lambda *_args: lambda: (loads.append("load"), loaded)[1],
+    )
+    lease_depth = 0
+
+    class Lease:
+        def __enter__(self):
+            nonlocal lease_depth
+            lease_depth += 1
+
+        def __exit__(self, *_args):
+            nonlocal lease_depth
+            lease_depth -= 1
+
+    monkeypatch.setattr(module, "_GPU_LEASE", Lease())
+    calls: list[str] = []
+    primary = InfrastructureError("context callback failed")
+
+    def compiler_context_factory(version: str):
+        calls.append(version)
+        assert lease_depth == 0
+        if failure_kind == "raises":
+            raise primary
+        if failure_kind == "wrong_type":
+            return object()
+        base = context()
+        if failure_kind == "missing_encoder":
+            return replace(base, encoder_capabilities=())
+        encoder = base.encoder_capabilities[0]
+        if failure_kind == "wrong_version":
+            return base
+        bound = replace(
+            encoder,
+            preprocessing_version=version,
+            layer="wrong" if failure_kind == "wrong_layer" else "layer",
+        )
+        candidate = replace(
+            base,
+            encoder_capabilities=(
+                (bound, bound) if failure_kind == "duplicate_encoder" else (bound,)
+            ),
+        )
+        if failure_kind == "mutated_sequence":
+            object.__setattr__(candidate, "encoder_capabilities", [bound])
+        return candidate
+
+    store_root = tmp_path / "store"
+    artifact_root = tmp_path / "artifacts"
+    store_root.mkdir()
+    artifact_root.mkdir()
+    root_fd = os.open(artifact_root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        expected = InfrastructureError if failure_kind == "raises" else DomainError
+        with pytest.raises(expected) as raised:
+            module.open_production_runtime(
+                object(),
+                object(),
+                object(),
+                compiler_context_factory,
+                lambda _reference: b"",
+                _UnusedControlBuilder(),
+                module.production_l1_rule_bindings(),
+                JobStore(store_root),
+                root_fd,
+            )
+    finally:
+        os.close(root_fd)
+
+    if failure_kind == "raises":
+        assert raised.value is primary
+    assert loads == ["load"]
+    assert calls == ["processor-v1"]
+    assert loaded.closed is True
+
+
+def test_factory_rejects_noncanonical_l1_bindings_before_loading(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _request_type()[0]
+    good = module.production_l1_rule_bindings()
+    swapped = (
+        module.ProductionL1RuleBinding(
+            RuleId("l1_bundle"), "decode_png_rgb_no_metadata_v1"
+        ),
+        module.ProductionL1RuleBinding(
+            RuleId("l1_decode"), "technical_rgb_png_bundle_v1"
+        ),
+        *good[2:],
+    )
+    hostile = module.production_l1_rule_bindings()
+    object.__setattr__(hostile[0], "rule_id", _HostileRuleId("l1_bundle"))
+    candidates = (
+        good[:-1],
+        (*good, good[-1]),
+        tuple(reversed(good)),
+        swapped,
+        list(good),
+        hostile,
+    )
+    loads: list[str] = []
+    monkeypatch.setattr(
+        module,
+        "_bind_pipeline_loader",
+        lambda *_args: lambda: loads.append("load"),
+    )
+    store_root = tmp_path / "store"
+    artifact_root = tmp_path / "artifacts"
+    store_root.mkdir()
+    artifact_root.mkdir()
+    root_fd = os.open(artifact_root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for bindings in candidates:
+            with pytest.raises(DomainError):
+                module.open_production_runtime(
+                    object(),
+                    object(),
+                    object(),
+                    lambda _version: object(),
+                    lambda _reference: b"",
+                    _UnusedControlBuilder(),
+                    bindings,
+                    JobStore(store_root),
+                    root_fd,
+                )
+    finally:
+        os.close(root_fd)
+
+    assert loads == []
+
+
+def test_context_factory_reentry_fails_before_a_second_load_and_closes_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _request_type()[0]
+    from tests.unit.spec.test_compiler import context
+
+    class Evidence:
+        pin = context().encoder_capabilities[0].pin
+        preprocessing_version = "processor-v1"
+        layer = "layer"
+
+    class Loaded:
+        closed = False
+
+        def _borrow_image_evidence_encoder(self):
+            return Evidence()
+
+        def close(self) -> None:
+            self.closed = True
+
+    loaded = Loaded()
+    loads: list[str] = []
+    monkeypatch.setattr(
+        module,
+        "_bind_pipeline_loader",
+        lambda *_args: lambda: (loads.append("load"), loaded)[1],
+    )
+    store_root = tmp_path / "store"
+    artifact_root = tmp_path / "artifacts"
+    store_root.mkdir()
+    artifact_root.mkdir()
+    store = JobStore(store_root)
+    root_fd = os.open(artifact_root, os.O_RDONLY | os.O_DIRECTORY)
+    primary = InfrastructureError("stop outer callback")
+
+    def compiler_context_factory(_version: str):
+        with pytest.raises(DomainError, match="invalid production runtime dependency"):
+            module.open_production_runtime(
+                object(),
+                object(),
+                object(),
+                compiler_context_factory,
+                lambda _reference: b"",
+                _UnusedControlBuilder(),
+                module.production_l1_rule_bindings(),
+                store,
+                root_fd,
+            )
+        raise primary
+
+    try:
+        with pytest.raises(InfrastructureError) as raised:
+            module.open_production_runtime(
+                object(),
+                object(),
+                object(),
+                compiler_context_factory,
+                lambda _reference: b"",
+                _UnusedControlBuilder(),
+                module.production_l1_rule_bindings(),
+                store,
+                root_fd,
+            )
+    finally:
+        os.close(root_fd)
+
+    assert raised.value is primary
+    assert loads == ["load"]
+    assert loaded.closed is True
+
+
+def test_source_consumers_do_not_import_private_runtime_surfaces() -> None:
+    source_root = Path(__file__).parents[3] / "src" / "specstyle"
+    private = {
+        "_ProductionGenerationRuntime",
+        "_RuntimeReadiness",
+        "_RuntimeFailureKind",
+        "_open_production_generation_runtime",
+    }
+    violations: list[tuple[str, str]] = []
+    for path in source_root.rglob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ImportFrom):
+                continue
+            if node.module != "specstyle.workflow.production_service":
+                continue
+            violations.extend(
+                (str(path.relative_to(source_root)), alias.name)
+                for alias in node.names
+                if alias.name in private
+            )
+
+    assert violations == []
+
+
+def test_public_factory_and_runtime_shapes_are_frozen() -> None:
+    module = _request_type()[0]
+    signature = inspect.signature(module.open_production_runtime)
     parameters = tuple(signature.parameters.values())
 
     assert tuple(parameter.name for parameter in parameters) == (
         "supply",
         "pipeline_graph",
         "environment",
-        "compiler_context",
+        "compiler_context_factory",
         "style_assets",
         "control_builder",
-        "allowlist",
+        "l1_rule_bindings",
         "job_store",
         "artifact_root_fd",
         "torch_module",
@@ -676,7 +1077,7 @@ def test_failed_runtime_open_cleanup_uses_runtime_ownership_order() -> None:
         Resource("artifact"),
     )
 
-    assert events == ["factory", "loaded", "report", "artifact"]
+    assert events == ["report", "artifact", "factory", "loaded"]
 
 
 def test_execute_after_close_fails_before_validating_the_request() -> None:

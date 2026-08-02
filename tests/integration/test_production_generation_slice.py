@@ -38,15 +38,13 @@ from specstyle.spec.compiled_models import (
     CompilerContext,
     ResourcePin,
 )
-from specstyle.verification.production import (
-    _L1RuleMapping,
-    _ProductionVerificationAllowlist,
-)
 from specstyle.workflow.job_models import EventType, JobStatus
 from specstyle.workflow.job_store import JobStore
 from specstyle.workflow.production_service import (
     ProductionJobRequest,
-    _open_production_generation_runtime,
+    ProductionL1RuleBinding,
+    open_production_runtime,
+    production_l1_rule_bindings,
 )
 from tests.unit.generation.test_diffusers_loader import (
     _CLIPImageProcessor,
@@ -59,7 +57,6 @@ from tests.unit.generation.test_diffusers_loader import (
 )
 from tests.unit.spec.test_compiler import context
 from tests.unit.verification._production_builders import (
-    _L1_MAPPINGS,
     _compiler_context as _verification_compiler_context,
     _raw_spec as _verification_raw_spec,
 )
@@ -79,7 +76,7 @@ def _compiler_inputs(
     *,
     applicable_batch: bool = False,
     mismatch: str | None = None,
-) -> tuple[str, CompilerContext, _ProductionVerificationAllowlist]:
+) -> tuple[str, CompilerContext, tuple[ProductionL1RuleBinding, ...]]:
     provenance = _build_processor_provenance(
         _Transformers, _CLIPImageProcessor(), _Transformers.__version__
     )
@@ -103,13 +100,8 @@ def _compiler_inputs(
     compiler_context, raw = _apply_compiler_mismatch(compiler_context, raw, mismatch)
     if applicable_batch:
         compiler_context = _add_applicable_batch_rule(compiler_context)
-    allowlist = _ProductionVerificationAllowlist(
-        "specstyle.production_verifier.v1",
-        compiler_context,
-        provenance,
-        tuple(_L1RuleMapping(*entry) for entry in _L1_MAPPINGS),
-    )
-    return json.dumps(raw), compiler_context, allowlist
+    bindings = production_l1_rule_bindings()
+    return json.dumps(raw), compiler_context, bindings
 
 
 def _apply_compiler_mismatch(
@@ -225,7 +217,7 @@ def _open_runtime(
     compiler_context: CompilerContext,
     style_assets: object,
     control_builder: object,
-    allowlist: _ProductionVerificationAllowlist,
+    l1_rule_bindings: tuple[ProductionL1RuleBinding, ...],
     job_store: JobStore,
     **kwargs: object,
 ):
@@ -233,14 +225,14 @@ def _open_runtime(
     artifact_root.mkdir(exist_ok=True)
     root_fd = os.open(artifact_root, os.O_RDONLY | os.O_DIRECTORY)
     try:
-        return _open_production_generation_runtime(
+        return open_production_runtime(
             supply,
             pipeline_graph,
             environment,
-            compiler_context,
+            lambda _preprocessing_version: compiler_context,
             style_assets,
             control_builder,
-            allowlist,
+            l1_rule_bindings,
             job_store,
             root_fd,
             **kwargs,

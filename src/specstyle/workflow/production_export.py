@@ -126,6 +126,22 @@ class ProductionExportCommand:
         object.__setattr__(self, "export_request", export_request)
 
 
+def _rebuild_production_export_command(value: object) -> ProductionExportCommand:
+    if type(value) is not ProductionExportCommand:
+        _invalid()
+    try:
+        rebuilt = ProductionExportCommand(
+            value.job_id,
+            value.bundle_name,
+            value.export_request,
+        )
+        if not _same(value, rebuilt):
+            _invalid()
+        return rebuilt
+    except Exception:
+        _invalid()
+
+
 def _safe_relative_path(value: object) -> str:
     if (
         type(value) is not str

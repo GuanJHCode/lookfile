@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from dataclasses import FrozenInstanceError, dataclass, fields, replace
 import importlib
+import os
+from pathlib import Path
+import threading
 
 import pytest
 
@@ -21,7 +24,7 @@ from specstyle.domain.identifiers import (
     JobId,
     Sha256,
 )
-from specstyle.errors import DomainError
+from specstyle.errors import DomainError, InfrastructureError
 from specstyle.exporting.bundle import ExportBundle, ExportedFile
 from specstyle.exporting.manifest import (
     AssetCredit,
@@ -53,6 +56,20 @@ from specstyle.spec.models import StyleSpecV1
 from specstyle.verification.routing import decide_artifact
 from specstyle.verification.rule_models import RuleResult, VerificationReport
 from specstyle.workflow.job_models import Job, JobBudget, JobState, JobStatus
+from specstyle.workflow.job_models import (
+    AttemptFinishedPayload,
+    AttemptStartedPayload,
+    Event,
+    EventType,
+    ExportStartedPayload,
+    JobSnapshot,
+    JobStartedPayload,
+    SpecCompiledPayload,
+    VerifierFinishedPayload,
+)
+from specstyle.workflow.job_store import JobStore
+from specstyle.workflow.production_artifacts import _open_production_artifact_store
+from specstyle.workflow.production_reports import _open_production_report_store
 from specstyle.workflow.production_service import (
     ProductionJobRequest,
     ProductionJobResult,
@@ -249,6 +266,150 @@ def _runtime(case: _Case) -> _ProductionGenerationRuntime:
     return runtime
 
 
+def _append_case_event(
+    store: JobStore,
+    case: _Case,
+    event_type: EventType,
+    from_state: JobStatus,
+    to_state: JobStatus,
+    payload: object,
+) -> None:
+    store.append_event(
+        case.request.job_id,
+        Event(
+            1,
+            case.request.job_id,
+            event_type,
+            from_state,
+            to_state,
+            "2026-08-02T00:00:01.000Z",
+            payload,
+        ),
+    )
+
+
+def _persist_case(store: JobStore, case: _Case) -> None:
+    result = case.result
+    request = result.history.initial_attempt.request
+    decision = result.terminal.artifact_decision
+    terminal_status = JobStatus(decision.artifact_status.value)
+    genesis = Job(
+        request.job_id,
+        result.compiled.compiled_spec_hash,
+        (request.output_profile,),
+        JobBudget(2),
+        JobStatus.CREATED,
+        "2026-08-02T00:00:00.000Z",
+        "2026-08-02T00:00:00.000Z",
+    )
+    store.save_snapshot(
+        request.job_id,
+        JobSnapshot("specstyle.workflow.snapshot.v1", genesis, 0, (), ()),
+    )
+    events = (
+        (
+            EventType.JOB_STARTED,
+            JobStatus.CREATED,
+            JobStatus.SPEC_VALIDATED,
+            JobStartedPayload(
+                result.compiled.compiled_spec_hash,
+                (request.output_profile,),
+                JobBudget(2),
+            ),
+        ),
+        (
+            EventType.SPEC_COMPILED,
+            JobStatus.SPEC_VALIDATED,
+            JobStatus.SPEC_COMPILED,
+            SpecCompiledPayload(result.compiled.compiled_spec_hash),
+        ),
+        (
+            EventType.ATTEMPT_STARTED,
+            JobStatus.SPEC_COMPILED,
+            JobStatus.GENERATING,
+            AttemptStartedPayload(0, 0, request.attempt_id, None),
+        ),
+        (
+            EventType.ATTEMPT_FINISHED,
+            JobStatus.GENERATING,
+            JobStatus.VERIFYING,
+            AttemptFinishedPayload(
+                0,
+                0,
+                request.attempt_id,
+                result.artifact.ref.artifact_id,
+                request.request_hash,
+            ),
+        ),
+        (
+            EventType.VERIFIER_FINISHED,
+            JobStatus.VERIFYING,
+            terminal_status,
+            VerifierFinishedPayload(
+                0,
+                0,
+                result.artifact.ref.artifact_id,
+                decision.artifact_status,
+                decision.decision_reason,
+                decision.repair_stop_reason,
+            ),
+        ),
+    )
+    for event_type, from_state, to_state, payload in events:
+        _append_case_event(store, case, event_type, from_state, to_state, payload)
+
+
+def _export_runtime(case: _Case, root: Path):
+    from specstyle.workflow import production_service
+
+    store = JobStore(root)
+    _persist_case(store, case)
+    persistence_root = root.parent / f"{root.name}-persistence"
+    persistence_root.mkdir()
+    root_fd = os.open(persistence_root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        artifact_store = _open_production_artifact_store(root_fd)
+        report_store = _open_production_report_store(root_fd)
+    finally:
+        os.close(root_fd)
+    artifact_repository = artifact_store.for_job(case.request.job_id)
+    report_repository = report_store.for_attempt(
+        case.request.job_id, case.result.request.attempt_id
+    )
+    artifact_repository.put(case.result.artifact)
+    report_repository.put(case.result.request, case.result.report)
+    artifact_repository.close()
+    report_repository.close()
+    runtime = object.__new__(production_service.ProductionRuntime)
+    values = {
+        "_loaded": object(),
+        "_load_pipeline": lambda: None,
+        "_allowlist": object(),
+        "_verifier_factory": object(),
+        "_report_store": report_store,
+        "_artifact_store": artifact_store,
+        "_environment": case.environment,
+        "_compiler_context": case.compiler_context,
+        "_style_assets": object(),
+        "_control_builder": object(),
+        "_job_store": store,
+        "_clock": production_service._NondecreasingAuditClock(
+            lambda: "2026-08-02T00:00:02.000Z"
+        ),
+        "_state_lock": threading.RLock(),
+        "_run_lock": threading.Lock(),
+        "_active_job_id": None,
+        "_active_cancel": None,
+        "_active_cancel_reason": None,
+        "_readiness_value": production_service.ProductionRuntimeReadiness.READY,
+        "_failure_kind_value": None,
+        "_closed": False,
+    }
+    for name, value in values.items():
+        setattr(runtime, name, value)
+    return runtime, store, artifact_store, report_store
+
+
 def _completed_state(bundle_name: str = "bundle") -> JobState:
     export_request = sample_approved_export_request()
     item = export_request.cohorts[0].items[0]
@@ -425,6 +586,231 @@ def test_prepare_export_supports_every_profile_and_terminal_route(
             ArtifactStatus.REJECTED: "rejected/",
         }[status]
     )
+
+
+@pytest.mark.parametrize(
+    ("profile", "status"),
+    tuple(
+        zip(
+            _PROFILES,
+            (
+                ArtifactStatus.APPROVED,
+                ArtifactStatus.MANUAL_REVIEW,
+                ArtifactStatus.REJECTED,
+            ),
+            strict=True,
+        )
+    ),
+)
+def test_publish_export_persists_started_then_atomically_published(
+    tmp_path: Path,
+    profile: str,
+    status: ArtifactStatus,
+) -> None:
+    case = _case(profile, status)
+    root = tmp_path / "state"
+    target = tmp_path / "exports"
+    root.mkdir()
+    target.mkdir()
+    runtime, store, artifact_store, report_store = _export_runtime(case, root)
+    command = _runtime(case).prepare_export(case.request, case.result, case.credits)
+    target_fd = os.open(target, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        result = runtime.publish_export(command, target_fd)
+    finally:
+        os.close(target_fd)
+        report_store.close()
+        artifact_store.close()
+
+    assert type(result) is _export_module().ProductionExportResult
+    assert result.job_state.job.status is JobStatus.COMPLETED
+    assert result.job_state.bundle_names == ("bundle",)
+    assert (target / "bundle" / "manifest.json").is_file()
+    assert [event.event_type for event in store.list_events(case.request.job_id)][
+        -2:
+    ] == [EventType.EXPORT_STARTED, EventType.EXPORT_PUBLISHED]
+
+
+def test_cancel_rejects_restarted_export_with_unknown_commit_point(
+    tmp_path: Path,
+) -> None:
+    case = _case()
+    root = tmp_path / "state"
+    root.mkdir()
+    runtime, store, artifact_store, report_store = _export_runtime(case, root)
+    _append_case_event(
+        store,
+        case,
+        EventType.EXPORT_STARTED,
+        JobStatus.APPROVED,
+        JobStatus.EXPORTING,
+        ExportStartedPayload("bundle"),
+    )
+
+    try:
+        with pytest.raises(
+            InfrastructureError,
+            match="^production export recovery required$",
+        ):
+            runtime.cancel(case.request.job_id)
+    finally:
+        report_store.close()
+        artifact_store.close()
+
+    assert store.load(case.request.job_id).job.status is JobStatus.EXPORTING
+    assert (
+        store.list_events(case.request.job_id)[-1].event_type
+        is EventType.EXPORT_STARTED
+    )
+
+
+def test_recover_exports_restages_missing_final_and_completes_job(
+    tmp_path: Path,
+) -> None:
+    module = _export_module()
+    case = _case()
+    root = tmp_path / "state"
+    target = tmp_path / "exports"
+    root.mkdir()
+    target.mkdir()
+    runtime, store, artifact_store, report_store = _export_runtime(case, root)
+    command = _runtime(case).prepare_export(case.request, case.result, case.credits)
+    _append_case_event(
+        store,
+        case,
+        EventType.EXPORT_STARTED,
+        JobStatus.APPROVED,
+        JobStatus.EXPORTING,
+        ExportStartedPayload("bundle"),
+    )
+    target_fd = os.open(target, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        entries = runtime.recover_exports((command,), target_fd)
+    finally:
+        os.close(target_fd)
+        report_store.close()
+        artifact_store.close()
+
+    assert len(entries) == 1
+    assert entries[0].job_id == case.request.job_id
+    assert entries[0].disposition is module.ProductionRecoveryDisposition.RECOVERED
+    assert entries[0].result is not None
+    assert entries[0].result.job_state.job.status is JobStatus.COMPLETED
+    assert (target / "bundle" / "manifest.json").is_file()
+    assert [event.event_type for event in store.list_events(case.request.job_id)][
+        -2:
+    ] == [EventType.EXPORT_STARTED, EventType.EXPORT_PUBLISHED]
+
+
+def test_close_cancels_staging_export_and_waits_without_publishing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from specstyle.workflow import production_export_lifecycle
+
+    case = _case()
+    root = tmp_path / "state"
+    target = tmp_path / "exports"
+    root.mkdir()
+    target.mkdir()
+    runtime, store, _artifact_store, _report_store = _export_runtime(case, root)
+    command = _runtime(case).prepare_export(case.request, case.result, case.credits)
+    entered, release, close_done = (
+        threading.Event(),
+        threading.Event(),
+        threading.Event(),
+    )
+    original_stage = production_export_lifecycle._stage_bundle
+
+    def blocked_stage(*args):
+        entered.set()
+        assert release.wait(2)
+        return original_stage(*args)
+
+    monkeypatch.setattr(production_export_lifecycle, "_stage_bundle", blocked_stage)
+    target_fd = os.open(target, os.O_RDONLY | os.O_DIRECTORY)
+    export_errors: list[Exception] = []
+    close_errors: list[Exception] = []
+
+    def publish() -> None:
+        try:
+            runtime.publish_export(command, target_fd)
+        except Exception as error:
+            export_errors.append(error)
+
+    def close() -> None:
+        try:
+            runtime.close()
+        except Exception as error:
+            close_errors.append(error)
+        finally:
+            close_done.set()
+
+    publisher = threading.Thread(target=publish)
+    closer = threading.Thread(target=close)
+    publisher.start()
+    assert entered.wait(2)
+    closer.start()
+    close_waited = not close_done.wait(0.1)
+    release.set()
+    publisher.join(2)
+    closer.join(2)
+    os.close(target_fd)
+
+    assert not publisher.is_alive() and not closer.is_alive()
+    assert close_waited
+    assert close_errors == []
+    assert len(export_errors) == 1
+    assert isinstance(export_errors[0], DomainError)
+    assert store.load(case.request.job_id).job.status is JobStatus.CANCELLED
+    assert not (target / "bundle").exists()
+
+
+def test_publish_export_closes_staged_owner_when_commit_raises(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from specstyle.workflow import production_export_lifecycle
+
+    case = _case()
+    root = tmp_path / "state"
+    target = tmp_path / "exports"
+    root.mkdir()
+    target.mkdir()
+    runtime, store, artifact_store, report_store = _export_runtime(case, root)
+    command = _runtime(case).prepare_export(case.request, case.result, case.credits)
+
+    class Staged:
+        closes = 0
+
+        def close(self) -> None:
+            self.closes += 1
+
+    staged = Staged()
+    failure = InfrastructureError("commit failed")
+    monkeypatch.setattr(
+        production_export_lifecycle, "_stage_bundle", lambda *_args: staged
+    )
+    monkeypatch.setattr(
+        production_export_lifecycle,
+        "_commit_staged_bundle",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(failure),
+    )
+    target_fd = os.open(target, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        with pytest.raises(InfrastructureError) as raised:
+            runtime.publish_export(command, target_fd)
+    finally:
+        os.close(target_fd)
+        report_store.close()
+        artifact_store.close()
+
+    assert raised.value is failure
+    assert staged.closes == 1
+    assert store.load(case.request.job_id).job.status is JobStatus.EXPORTING
+    assert EventType.EXPORT_PUBLISHED not in {
+        event.event_type for event in store.list_events(case.request.job_id)
+    }
 
 
 def test_prepare_export_rejects_non_exact_arguments_and_credit_contracts() -> None:
