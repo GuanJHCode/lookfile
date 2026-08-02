@@ -6,7 +6,6 @@ from enum import StrEnum
 import os
 import threading
 from typing import Any
-import weakref
 
 from specstyle.domain.identifiers import JobId
 from specstyle.errors import DomainError, InfrastructureError
@@ -45,31 +44,25 @@ class _ExportPhase(StrEnum):
 
 
 class _ExportLockHolder:
-    __slots__ = ("lock", "operation_lock", "phase", "__weakref__")
+    __slots__ = ("job_holder", "lock", "operation_lock", "phase", "__weakref__")
 
-    def __init__(self) -> None:
-        self.lock = threading.RLock()
+    def __init__(self, job_holder) -> None:
+        self.job_holder = job_holder
+        self.lock = job_holder.lock
         self.operation_lock = threading.Lock()
         self.phase = _ExportPhase.UNKNOWN
 
 
-_EXPORT_LOCKS_GUARD = threading.Lock()
-_EXPORT_LOCKS: weakref.WeakValueDictionary[tuple[str, str], _ExportLockHolder] = (
-    weakref.WeakValueDictionary()
-)
-
-
 def _export_lock_holder(store: JobStore, job_id: JobId, /) -> _ExportLockHolder:
-    lock_root = getattr(store, "_lock_root", None)
-    if type(lock_root) is not str:
-        lock_root = f"<in-memory:{id(store)}>"
-    key = (lock_root, job_id.value)
-    with _EXPORT_LOCKS_GUARD:
-        holder = _EXPORT_LOCKS.get(key)
+    namespace = store._namespace_holder
+    job_holder = store._job_lock_holder(job_id)
+    with namespace.exports_lock:
+        holder = namespace.exports.get(job_id.value)
         if holder is None:
-            holder = _ExportLockHolder()
-            _EXPORT_LOCKS[key] = holder
-        return holder
+            holder = _ExportLockHolder(job_holder)
+            namespace.exports[job_id.value] = holder
+    assert type(holder) is _ExportLockHolder
+    return holder
 
 
 def _validate_export_root(target_root_fd: object, /) -> int:

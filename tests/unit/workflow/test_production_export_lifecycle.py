@@ -440,24 +440,89 @@ def test_missing_recovery_commands_follow_stable_job_order(tmp_path: Path) -> No
     )
 
 
-def test_export_lock_holders_share_by_job_do_not_cross_jobs_and_are_collectable(
+def test_export_holders_are_strong_per_live_inode_namespace_then_collectable(
     tmp_path: Path,
 ) -> None:
-    store = JobStore(tmp_path)
-    first = lifecycle._export_lock_holder(store, JobId("job-a"))
-    same = lifecycle._export_lock_holder(store, JobId("job-a"))
-    other = lifecycle._export_lock_holder(store, JobId("job-b"))
-    reference = weakref.ref(first)
+    import specstyle.workflow.job_store as store_module
+
+    first_store = JobStore(tmp_path)
+    second_store = JobStore(tmp_path)
+    identity = first_store._root_identity
+    first = lifecycle._export_lock_holder(first_store, JobId("job-a"))
+    same = lifecycle._export_lock_holder(second_store, JobId("job-a"))
+    other = lifecycle._export_lock_holder(first_store, JobId("job-b"))
+    namespace_reference = weakref.ref(first_store._namespace_holder)
 
     assert first is same
     assert first is not other
+    assert first.job_holder is first_store._job_lock_holder(JobId("job-a"))
     assert other.lock.acquire(blocking=False)
     other.lock.release()
-    del first, same
+    first_store.close()
+    del first_store
     gc.collect()
+    assert namespace_reference() is second_store._namespace_holder
 
-    assert reference() is None
-    assert all(key[1] != "job-a" for key in lifecycle._EXPORT_LOCKS)
+    second_store.close()
+    del second_store, first, same, other
+    gc.collect()
+    assert namespace_reference() is None
+    assert identity not in store_module._NAMESPACE_HOLDERS
+
+
+def test_idle_export_and_job_holders_are_collectable_in_live_namespace(
+    tmp_path: Path,
+) -> None:
+    store = JobStore(tmp_path)
+    namespace = store._namespace_holder
+    held = lifecycle._export_lock_holder(store, JobId("job-held"))
+    try:
+        for index in range(128):
+            lifecycle._export_lock_holder(store, JobId(f"job-{index}"))
+        gc.collect()
+        assert namespace is not None
+        assert tuple(namespace.exports) == ("job-held",)
+        assert tuple(namespace.jobs) == ("job-held",)
+        assert held.job_holder is namespace.jobs["job-held"]
+        del held
+        gc.collect()
+        assert len(namespace.exports) == 0
+        assert len(namespace.jobs) == 0
+    finally:
+        store.close()
+
+
+def test_export_lock_blocks_direct_job_store_operation_for_same_job(
+    tmp_path: Path,
+) -> None:
+    store = JobStore(tmp_path)
+    job_id = JobId("job-a")
+    holder = lifecycle._export_lock_holder(store, job_id)
+    entered = threading.Event()
+    finished = threading.Event()
+    errors: list[BaseException] = []
+
+    def read_job() -> None:
+        entered.set()
+        try:
+            store.get_snapshot(job_id)
+        except BaseException as cause:
+            errors.append(cause)
+        finally:
+            finished.set()
+
+    thread = threading.Thread(target=read_job)
+    try:
+        with holder.lock:
+            thread.start()
+            assert entered.wait(2)
+            assert not finished.wait(0.1)
+        assert finished.wait(2)
+        thread.join(2)
+        assert not thread.is_alive()
+        assert errors == []
+    finally:
+        store.close()
 
 
 def test_persistence_tamper_fails_before_export_started(

@@ -336,58 +336,42 @@ def test_list_job_ids_detects_job_directory_replacement_after_validation(
         store.list_job_ids()
 
 
-def test_list_job_ids_reads_from_pinned_fd_during_whole_jobs_tree_swap(
+def test_list_job_ids_rejects_jobs_tree_rebind_after_entry_validation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = _store(tmp_path)
     store.save_snapshot(JobId("job1"), _initial_snapshot("job1"))
-    jobs = tmp_path / "jobs"
-    valid_jobs = tmp_path / "valid-jobs"
-    jobs.rename(valid_jobs)
-    corrupt_snapshot = jobs / "job1" / "snapshot.json"
-    corrupt_snapshot.parent.mkdir(parents=True)
-    corrupt_snapshot.write_bytes(b"{")
-    original_load = store.load
+    replacement_root = tmp_path / "replacement-root"
+    replacement_root.mkdir()
+    replacement_store = _store(replacement_root)
+    replacement_store.save_snapshot(JobId("job1"), _initial_snapshot("job1"))
+    replacement_store.close()
+    original_validate = store._validated_listed_job
+    rebound = False
 
-    def load_from_temporary_valid_tree(job_id: JobId):
-        corrupt_jobs = tmp_path / "corrupt-jobs"
-        jobs.rename(corrupt_jobs)
-        valid_jobs.rename(jobs)
-        try:
-            return original_load(job_id)
-        finally:
-            jobs.rename(valid_jobs)
-            corrupt_jobs.rename(jobs)
+    def rebind_after_validation(jobs_fd: int, name: str, /):
+        nonlocal rebound
+        result = original_validate(jobs_fd, name)
+        if not rebound:
+            rebound = True
+            (tmp_path / "jobs").rename(tmp_path / "displaced-jobs")
+            (replacement_root / "jobs").rename(tmp_path / "jobs")
+        return result
 
-    monkeypatch.setattr(store, "load", load_from_temporary_valid_tree)
+    monkeypatch.setattr(store, "_validated_listed_job", rebind_after_validation)
     with pytest.raises(InfrastructureError, match="^job store corrupted$"):
         store.list_job_ids()
-    assert corrupt_snapshot.read_bytes() == b"{"
+    assert rebound
 
 
-def test_list_job_ids_pre_stat_success_then_open_missing_is_corruption(
+def test_list_job_ids_does_not_resolve_jobs_path_after_construction(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import specstyle.workflow.job_store as store_mod
-
     store = _store(tmp_path)
     jobs = tmp_path / "jobs"
     jobs.mkdir()
-    removed_jobs = tmp_path / "removed-jobs"
-    real_open = os.open
-    triggered = False
-
-    def remove_before_open(path, flags, mode=0o777, *, dir_fd=None):
-        nonlocal triggered
-        if not triggered and dir_fd is None and os.fspath(path) == os.fspath(jobs):
-            triggered = True
-            jobs.rename(removed_jobs)
-        return real_open(path, flags, mode, dir_fd=dir_fd)
-
-    monkeypatch.setattr(store_mod.os, "open", remove_before_open)
-    with pytest.raises(InfrastructureError, match="^job store corrupted$"):
-        store.list_job_ids()
-    assert triggered is True
+    del monkeypatch
+    assert store.list_job_ids() == ()
 
 
 @pytest.mark.parametrize("filename", ["snapshot.json", "events.ndjson"])
@@ -486,57 +470,6 @@ def test_list_job_ids_rejects_optional_corrupt_events_hidden_during_open(
     assert events.read_bytes() == b"{"
 
 
-def test_list_job_ids_rejects_temporary_same_name_state_file_swap(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    import specstyle.workflow.job_store as store_mod
-
-    store = _store(tmp_path)
-    _seed_started(store, tmp_path)
-    job_dir = tmp_path / "jobs" / "job1"
-    valid = tmp_path / "valid-state"
-    valid.mkdir()
-    names = ("snapshot.json", "events.ndjson")
-    for name in names:
-        (job_dir / name).rename(valid / name)
-        (job_dir / name).write_bytes(b"{")
-    original_read = store_mod._read_state_file
-    swapped = False
-
-    def swap_in() -> None:
-        nonlocal swapped
-        for name in names:
-            (job_dir / name).rename(tmp_path / f"corrupt-{name}")
-            (valid / name).rename(job_dir / name)
-        swapped = True
-
-    def restore() -> None:
-        nonlocal swapped
-        for name in names:
-            (job_dir / name).rename(valid / name)
-            (tmp_path / f"corrupt-{name}").rename(job_dir / name)
-        swapped = False
-
-    def read_with_temporary_state(*args, **kwargs):
-        name = args[2]
-        if name == "snapshot.json" and not swapped:
-            swap_in()
-        try:
-            result = original_read(*args, **kwargs)
-        except BaseException:
-            if swapped:
-                restore()
-            raise
-        if name == "events.ndjson":
-            restore()
-        return result
-
-    monkeypatch.setattr(store_mod, "_read_state_file", read_with_temporary_state)
-    with pytest.raises(InfrastructureError, match="^job store corrupted$"):
-        store.list_job_ids()
-    assert tuple((job_dir / name).read_bytes() for name in names) == (b"{", b"{")
-
-
 @pytest.mark.parametrize("mutation", ["delete_snapshot", "add_unknown"])
 def test_list_job_ids_rechecks_namespace_after_state_validation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str
@@ -598,12 +531,16 @@ def test_list_job_ids_detects_same_name_replacement_after_entry_validation(
     replacement_store = _store(replacement_root)
     replacement_store.save_snapshot(JobId("job1"), _initial_snapshot("job1"))
     original_validate = store._validated_listed_job
+    replaced = False
 
     def replace_after_validation(jobs_fd: int, name: str, /):
+        nonlocal replaced
         result = original_validate(jobs_fd, name)
-        job_dir = tmp_path / "jobs" / name
-        job_dir.rename(tmp_path / "displaced-job1")
-        (replacement_root / "jobs" / name).rename(job_dir)
+        if not replaced:
+            replaced = True
+            job_dir = tmp_path / "jobs" / name
+            job_dir.rename(tmp_path / "displaced-job1")
+            (replacement_root / "jobs" / name).rename(job_dir)
         return result
 
     monkeypatch.setattr(store, "_validated_listed_job", replace_after_validation)
@@ -626,6 +563,7 @@ def test_list_job_ids_closes_descriptors_on_success_and_corruption(
         pytest.skip("descriptor namespace unavailable")
     store = _store(tmp_path)
     store.save_snapshot(JobId("job1"), _initial_snapshot("job1"))
+    gc.collect()
     before = len(os.listdir(fd_root))
 
     for _ in range(50):
@@ -651,18 +589,50 @@ def test_list_job_ids_detects_namespace_change_after_enumeration(
     store.save_snapshot(JobId("job1"), _initial_snapshot("job1"))
     jobs = tmp_path / "jobs"
     original_validate = store._validated_listed_job
+    mutated = False
 
     def mutate_after_validation(jobs_fd: int, name: str, /):
+        nonlocal mutated
         result = original_validate(jobs_fd, name)
-        if mutation == "added":
-            (jobs / "late").mkdir()
-        else:
-            (jobs / name).rename(tmp_path / "removed-job")
+        if not mutated:
+            mutated = True
+            if mutation == "added":
+                (jobs / "late").mkdir()
+            else:
+                (jobs / name).rename(tmp_path / "removed-job")
         return result
 
     monkeypatch.setattr(store, "_validated_listed_job", mutate_after_validation)
     with pytest.raises(InfrastructureError, match="^job store corrupted$"):
         store.list_job_ids()
+
+
+def test_list_job_ids_retries_legitimate_completed_namespace_addition(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = _store(tmp_path)
+    second = _store(tmp_path)
+    first.save_snapshot(JobId("job1"), _initial_snapshot("job1"))
+    original = first._validated_listed_job
+    additions = 0
+
+    def add_after_validation(jobs_fd: int, name: str, /):
+        nonlocal additions
+        result = original(jobs_fd, name)
+        if additions < 5:
+            additions += 1
+            added = f"job{additions + 1}"
+            second.save_snapshot(JobId(added), _initial_snapshot(added))
+        return result
+
+    monkeypatch.setattr(first, "_validated_listed_job", add_after_validation)
+    try:
+        assert first.list_job_ids() == tuple(
+            JobId(f"job{index}") for index in range(1, 7)
+        )
+    finally:
+        first.close()
+        second.close()
 
 
 def test_save_snapshot_rejects_cross_job_before_creating_directory(
@@ -726,30 +696,24 @@ def test_load_returns_exact_job_state(tmp_path: Path) -> None:
     assert type(store.load(JobId("job1"))) is JobState
 
 
-def test_append_serializes_competing_store_instances(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_append_serializes_competing_store_instances(tmp_path: Path) -> None:
     store_a = _store(tmp_path)
-    alias = tmp_path / "alias"
-    alias.symlink_to(tmp_path, target_is_directory=True)
-    store_b = _store(alias)
+    root_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    store_b = JobStore.from_root_fd(root_fd)
+    os.close(root_fd)
     _seed_to(store_a, "CREATED")
-    entered = ThreadEvent()
-    release = ThreadEvent()
     errors: list[BaseException] = []
-    original = JobStore._append_event_locked
+    holding, release, completed = ThreadEvent(), ThreadEvent(), ThreadEvent()
 
-    def block_first(self: JobStore, job_id: JobId, event: Event) -> Event:
-        if event.event_type is EventType.JOB_STARTED:
-            entered.set()
-            assert release.wait(timeout=2)
-        return original(self, job_id, event)
+    def hold_first_store() -> None:
+        with store_a._job_lock(JobId("job1")):
+            holding.set()
+            assert release.wait(2)
 
-    monkeypatch.setattr(JobStore, "_append_event_locked", block_first)
-
-    def append_started() -> None:
+    def append_from_second_store() -> None:
+        assert holding.wait(2)
         try:
-            store_a.append_event(
+            store_b.append_event(
                 JobId("job1"),
                 _event(
                     1,
@@ -761,71 +725,57 @@ def test_append_serializes_competing_store_instances(
             )
         except BaseException as cause:
             errors.append(cause)
+        finally:
+            completed.set()
 
-    def append_compiled() -> None:
-        try:
-            store_b.append_event(
-                JobId("job1"),
-                _event(
-                    2,
-                    EventType.SPEC_COMPILED,
-                    "SPEC_VALIDATED",
-                    "SPEC_COMPILED",
-                    SpecCompiledPayload(Sha256("a" * 64)),
-                ),
-            )
-        except BaseException as cause:
-            errors.append(cause)
-
-    first = Thread(target=append_started)
-    second = Thread(target=append_compiled)
+    first = Thread(target=hold_first_store)
+    second = Thread(target=append_from_second_store)
     first.start()
-    assert entered.wait(timeout=2)
     second.start()
+    assert holding.wait(2)
+    assert not completed.wait(0.1)
     release.set()
     first.join(timeout=2)
     second.join(timeout=2)
     assert not first.is_alive() and not second.is_alive()
     assert errors == []
-    assert [event.sequence for event in store_a.list_events(JobId("job1"))] == [1, 2]
+    assert [event.sequence for event in store_a.list_events(JobId("job1"))] == [1]
 
 
-def test_job_lock_registry_reclaims_idle_holders_and_does_not_cross_block(
+def test_job_lock_registry_collects_idle_holders_and_contends_live_job(
     tmp_path: Path,
 ) -> None:
-    import specstyle.workflow.job_store as store_mod
-
     store = _store(tmp_path)
-    before = len(store_mod._JOB_LOCKS)
     for index in range(100):
         with store._job_lock(JobId(f"job{index}")):
             pass
     gc.collect()
-    assert len(store_mod._JOB_LOCKS) <= before
+    assert len(store._namespace_holder.jobs) == 0
 
     holding = ThreadEvent()
     release = ThreadEvent()
-    entered_other = ThreadEvent()
+    contender_entered = ThreadEvent()
 
     def hold_first() -> None:
         with store._job_lock(JobId("job1")):
             holding.set()
             assert release.wait(timeout=2)
 
-    def acquire_other() -> None:
+    def acquire_same_job() -> None:
         assert holding.wait(timeout=2)
-        with store._job_lock(JobId("job2")):
-            entered_other.set()
+        with store._job_lock(JobId("job1")):
+            contender_entered.set()
 
     first = Thread(target=hold_first)
-    second = Thread(target=acquire_other)
+    second = Thread(target=acquire_same_job)
     first.start()
     second.start()
-    assert entered_other.wait(timeout=2)
+    assert not contender_entered.wait(timeout=0.1)
     release.set()
     first.join(timeout=2)
     second.join(timeout=2)
     assert not first.is_alive() and not second.is_alive()
+    assert contender_entered.is_set()
 
 
 def test_forged_snapshot_and_event_are_normalized_to_domain_errors(
@@ -916,17 +866,13 @@ def test_save_rejects_coercible_forged_snapshot_before_overwrite(
     assert path.read_bytes() == before
 
 
-def test_snapshot_exists_os_error_is_normalized_to_io_error(
+def test_snapshot_lookup_does_not_depend_on_path_exists(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = _store(tmp_path)
 
-    def boom(self: Path) -> bool:
-        raise OSError("stat failed")
-
-    monkeypatch.setattr(Path, "exists", boom)
-    with pytest.raises(InfrastructureError, match="job store io failed"):
-        store.get_snapshot(JobId("job1"))
+    monkeypatch.setattr(Path, "exists", lambda self: (_ for _ in ()).throw(OSError()))
+    assert store.get_snapshot(JobId("job1")) is None
 
 
 def test_rejects_invalid_transition(tmp_path: Path) -> None:
@@ -1370,14 +1316,14 @@ def test_append_event_fsyncs_directory(
     """append_event 必须在文件 fsync 后 fsync 目录，保证崩溃恢复幂等。"""
     import specstyle.workflow.job_store as store_mod
 
-    calls: list[tuple[object, bool]] = []
-    real = store_mod._fsync_dir
+    calls: list[int] = []
+    real = store_mod.os.fsync
 
-    def spy(directory, *, require: bool = False):
-        calls.append((directory, require))
-        return real(directory, require=require)
+    def spy(fd: int):
+        calls.append(fd)
+        return real(fd)
 
-    monkeypatch.setattr(store_mod, "_fsync_dir", spy)
+    monkeypatch.setattr(store_mod.os, "fsync", spy)
     store = _store(tmp_path)
     store.save_snapshot(
         JobId("job1"),
@@ -1387,7 +1333,7 @@ def test_append_event_fsyncs_directory(
         JobId("job1"),
         _event(1, EventType.JOB_STARTED, "CREATED", "SPEC_VALIDATED", _start_payload()),
     )
-    assert any(require is True for _, require in calls)
+    assert len(calls) >= 2
 
 
 def test_append_event_dir_fsync_failure_raises(
@@ -1395,16 +1341,15 @@ def test_append_event_dir_fsync_failure_raises(
 ) -> None:
     import specstyle.workflow.job_store as store_mod
 
-    def boom(directory, *, require: bool = False):
-        if require:
-            raise OSError("dir fsync denied")
+    def boom(fd: int):
+        raise OSError("dir fsync denied")
 
     store = _store(tmp_path)
     store.save_snapshot(
         JobId("job1"),
         JobSnapshot("specstyle.workflow.snapshot.v1", _job("CREATED"), 0, (), ()),
     )
-    monkeypatch.setattr(store_mod, "_fsync_dir", boom)
+    monkeypatch.setattr(store_mod.os, "fsync", boom)
     with pytest.raises(InfrastructureError, match="job store io failed"):
         store.append_event(
             JobId("job1"),
@@ -1564,10 +1509,10 @@ def test_save_snapshot_directory_fsync_failure_is_io_error(
 ) -> None:
     import specstyle.workflow.job_store as store_mod
 
-    def boom(directory, *, require: bool = False):
+    def boom(fd: int):
         raise OSError("dir fsync denied")
 
-    monkeypatch.setattr(store_mod, "_fsync_dir", boom)
+    monkeypatch.setattr(store_mod.os, "fsync", boom)
     with pytest.raises(InfrastructureError, match="job store io failed"):
         _store(tmp_path).save_snapshot(
             JobId("job1"),

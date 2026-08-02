@@ -178,19 +178,23 @@ class _Loaded:
 
 
 class _DurabilityCheckingJobStore(JobStore):
-    def __init__(self, root: Path) -> None:
-        super().__init__(root)
-        self.root = root
+    def __init__(self, state_root: Path, persistence_root: Path) -> None:
+        super().__init__(state_root)
+        self.persistence_root = persistence_root
 
     def append_event(self, job_id: JobId, event: Event, /) -> Event:
         if event.event_type is EventType.ATTEMPT_FINISHED:
             artifact = event.payload.artifact_id.value
-            directory = self.root / "jobs" / job_id.value / "artifacts" / artifact
+            directory = (
+                self.persistence_root / "jobs" / job_id.value / "artifacts" / artifact
+            )
             assert (directory / "artifact.png").is_file()
             assert (directory / "metadata.json").is_file()
         if event.event_type is EventType.VERIFIER_FINISHED:
             attempt = self.load(job_id).attempt_ids[-1].value
-            directory = self.root / "jobs" / job_id.value / "reports" / attempt
+            directory = (
+                self.persistence_root / "jobs" / job_id.value / "reports" / attempt
+            )
             assert (directory / "report.json").is_file()
             assert (directory / "metadata.json").is_file()
         return super().append_event(job_id, event)
@@ -214,7 +218,11 @@ def _runtime(
     outcomes: dict[str, dict[str, RuleStatus]],
 ):
     compiled, graph, plan, initial = _contract(rule_specs)
-    root_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    state_root = tmp_path / "state"
+    persistence_root = tmp_path / "persistence"
+    state_root.mkdir()
+    persistence_root.mkdir()
+    root_fd = os.open(persistence_root, os.O_RDONLY | os.O_DIRECTORY)
     try:
         artifacts = _TrackingStore(_open_production_artifact_store(root_fd), "for_job")
         reports = _TrackingStore(_open_production_report_store(root_fd), "for_attempt")
@@ -233,7 +241,7 @@ def _runtime(
         "_compiler_context": object(),
         "_style_assets": lambda _reference: b"",
         "_control_builder": object(),
-        "_job_store": _DurabilityCheckingJobStore(tmp_path),
+        "_job_store": _DurabilityCheckingJobStore(state_root, persistence_root),
         "_clock": production_service._NondecreasingAuditClock(lambda: _TS),
         "_state_lock": threading.RLock(),
         "_run_lock": threading.Lock(),
@@ -1072,22 +1080,33 @@ def test_cancel_hint_precedes_durable_append_without_claiming_early_win(
     assert append_entered.wait(2)
     checkpoint_results: list[object] = []
     checkpoint_errors: list[BaseException] = []
-    _capture_call(
-        lambda: runtime._checkpoint(JobId("job")),
-        checkpoint_results,
-        checkpoint_errors,
+    checkpoint_done = threading.Event()
+    checkpoint = threading.Thread(
+        target=lambda: (
+            _capture_call(
+                lambda: runtime._checkpoint(JobId("job")),
+                checkpoint_results,
+                checkpoint_errors,
+            ),
+            checkpoint_done.set(),
+        )
     )
+    checkpoint.start()
+    assert not checkpoint_done.wait(0.1)
     hint_before_append = runtime._active_cancel_reason
     event_before_append = active_event.is_set()
     release_append.set()
     canceller.join(2)
     release_generation.set()
     runner.join(2)
+    checkpoint.join(2)
     try:
         assert hint_before_append == "user requested"
         assert event_before_append is False
-        assert checkpoint_results == [None] and checkpoint_errors == []
+        assert checkpoint_results == [] and len(checkpoint_errors) == 1
+        assert str(checkpoint_errors[0]) == "production job cancelled"
         assert not runner.is_alive() and not canceller.is_alive()
+        assert not checkpoint.is_alive()
         assert run_results == [] and len(run_errors) == 1
         assert str(run_errors[0]) == "production job cancelled"
         assert cancel_errors == []

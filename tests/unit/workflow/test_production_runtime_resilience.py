@@ -231,13 +231,18 @@ def test_external_close_waits_for_active_run_then_completes_cleanup(
     assert calls == ["factory", "loaded", "report", "artifact"]
 
 
-def test_close_preserves_cancel_persistence_error_and_attempts_all_cleanup() -> None:
+def test_close_preserves_cancel_persistence_error_and_attempts_all_cleanup(
+    tmp_path,
+) -> None:
     module = importlib.import_module("specstyle.workflow.production_service")
     calls: list[str] = []
     runtime = _runtime_for_close(module, calls)
     cancel_failure = InfrastructureError("cancel persistence failed")
 
-    class FailingCancelStore:
+    class FailingCancelStore(JobStore):
+        def __init__(self) -> None:
+            super().__init__(tmp_path)
+
         def get_snapshot(self, _job_id):
             return object()
 
@@ -250,15 +255,18 @@ def test_close_preserves_cancel_persistence_error_and_attempts_all_cleanup() -> 
     runtime._verifier_factory = _FailingCloseProbe("factory", calls)
     runtime._report_store = _FailingCloseProbe("report", calls)
 
-    with pytest.raises(InfrastructureError) as raised:
-        runtime.close()
+    try:
+        with pytest.raises(InfrastructureError) as raised:
+            runtime.close()
+    finally:
+        runtime._job_store.close()
 
     assert raised.value is cancel_failure
     assert calls == ["factory", "loaded", "report", "artifact"]
     assert runtime.readiness.value == "CLOSED"
 
 
-def test_close_cancel_error_releases_run_and_second_close_waiter() -> None:
+def test_close_cancel_error_releases_run_and_second_close_waiter(tmp_path) -> None:
     module = importlib.import_module("specstyle.workflow.production_service")
     calls: list[str] = []
     runtime = _runtime_for_close(module, calls)
@@ -267,7 +275,10 @@ def test_close_cancel_error_releases_run_and_second_close_waiter() -> None:
     run_entered, release_run = threading.Event(), threading.Event()
     second_done = threading.Event()
 
-    class FailingCancelStore:
+    class FailingCancelStore(JobStore):
+        def __init__(self) -> None:
+            super().__init__(tmp_path)
+
         def get_snapshot(self, _job_id):
             return object()
 
@@ -309,6 +320,7 @@ def test_close_cancel_error_releases_run_and_second_close_waiter() -> None:
     release_run.set()
     for thread in (runner, first, second):
         thread.join(2)
+    runtime._job_store.close()
 
     assert all(not thread.is_alive() for thread in (runner, first, second))
     assert first_errors == [cancel_failure] and second_errors == []
@@ -447,8 +459,9 @@ def test_cancel_checks_closed_before_job_id_and_reason_validation() -> None:
         runtime.cancel(object(), reason=object())
 
 
-class _ManyTransitionRaceStore:
-    def __init__(self) -> None:
+class _ManyTransitionRaceStore(JobStore):
+    def __init__(self, root) -> None:
+        super().__init__(root)
         self.statuses = [
             JobStatus.GENERATING,
             JobStatus.VERIFYING,
@@ -470,13 +483,16 @@ class _ManyTransitionRaceStore:
         return _event
 
 
-def test_cancel_reloads_through_more_than_two_nonterminal_races() -> None:
+def test_cancel_reloads_through_more_than_two_nonterminal_races(tmp_path) -> None:
     module = importlib.import_module("specstyle.workflow.production_service")
-    store = _ManyTransitionRaceStore()
+    store = _ManyTransitionRaceStore(tmp_path)
     runtime = _runtime_for_close(module, [])
     runtime._job_store = store
 
-    state = runtime.cancel(JobId("job1"), reason="race")
+    try:
+        state = runtime.cancel(JobId("job1"), reason="race")
+    finally:
+        store.close()
 
     assert state.job.status is JobStatus.CANCELLED
     assert store.append_calls == 4
