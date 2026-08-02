@@ -250,9 +250,9 @@ _PAYLOAD_BUILDERS = {
         DecisionReason(d["decision_reason"])
         if isinstance(d["decision_reason"], DecisionReason)
         else _enum_value(d, "decision_reason", DecisionReason),
-        RepairStopReason(d["repair_stop_reason"])
+        d["repair_stop_reason"]
         if d["repair_stop_reason"] is None
-        or isinstance(d["repair_stop_reason"], RepairStopReason)
+        or type(d["repair_stop_reason"]) is RepairStopReason
         else _enum_value(d, "repair_stop_reason", RepairStopReason),
     ),
     EventType.REPAIR_STEP: lambda d: RepairStepPayload(
@@ -652,6 +652,9 @@ class JobStore:
         bundles = set(state.bundle_names)
         if event.event_type is EventType.ATTEMPT_STARTED:
             if event.payload.attempt_id.value in attempts:
+                raise DomainError("duplicate job attempt") from None
+        if event.event_type is EventType.REPAIR_STEP:
+            if event.payload.child_attempt_id.value in attempts:
                 raise DomainError("duplicate job attempt") from None
         if event.event_type is EventType.EXPORT_PUBLISHED:
             if event.payload.bundle_name in bundles:

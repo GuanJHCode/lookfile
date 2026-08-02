@@ -112,7 +112,7 @@ _EVENT_TO_STATE: dict[EventType, frozenset[JobStatus]] = {
             JobStatus.REPAIR_SELECTING,
         }
     ),
-    EventType.REPAIR_STEP: frozenset({JobStatus.REPAIRING, JobStatus.VERIFYING}),
+    EventType.REPAIR_STEP: frozenset({JobStatus.REPAIRING}),
     EventType.EXPORT_STARTED: frozenset({JobStatus.EXPORTING}),
     EventType.EXPORT_PUBLISHED: frozenset({JobStatus.COMPLETED}),
     EventType.RECOVERABLE: frozenset({JobStatus.RECOVERABLE_ERROR}),
@@ -190,6 +190,11 @@ def replay_events(snapshot: JobSnapshot, events: tuple[object, ...], /) -> JobSt
 def _check_idempotent(event: object, attempts: list[str], bundles: list[str]) -> None:
     if event.event_type is EventType.ATTEMPT_STARTED:  # type: ignore[attr-defined]
         aid = event.payload.attempt_id.value  # type: ignore[attr-defined]
+        if aid in attempts:
+            raise DomainError("invalid job event") from None
+        attempts.append(aid)
+    elif event.event_type is EventType.REPAIR_STEP:  # type: ignore[attr-defined]
+        aid = event.payload.child_attempt_id.value  # type: ignore[attr-defined]
         if aid in attempts:
             raise DomainError("invalid job event") from None
         attempts.append(aid)

@@ -14,7 +14,13 @@ from PIL import Image
 
 import specstyle.workflow.production_service as production_service
 from specstyle.domain.artifacts import AssetRef
-from specstyle.domain.enums import RuleScope, RuleStatus
+from specstyle.domain.enums import (
+    ArtifactStatus,
+    DecisionReason,
+    RepairStopReason,
+    RuleScope,
+    RuleStatus,
+)
 from specstyle.domain.identifiers import AssetId, Identifier, JobId
 from specstyle.errors import DomainError, InfrastructureError
 from specstyle.generation.image_evidence import (
@@ -89,6 +95,11 @@ def _compiler_inputs(
         pipeline_graph, compiler_context, style_contents, fidelity_required=False
     ).model_dump(mode="json")
     raw["profiles"]["production"]["resolution"] = [1024, 1024]
+    raw["repair"] = {
+        "policy_version": "1.0",
+        "max_rounds": 1,
+        "stop_after_no_improvement": 1,
+    }
     compiler_context, raw = _apply_compiler_mismatch(compiler_context, raw, mismatch)
     if applicable_batch:
         compiler_context = _add_applicable_batch_rule(compiler_context)
@@ -238,7 +249,7 @@ def _open_runtime(
         os.close(root_fd)
 
 
-def test_real_initial_attempt_reaches_verifying_with_exact_audit_history(
+def test_real_initial_attempt_reaches_terminal_with_exact_durable_audit_history(
     tmp_path: Path, monkeypatch
 ) -> None:
     style_contents = (_png("red"), _png("blue"))
@@ -303,23 +314,47 @@ def test_real_initial_attempt_reaches_verifying_with_exact_audit_history(
             RuleStatus.UNVERIFIABLE,
             RuleStatus.UNVERIFIABLE,
         )
-        assert result.job_state.job.status is JobStatus.VERIFYING
-        assert result.job_state.last_sequence == 4
+        assert (
+            result.terminal.artifact_decision.artifact_status is ArtifactStatus.APPROVED
+        )
+        assert (
+            result.terminal.artifact_decision.decision_reason
+            is DecisionReason.ALL_REQUIRED_PASS
+        )
+        assert (
+            result.terminal.artifact_decision.repair_stop_reason
+            is RepairStopReason.PASS_ALL_REQUIRED
+        )
+        assert result.job_state.job.status is JobStatus.APPROVED
+        assert result.job_state.last_sequence == 5
         assert len(builder.calls) == 1
         assert observed["style_colors"] == ((255, 0, 0), (0, 0, 255))
         assert observed["control_image"].size == (1024, 1024)
+        root = tmp_path / "artifacts" / "jobs" / request.job_id.value
+        artifact_dir = root / "artifacts" / result.artifact.ref.artifact_id.value
+        report_dir = root / "reports" / result.request.attempt_id.value
+        assert tuple(sorted(path.name for path in artifact_dir.iterdir())) == (
+            "artifact.png",
+            "metadata.json",
+        )
+        assert tuple(sorted(path.name for path in report_dir.iterdir())) == (
+            "metadata.json",
+            "report.json",
+        )
         events = store.list_events(request.job_id)
         assert tuple(event.event_type for event in events) == (
             EventType.JOB_STARTED,
             EventType.SPEC_COMPILED,
             EventType.ATTEMPT_STARTED,
             EventType.ATTEMPT_FINISHED,
+            EventType.VERIFIER_FINISHED,
         )
         assert tuple((event.from_state, event.to_state) for event in events) == (
             (JobStatus.CREATED, JobStatus.SPEC_VALIDATED),
             (JobStatus.SPEC_VALIDATED, JobStatus.SPEC_COMPILED),
             (JobStatus.SPEC_COMPILED, JobStatus.GENERATING),
             (JobStatus.GENERATING, JobStatus.VERIFYING),
+            (JobStatus.VERIFYING, JobStatus.APPROVED),
         )
     finally:
         runtime.close()
@@ -568,6 +603,17 @@ def test_job_store_write_failure_propagates_the_original_infrastructure_error(
         return type("Result", (), {"images": [Image.new("RGB", size)]})()
 
     monkeypatch.setattr(_Pipeline, "__call__", generate, raising=False)
+    original_run_generation = production_service.run_generation
+    generation_errors: list[InfrastructureError] = []
+
+    def capture_error(backend: object, generation_request: object):
+        try:
+            return original_run_generation(backend, generation_request)
+        except InfrastructureError as error:
+            generation_errors.append(error)
+            raise
+
+    monkeypatch.setattr(production_service, "run_generation", capture_error)
     write_error = InfrastructureError("injected job store write failure")
     real_append = store.append_event
 
@@ -597,7 +643,8 @@ def test_job_store_write_failure_propagates_the_original_infrastructure_error(
     try:
         with pytest.raises(InfrastructureError) as raised:
             runtime._execute_initial_attempt(request)
-        assert raised.value is write_error
+        expected = write_error if failure_stage == "finish" else generation_errors[0]
+        assert raised.value is expected
         assert tuple(
             event.event_type for event in store.list_events(request.job_id)
         ) == (
@@ -682,7 +729,7 @@ def _open_clock_case(
     return runtime, supply, store, request, observed
 
 
-def test_start_event_clock_rollbacks_are_clamped_through_verifying(
+def test_start_event_clock_rollbacks_are_clamped_through_terminal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     runtime, supply, store, request, _observed = _open_clock_case(
@@ -694,12 +741,18 @@ def test_start_event_clock_rollbacks_are_clamped_through_verifying(
             "2026-08-01T00:00:00.200Z",
             "2026-08-01T00:00:00.100Z",
             "2026-08-01T00:00:00.500Z",
+            "2026-08-01T00:00:00.450Z",
+            "2026-08-01T00:00:00.600Z",
         ),
     )
     try:
         result = runtime._execute_initial_attempt(request)
 
-        assert result.job_state.job.status is JobStatus.VERIFYING
+        assert result.job_state.job.status is JobStatus.REJECTED
+        assert (
+            result.terminal.artifact_decision.repair_stop_reason
+            is RepairStopReason.NO_ACTION
+        )
         assert tuple(
             event.timestamp for event in store.list_events(request.job_id)
         ) == (
@@ -707,13 +760,15 @@ def test_start_event_clock_rollbacks_are_clamped_through_verifying(
             "2026-08-01T00:00:00.400Z",
             "2026-08-01T00:00:00.400Z",
             "2026-08-01T00:00:00.500Z",
+            "2026-08-01T00:00:00.500Z",
+            "2026-08-01T00:00:00.600Z",
         )
     finally:
         runtime.close()
         supply.close()
 
 
-def test_finish_clock_rollback_is_clamped_without_changing_success_state(
+def test_finish_clock_rollback_is_clamped_without_changing_terminal_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     runtime, supply, store, request, _observed = _open_clock_case(
@@ -725,14 +780,20 @@ def test_finish_clock_rollback_is_clamped_without_changing_success_state(
             "2026-08-01T00:00:00.200Z",
             "2026-08-01T00:00:00.300Z",
             "2026-08-01T00:00:00.250Z",
+            "2026-08-01T00:00:00.240Z",
+            "2026-08-01T00:00:00.230Z",
         ),
     )
     try:
         result = runtime._execute_initial_attempt(request)
 
         events = store.list_events(request.job_id)
-        assert result.job_state.job.status is JobStatus.VERIFYING
-        assert events[-1].event_type is EventType.ATTEMPT_FINISHED
+        assert result.job_state.job.status is JobStatus.REJECTED
+        assert (
+            result.terminal.artifact_decision.repair_stop_reason
+            is RepairStopReason.NO_ACTION
+        )
+        assert events[-1].event_type is EventType.VERIFIER_FINISHED
         assert events[-1].timestamp == "2026-08-01T00:00:00.300Z"
     finally:
         runtime.close()

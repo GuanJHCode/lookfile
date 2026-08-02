@@ -133,12 +133,23 @@ def _request_kwargs() -> dict[str, object]:
     }
 
 
-def test_request_is_the_only_public_frozen_slotted_surface() -> None:
+def test_request_and_result_are_the_only_public_frozen_slotted_surfaces() -> None:
     module, request_type = _request_type()
 
     request = request_type(**_request_kwargs())
 
-    assert module.__all__ == ("ProductionJobRequest",)
+    assert module.__all__ == ("ProductionJobRequest", "ProductionJobResult")
+    assert tuple(field.name for field in fields(module.ProductionJobResult)) == (
+        "compiled",
+        "graph",
+        "verification_plan",
+        "request",
+        "artifact",
+        "report",
+        "history",
+        "terminal",
+        "job_state",
+    )
     assert not hasattr(request, "__dict__")
     assert request.style_references == _style_references()
     with pytest.raises(FrozenInstanceError):
@@ -227,6 +238,44 @@ def test_request_accepts_only_job_ids_that_fit_the_exact_attempt_id(
         request_type(**kwargs)
 
 
+@pytest.mark.parametrize(
+    ("profiles", "policy_version", "max_rounds", "stop_after"),
+    [
+        (("xhs_grid", "talking_head_cover"), "1.0", 1, 1),
+        (("xhs_grid",), "1.1", 1, 1),
+        (("xhs_grid",), "1.0", 2, 1),
+        (("xhs_grid",), "1.0", 2, 2),
+    ],
+)
+def test_selection_rejects_non_frozen_single_item_repair_contract_pre_genesis(
+    monkeypatch: pytest.MonkeyPatch,
+    profiles: tuple[str, ...],
+    policy_version: str,
+    max_rounds: int,
+    stop_after: int,
+) -> None:
+    module, request_type = _request_type()
+    graph = SimpleNamespace(output_profile="xhs_grid")
+    plan = SimpleNamespace(output_profile="xhs_grid", rules=())
+    compiled = SimpleNamespace(
+        production_graphs=(graph,),
+        verification_plans=(plan,),
+        source_spec=SimpleNamespace(
+            outputs=SimpleNamespace(profiles=profiles),
+            repair=SimpleNamespace(
+                policy_version=policy_version,
+                max_rounds=max_rounds,
+                stop_after_no_improvement=stop_after,
+            ),
+        ),
+    )
+    monkeypatch.setattr(module, "load_style_spec_text", lambda _text: object())
+    monkeypatch.setattr(module, "compile_style_spec", lambda *_args: compiled)
+
+    with pytest.raises(DomainError, match="production repair contract is unsupported"):
+        module._select_initial_contract(request_type(**_request_kwargs()), object())
+
+
 def test_module_has_no_forbidden_production_dependencies() -> None:
     module = _request_type()[0]
     tree = ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
@@ -247,7 +296,6 @@ def test_module_has_no_forbidden_production_dependencies() -> None:
         "specstyle.workflow.real_pipeline",
         "specstyle.workflow.orchestrator",
         "specstyle.workflow.batch_runner",
-        "specstyle.repair",
         "specstyle.exporting",
         "gradio",
         "tests",
@@ -259,10 +307,26 @@ def test_module_has_no_forbidden_production_dependencies() -> None:
     )
     assert {
         "specstyle.workflow.production_artifacts",
+        "specstyle.workflow.production_reports",
+        "specstyle.workflow.production_repair",
+        "specstyle.repair.history",
+        "specstyle.repair.loop",
         "specstyle.verification.production",
         "specstyle.verification.protocols",
         "specstyle.verification.rule_models",
     }.issubset(imports)
+    repair_core_calls = {
+        alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom)
+        and node.module in {"specstyle.repair.history", "specstyle.repair.loop"}
+        for alias in node.names
+    }
+    assert not {
+        "start_repair_history",
+        "next_repair_step",
+        "consume_repair_result",
+    }.intersection(repair_core_calls)
 
 
 class _UnusedControlBuilder:
@@ -378,18 +442,21 @@ def test_private_factory_and_runtime_shapes_are_frozen() -> None:
         parameter.kind is inspect.Parameter.KEYWORD_ONLY for parameter in parameters[9:]
     )
     assert parameters[-1].default is module._utc_now
-    assert tuple(field.name for field in fields(module._InitialAttemptResult)) == (
+    assert tuple(field.name for field in fields(module.ProductionJobResult)) == (
         "compiled",
         "graph",
         "verification_plan",
         "request",
         "artifact",
         "report",
+        "history",
+        "terminal",
         "job_state",
     )
     assert module._ProductionGenerationRuntime.__slots__ == (
         "_loaded",
         "_verifier_factory",
+        "_report_store",
         "_artifact_store",
         "_environment",
         "_compiler_context",
@@ -404,6 +471,10 @@ def test_private_factory_and_runtime_shapes_are_frozen() -> None:
 def _runtime_with_close_probes(module, events: list[str], first_error: Exception):
     runtime = object.__new__(module._ProductionGenerationRuntime)
 
+    class Factory:
+        def close(self) -> None:
+            events.append("factory")
+
     class Loaded:
         def close(self) -> None:
             assert runtime._verifier_factory is None
@@ -415,9 +486,15 @@ def _runtime_with_close_probes(module, events: list[str], first_error: Exception
             events.append("artifact")
             raise InfrastructureError("later artifact close failure")
 
+    class ReportStore:
+        def close(self) -> None:
+            events.append("report")
+            raise InfrastructureError("later report close failure")
+
     values = {
         "_loaded": Loaded(),
-        "_verifier_factory": object(),
+        "_verifier_factory": Factory(),
+        "_report_store": ReportStore(),
         "_artifact_store": ArtifactStore(),
         "_environment": object(),
         "_compiler_context": object(),
@@ -445,8 +522,30 @@ def test_close_detaches_factory_attempts_all_cleanup_and_preserves_first_error()
     runtime.close()
 
     assert raised.value is first_error
-    assert events == ["loaded", "artifact"]
+    assert events == ["factory", "loaded", "report", "artifact"]
     assert runtime._closed is True
+
+
+def test_failed_runtime_open_cleanup_uses_runtime_ownership_order() -> None:
+    module = _request_type()[0]
+    events: list[str] = []
+
+    class Resource:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def close(self) -> None:
+            events.append(self.name)
+            raise InfrastructureError(f"{self.name} close failure")
+
+    module._cleanup_failed_open(
+        Resource("loaded"),
+        Resource("factory"),
+        Resource("report"),
+        Resource("artifact"),
+    )
+
+    assert events == ["factory", "loaded", "report", "artifact"]
 
 
 def test_execute_after_close_fails_before_validating_the_request() -> None:
@@ -459,20 +558,31 @@ def test_execute_after_close_fails_before_validating_the_request() -> None:
 
 
 class _FlowRepository:
-    def __init__(self, events: list[str], put_error: Exception | None = None) -> None:
+    def __init__(
+        self,
+        events: list[str],
+        put_error: Exception | None = None,
+        close_error: Exception | None = None,
+    ) -> None:
         self.events = events
         self.put_error = put_error
+        self.close_error = close_error
+        self.stored: GeneratedArtifact | None = None
 
-    def put(self, _artifact: GeneratedArtifact, /) -> None:
-        self.events.append("put")
+    def put(self, artifact: GeneratedArtifact, /) -> None:
+        self.events.append("artifact.put")
         if self.put_error is not None:
             raise self.put_error
+        self.stored = artifact
 
     def __call__(self, _reference: ArtifactRef, /) -> GeneratedArtifact | None:
-        raise AssertionError("resolver execution is mocked in this flow test")
+        self.events.append("artifact.read")
+        return self.stored
 
     def close(self) -> None:
-        self.events.append("repository.close")
+        self.events.append("artifact.close")
+        if self.close_error is not None:
+            raise self.close_error
 
 
 class _FlowArtifactStore:
@@ -481,7 +591,47 @@ class _FlowArtifactStore:
         self.repository = repository
 
     def for_job(self, _job_id: JobId, /) -> _FlowRepository:
-        self.events.append("for_job")
+        self.events.append("artifact.for_job")
+        return self.repository
+
+
+class _FlowReportRepository:
+    def __init__(
+        self,
+        events: list[str],
+        put_error: Exception | None = None,
+        close_error: Exception | None = None,
+    ) -> None:
+        self.events = events
+        self.put_error = put_error
+        self.close_error = close_error
+        self.stored: object | None = None
+
+    def put(self, _request: object, report: object, /) -> None:
+        self.events.append("report.put")
+        if self.put_error is not None:
+            raise self.put_error
+        self.stored = report
+
+    def __call__(self) -> object | None:
+        self.events.append("report.read")
+        return self.stored
+
+    def close(self) -> None:
+        self.events.append("report.close")
+        if self.close_error is not None:
+            raise self.close_error
+
+
+class _FlowReportStore:
+    def __init__(self, events: list[str], repository: _FlowReportRepository) -> None:
+        self.events = events
+        self.repository = repository
+
+    def for_attempt(
+        self, _job_id: JobId, _attempt_id: AttemptId, /
+    ) -> _FlowReportRepository:
+        self.events.append("report.for_attempt")
         return self.repository
 
 
@@ -503,6 +653,7 @@ class _FlowJobStore:
     def __init__(self, events: list[str], state: object) -> None:
         self.events = events
         self.state = state
+        self.appended: list[object] = []
 
     def get_snapshot(self, _job_id: JobId) -> None:
         self.events.append("duplicate.read")
@@ -511,6 +662,10 @@ class _FlowJobStore:
     def load(self, _job_id: JobId) -> object:
         self.events.append("job.load")
         return self.state
+
+    def append_event(self, _job_id: JobId, event: object) -> None:
+        self.appended.append(event)
+        self.events.append(f"event.{event.event_type.value}")
 
 
 def _flow_artifact() -> GeneratedArtifact:
@@ -524,8 +679,20 @@ def _flow_artifact() -> GeneratedArtifact:
 
 
 def _install_flow_mocks(module, monkeypatch, events: list[str]) -> tuple[object, ...]:
-    compiled, graph, plan, generation_request = (object() for _ in range(4))
+    compiled, graph, plan = (object() for _ in range(3))
+    generation_request = SimpleNamespace(
+        job_id=JobId("job-1"), attempt_id=AttemptId("job-1-a0-xhs_grid-0")
+    )
     artifact, report = _flow_artifact(), object()
+    history = SimpleNamespace(
+        current_request=generation_request,
+        current_artifact=artifact,
+        current_report=report,
+    )
+    terminal = SimpleNamespace(no_action=None)
+    composition = SimpleNamespace(
+        history=history, step=terminal, selecting_decision=None
+    )
 
     def marked(name: str, value: object = None) -> object:
         events.append(name)
@@ -563,18 +730,44 @@ def _install_flow_mocks(module, monkeypatch, events: list[str]) -> tuple[object,
         "_run_initial_verification",
         lambda *_args: marked("verification", report),
     )
-    return compiled, graph, plan, generation_request, artifact, report
+    monkeypatch.setattr(
+        module,
+        "_compose_initial_repair",
+        lambda *_args: marked("repair.compose", composition),
+    )
+    monkeypatch.setattr(
+        module._ProductionGenerationRuntime,
+        "_record_terminal",
+        lambda *_args: marked("event.final"),
+    )
+    return (
+        compiled,
+        graph,
+        plan,
+        generation_request,
+        artifact,
+        report,
+        history,
+        terminal,
+    )
 
 
 def _flow_runtime(
-    module, events: list[str], repository: _FlowRepository, factory: _FlowFactory
+    module,
+    events: list[str],
+    repository: _FlowRepository,
+    factory: _FlowFactory,
+    report_repository: _FlowReportRepository | None = None,
 ):
     runtime = object.__new__(module._ProductionGenerationRuntime)
     state = object()
+    if report_repository is None:
+        report_repository = _FlowReportRepository(events)
     values = {
         "_loaded": object(),
         "_verifier_factory": factory,
         "_artifact_store": _FlowArtifactStore(events, repository),
+        "_report_store": _FlowReportStore(events, report_repository),
         "_environment": object(),
         "_compiler_context": object(),
         "_style_assets": object(),
@@ -604,22 +797,51 @@ def test_initial_attempt_order_binds_verifier_before_genesis_and_persists_first(
         "preflight",
         "duplicate.read",
         "request.build",
-        "for_job",
+        "artifact.for_job",
+        "report.for_attempt",
         "verifier.create",
         "genesis",
         "events.1-3",
         "generation",
-        "put",
+        "artifact.put",
+        "artifact.read",
         "event.4",
         "verification",
+        "report.put",
+        "report.read",
+        "repair.compose",
+        "event.final",
         "job.load",
-        "repository.close",
+        "report.close",
+        "artifact.close",
     ]
     assert tuple(getattr(result, name) for name in result.__dataclass_fields__) == (
-        *expected[:5],
-        expected[5],
+        *expected,
         state,
     )
+
+
+def test_invalid_contract_stops_before_any_job_or_repository_io(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module, request_type = _request_type()
+    events: list[str] = []
+    runtime, _state = _flow_runtime(
+        module, events, _FlowRepository(events), _FlowFactory(events)
+    )
+
+    def reject(*_args: object) -> None:
+        events.append("compile/select")
+        raise DomainError("production repair contract is unsupported")
+
+    monkeypatch.setattr(module, "_select_initial_contract", reject)
+
+    with pytest.raises(
+        DomainError, match="^production repair contract is unsupported$"
+    ):
+        runtime._execute_initial_attempt(request_type(**_request_kwargs()))
+
+    assert events == ["compile/select"]
 
 
 def test_verifier_bind_failure_is_pre_genesis_and_closes_repository(
@@ -643,10 +865,42 @@ def test_verifier_bind_failure_is_pre_genesis_and_closes_repository(
         "preflight",
         "duplicate.read",
         "request.build",
-        "for_job",
+        "artifact.for_job",
+        "report.for_attempt",
         "verifier.create",
-        "repository.close",
+        "report.close",
+        "artifact.close",
     ]
+
+
+def test_report_repository_open_failure_closes_artifact_before_genesis(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module, request_type = _request_type()
+    events: list[str] = []
+    repository = _FlowRepository(events)
+    runtime, _state = _flow_runtime(module, events, repository, _FlowFactory(events))
+    error = InfrastructureError("production report store unavailable")
+
+    class FailingReportStore:
+        def for_attempt(self, *_args: object) -> None:
+            events.append("report.for_attempt")
+            raise error
+
+    runtime._report_store = FailingReportStore()
+    _install_flow_mocks(module, monkeypatch, events)
+
+    with pytest.raises(InfrastructureError) as raised:
+        runtime._execute_initial_attempt(request_type(**_request_kwargs()))
+
+    assert raised.value is error
+    assert events[-3:] == [
+        "artifact.for_job",
+        "report.for_attempt",
+        "artifact.close",
+    ]
+    assert "verifier.create" not in events
+    assert "genesis" not in events
 
 
 def test_artifact_persistence_failure_never_records_attempt_finished(
@@ -662,10 +916,159 @@ def test_artifact_persistence_failure_never_records_attempt_finished(
     with pytest.raises(InfrastructureError) as raised:
         runtime._execute_initial_attempt(request_type(**_request_kwargs()))
 
-    assert raised.value is error
-    assert events[-3:] == ["generation", "put", "repository.close"]
+    assert raised.value is not error
+    assert raised.value.args == ("artifact persistence failed",)
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert events[-4:] == [
+        "artifact.put",
+        "event.FATAL",
+        "report.close",
+        "artifact.close",
+    ]
     assert "event.4" not in events
     assert "verification" not in events
+    event = runtime._job_store.appended[-1]
+    assert (event.event_type.value, event.from_state.value, event.to_state.value) == (
+        "FATAL",
+        "GENERATING",
+        "JOB_FAILED",
+    )
+    assert (event.payload.error_family, event.payload.reason) == (
+        "UNKNOWN",
+        "artifact persistence failed",
+    )
+
+
+def test_artifact_readback_mismatch_uses_the_same_fatal_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module, request_type = _request_type()
+    events: list[str] = []
+
+    class MismatchRepository(_FlowRepository):
+        def __call__(self, _reference: ArtifactRef, /) -> None:
+            self.events.append("artifact.read")
+            return None
+
+    runtime, _state = _flow_runtime(
+        module, events, MismatchRepository(events), _FlowFactory(events)
+    )
+    _install_flow_mocks(module, monkeypatch, events)
+
+    with pytest.raises(InfrastructureError, match="^artifact persistence failed$"):
+        runtime._execute_initial_attempt(request_type(**_request_kwargs()))
+
+    assert events[-5:] == [
+        "artifact.put",
+        "artifact.read",
+        "event.FATAL",
+        "report.close",
+        "artifact.close",
+    ]
+    assert "event.4" not in events
+
+
+def test_report_persistence_failure_is_fatal_and_cleanup_cannot_mask_primary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module, request_type = _request_type()
+    events: list[str] = []
+    error = InfrastructureError("sensitive report store failure")
+    repository = _FlowRepository(
+        events, close_error=InfrastructureError("artifact close failure")
+    )
+    reports = _FlowReportRepository(
+        events,
+        put_error=error,
+        close_error=InfrastructureError("report close failure"),
+    )
+    runtime, _state = _flow_runtime(
+        module, events, repository, _FlowFactory(events), reports
+    )
+    _install_flow_mocks(module, monkeypatch, events)
+
+    with pytest.raises(
+        InfrastructureError, match="^verification report persistence failed$"
+    ) as raised:
+        runtime._execute_initial_attempt(request_type(**_request_kwargs()))
+
+    assert raised.value is not error
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert events[-4:] == [
+        "report.put",
+        "event.FATAL",
+        "report.close",
+        "artifact.close",
+    ]
+    assert "repair.compose" not in events
+    event = runtime._job_store.appended[-1]
+    assert (event.event_type.value, event.from_state.value, event.to_state.value) == (
+        "FATAL",
+        "VERIFYING",
+        "JOB_FAILED",
+    )
+    assert (event.payload.error_family, event.payload.reason) == (
+        "UNKNOWN",
+        "verification report persistence failed",
+    )
+
+
+def test_report_readback_mismatch_uses_the_same_fatal_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module, request_type = _request_type()
+    events: list[str] = []
+
+    class MismatchRepository(_FlowReportRepository):
+        def __call__(self) -> None:
+            self.events.append("report.read")
+            return None
+
+    runtime, _state = _flow_runtime(
+        module,
+        events,
+        _FlowRepository(events),
+        _FlowFactory(events),
+        MismatchRepository(events),
+    )
+    _install_flow_mocks(module, monkeypatch, events)
+
+    with pytest.raises(
+        InfrastructureError, match="^verification report persistence failed$"
+    ):
+        runtime._execute_initial_attempt(request_type(**_request_kwargs()))
+
+    assert events[-5:] == [
+        "report.put",
+        "report.read",
+        "event.FATAL",
+        "report.close",
+        "artifact.close",
+    ]
+    assert "repair.compose" not in events
+
+
+def test_successful_attempt_close_failure_attempts_both_and_preserves_report_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module, request_type = _request_type()
+    events: list[str] = []
+    artifact_error = InfrastructureError("artifact close failure")
+    report_error = InfrastructureError("report close failure")
+    artifacts = _FlowRepository(events, close_error=artifact_error)
+    reports = _FlowReportRepository(events, close_error=report_error)
+    runtime, _state = _flow_runtime(
+        module, events, artifacts, _FlowFactory(events), reports
+    )
+    _install_flow_mocks(module, monkeypatch, events)
+
+    with pytest.raises(InfrastructureError) as raised:
+        runtime._execute_initial_attempt(request_type(**_request_kwargs()))
+
+    assert raised.value is report_error
+    assert events[-3:] == ["job.load", "report.close", "artifact.close"]
 
 
 def _verification_rule() -> RuleDefinition:
@@ -771,3 +1174,79 @@ def test_verifier_failure_records_fatal_then_raises_sanitized_boundary_error(
         "verifier unavailable",
     )
     assert "sensitive" not in event.payload.reason
+
+
+def test_repair_core_failure_records_unknown_fatal_and_erases_sensitive_context() -> (
+    None
+):
+    module = _request_type()[0]
+    store = _VerificationEventStore()
+    error = DomainError("sensitive repair invariant")
+
+    def fail() -> None:
+        raise error
+
+    with pytest.raises(
+        InfrastructureError, match="^repair composition failed$"
+    ) as raised:
+        module._repair_call(
+            fail,
+            store,
+            JobId("job-1"),
+            module.JobStatus.REPAIR_SELECTING,
+            lambda: "2026-08-01T00:00:00.000Z",
+        )
+
+    assert raised.value is not error
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert len(store.events) == 1
+    event = store.events[0]
+    assert (event.event_type.value, event.from_state.value, event.to_state.value) == (
+        "FATAL",
+        "REPAIR_SELECTING",
+        "JOB_FAILED",
+    )
+    assert (event.payload.error_family, event.payload.reason) == (
+        "UNKNOWN",
+        "repair composition failed",
+    )
+
+
+def test_repair_step_event_failure_closes_both_child_repositories_without_masking(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _request_type()[0]
+    events: list[str] = []
+    artifact_repository = _FlowRepository(
+        events, close_error=InfrastructureError("artifact cleanup failure")
+    )
+    report_repository = _FlowReportRepository(
+        events, close_error=InfrastructureError("report cleanup failure")
+    )
+    runtime = object.__new__(module._ProductionGenerationRuntime)
+    runtime._job_store = _VerificationEventStore()
+    runtime._clock = lambda: "2026-08-01T00:00:00.000Z"
+    error = InfrastructureError("repair step event failure")
+    request = SimpleNamespace(job_id=JobId("job-1"))
+    command = SimpleNamespace(request=request)
+    prepared = SimpleNamespace(verification_plan=object())
+
+    monkeypatch.setattr(
+        module._ProductionGenerationRuntime,
+        "_open_attempt",
+        lambda *_args: (artifact_repository, report_repository, object()),
+    )
+
+    def fail_step(*_args: object) -> None:
+        raise error
+
+    monkeypatch.setattr(
+        module._ProductionGenerationRuntime, "_record_repair_step", fail_step
+    )
+
+    with pytest.raises(InfrastructureError) as raised:
+        runtime._run_repair(prepared, object(), command)
+
+    assert raised.value is error
+    assert events == ["report.close", "artifact.close"]

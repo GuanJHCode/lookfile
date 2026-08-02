@@ -17,7 +17,10 @@ from specstyle.domain.enums import (
 from specstyle.domain.identifiers import (
     ArtifactId,
     AttemptId,
+    DecisionId,
+    Identifier,
     JobId,
+    RuleId,
     Sha256,
 )
 from specstyle.errors import DomainError, InfrastructureError
@@ -35,6 +38,7 @@ from specstyle.workflow.job_models import (
     JobSnapshot,
     JobStartedPayload,
     JobState,
+    RepairStepPayload,
     SpecCompiledPayload,
     VerifierFinishedPayload,
 )
@@ -109,6 +113,18 @@ def _verifier_payload(status="APPROVED") -> VerifierFinishedPayload:
         ArtifactStatus(status),
         DecisionReason.ALL_REQUIRED_PASS,
         RepairStopReason.PASS_ALL_REQUIRED,
+    )
+
+
+def _repair_step_payload(child_attempt_id: str = "att2") -> RepairStepPayload:
+    return RepairStepPayload(
+        0,
+        0,
+        DecisionId("decision1"),
+        Identifier("style_strength_inc"),
+        RuleId("STYLE_LOW"),
+        AttemptId("att1"),
+        AttemptId(child_attempt_id),
     )
 
 
@@ -485,6 +501,93 @@ def test_rejects_duplicate_attempt(tmp_path: Path) -> None:
                 _attempt_payload("att1"),
             ),
         )
+
+
+def test_verifier_finished_nullable_repair_stop_reason_round_trips(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    _seed_to(store, "VERIFYING")
+    payload = VerifierFinishedPayload(
+        0,
+        0,
+        ArtifactId("art1"),
+        ArtifactStatus.REJECTED,
+        DecisionReason.REQUIRED_GATE_FAILED,
+        None,
+    )
+    store.append_event(
+        JobId("job1"),
+        _event(
+            5,
+            EventType.VERIFIER_FINISHED,
+            "VERIFYING",
+            "REPAIR_SELECTING",
+            payload,
+        ),
+    )
+
+    persisted = store.list_events(JobId("job1"))[-1]
+
+    assert persisted.payload == payload
+    assert persisted.payload.repair_stop_reason is None  # type: ignore[union-attr]
+
+
+def _seed_repair_selecting(store: JobStore) -> None:
+    _seed_to(store, "VERIFYING")
+    store.append_event(
+        JobId("job1"),
+        _event(
+            5,
+            EventType.VERIFIER_FINISHED,
+            "VERIFYING",
+            "REPAIR_SELECTING",
+            VerifierFinishedPayload(
+                0,
+                0,
+                ArtifactId("art1"),
+                ArtifactStatus.REJECTED,
+                DecisionReason.REQUIRED_GATE_FAILED,
+                RepairStopReason.MAX_ROUNDS,
+            ),
+        ),
+    )
+
+
+def test_repair_step_rejects_duplicate_child_attempt(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    _seed_repair_selecting(store)
+
+    with pytest.raises(DomainError, match="duplicate job attempt"):
+        store.append_event(
+            JobId("job1"),
+            _event(
+                6,
+                EventType.REPAIR_STEP,
+                "REPAIR_SELECTING",
+                "REPAIRING",
+                _repair_step_payload("att1"),
+            ),
+        )
+
+
+def test_repair_step_registers_child_attempt(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    _seed_repair_selecting(store)
+    store.append_event(
+        JobId("job1"),
+        _event(
+            6,
+            EventType.REPAIR_STEP,
+            "REPAIR_SELECTING",
+            "REPAIRING",
+            _repair_step_payload(),
+        ),
+    )
+
+    state = store.load(JobId("job1"))
+
+    assert state.attempt_ids == (AttemptId("att1"), AttemptId("att2"))
 
 
 def test_rejects_duplicate_export(tmp_path: Path) -> None:

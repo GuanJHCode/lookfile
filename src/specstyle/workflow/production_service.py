@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from typing import Any, Callable
 
 from specstyle.domain.artifacts import AssetRef
-from specstyle.domain.enums import RuleScope, StaticApplicability
+from specstyle.domain.enums import ArtifactStatus
 from specstyle.domain.identifiers import AttemptId, JobId
 from specstyle.errors import DomainError, InfrastructureError
 from specstyle.generation.diffusers_backend import DiffusersBackend, StyleAssetResolver
@@ -29,6 +29,8 @@ from specstyle.observability.environment import (
     EnvironmentSnapshot,
     hash_environment,
 )
+from specstyle.repair.history import RepairHistory
+from specstyle.repair.loop import NextGeneration, RepairTerminal
 from specstyle.spec.compiled_models import (
     CompiledExecutionGraph,
     CompiledStyleSpec,
@@ -56,14 +58,23 @@ from specstyle.workflow.job_models import (
     JobStartedPayload,
     JobState,
     JobStatus,
+    RepairStepPayload,
     SpecCompiledPayload,
+    VerifierFinishedPayload,
     _bundle_name,
     _timestamp,
 )
 from specstyle.workflow.job_store import JobStore
 from specstyle.workflow.production_artifacts import _open_production_artifact_store
+from specstyle.workflow.production_repair import (
+    _compose_initial_repair,
+    _compose_repair_result,
+    _repair_ids,
+    _validate_repair_contract,
+)
+from specstyle.workflow.production_reports import _open_production_report_store
 
-__all__ = ("ProductionJobRequest",)
+__all__ = ("ProductionJobRequest", "ProductionJobResult")
 
 _OUTPUT_PROFILES = {"xhs_grid", "talking_head_cover", "background_sequence"}
 
@@ -123,16 +134,19 @@ class ProductionJobRequest:
             raise DomainError("invalid production job request")
         _bundle_name(self.bundle_name)
         AttemptId(f"{self.job_id.value}-a0-{self.output_profile}-0")
+        _repair_ids(self.job_id, self.output_profile)
 
 
 @dataclass(frozen=True, slots=True)
-class _InitialAttemptResult:
+class ProductionJobResult:
     compiled: CompiledStyleSpec
     graph: CompiledExecutionGraph
     verification_plan: CompiledVerificationPlan
     request: GenerationRequest
     artifact: GeneratedArtifact
     report: VerificationReport
+    history: RepairHistory
+    terminal: RepairTerminal
     job_state: JobState
 
 
@@ -143,6 +157,7 @@ class _PreparedInitialAttempt:
     verification_plan: CompiledVerificationPlan
     request: GenerationRequest
     repository: Any
+    report_repository: Any
     verifier: Verifier
 
 
@@ -164,14 +179,8 @@ def _select_initial_contract(
     )
     if len(graphs) != 1 or len(plans) != 1:
         raise DomainError("production selectors must resolve exactly once")
-    plan = plans[0]
-    if any(
-        rule.definition.scope is RuleScope.BATCH
-        and rule.definition.applicability is StaticApplicability.APPLICABLE
-        for rule in plan.rules
-    ):
-        raise DomainError("applicable batch verification is unsupported")
-    return compiled, graphs[0], plan
+    _validate_repair_contract(compiled, request.output_profile)
+    return compiled, graphs[0], plans[0]
 
 
 def _matches_descriptor(resolved: object, descriptor: object) -> bool:
@@ -323,23 +332,27 @@ def _run_initial_generation(
     store: JobStore,
     request: GenerationRequest,
     clock: Callable[[], str],
+    from_state: JobStatus = JobStatus.GENERATING,
 ) -> GeneratedArtifact:
     try:
         return run_generation(DiffusersBackend(loaded, style_assets), request)
     except (DomainError, InfrastructureError) as error:
         oom = type(error) is InfrastructureError and error.args == ("generation OOM",)
-        _append_event(
-            store,
-            request.job_id,
-            EventType.FATAL,
-            JobStatus.GENERATING,
-            JobStatus.JOB_FAILED,
-            clock(),
-            FatalPayload(
-                "GENERATION_OOM" if oom else "GENERATION_FAILED",
-                "generation OOM" if oom else "generation failed",
-            ),
-        )
+        try:
+            _append_event(
+                store,
+                request.job_id,
+                EventType.FATAL,
+                from_state,
+                JobStatus.JOB_FAILED,
+                clock(),
+                FatalPayload(
+                    "GENERATION_OOM" if oom else "GENERATION_FAILED",
+                    "generation OOM" if oom else "generation failed",
+                ),
+            )
+        except Exception:
+            pass
         raise
 
 
@@ -348,12 +361,13 @@ def _record_attempt_finish(
     request: GenerationRequest,
     artifact: GeneratedArtifact,
     timestamp: str,
+    from_state: JobStatus = JobStatus.GENERATING,
 ) -> None:
     _append_event(
         store,
         request.job_id,
         EventType.ATTEMPT_FINISHED,
-        JobStatus.GENERATING,
+        from_state,
         JobStatus.VERIFYING,
         timestamp,
         AttemptFinishedPayload(
@@ -369,15 +383,18 @@ def _record_attempt_finish(
 def _record_verifier_fatal(
     store: JobStore, job_id: JobId, clock: Callable[[], str]
 ) -> None:
-    _append_event(
-        store,
-        job_id,
-        EventType.FATAL,
-        JobStatus.VERIFYING,
-        JobStatus.JOB_FAILED,
-        clock(),
-        FatalPayload("VERIFIER_UNAVAILABLE", "verifier unavailable"),
-    )
+    try:
+        _append_event(
+            store,
+            job_id,
+            EventType.FATAL,
+            JobStatus.VERIFYING,
+            JobStatus.JOB_FAILED,
+            clock(),
+            FatalPayload("VERIFIER_UNAVAILABLE", "verifier unavailable"),
+        )
+    except Exception:
+        pass
 
 
 def _run_initial_verification(
@@ -402,10 +419,137 @@ def _run_initial_verification(
     return report
 
 
+def _record_unknown_fatal(
+    store: JobStore,
+    job_id: JobId,
+    from_state: JobStatus,
+    clock: Callable[[], str],
+    reason: str,
+) -> None:
+    try:
+        _append_event(
+            store,
+            job_id,
+            EventType.FATAL,
+            from_state,
+            JobStatus.JOB_FAILED,
+            clock(),
+            FatalPayload("UNKNOWN", reason),
+        )
+    except Exception:
+        pass
+
+
+def _persist_artifact(
+    repository: Any,
+    artifact: GeneratedArtifact,
+    store: JobStore,
+    request: GenerationRequest,
+    state: JobStatus,
+    clock: Callable[[], str],
+) -> None:
+    failed = False
+    try:
+        repository.put(artifact)
+        if repository(artifact.ref) != artifact:
+            raise InfrastructureError("artifact readback mismatch")
+    except Exception:
+        failed = True
+    if failed:
+        _record_unknown_fatal(
+            store, request.job_id, state, clock, "artifact persistence failed"
+        )
+        raise InfrastructureError("artifact persistence failed") from None
+
+
+def _persist_report(
+    repository: Any,
+    request: GenerationRequest,
+    report: VerificationReport,
+    store: JobStore,
+    clock: Callable[[], str],
+) -> None:
+    failed = False
+    try:
+        repository.put(request, report)
+        if repository() != report:
+            raise InfrastructureError("report readback mismatch")
+    except Exception:
+        failed = True
+    if failed:
+        reason = "verification report persistence failed"
+        _record_unknown_fatal(store, request.job_id, JobStatus.VERIFYING, clock, reason)
+        raise InfrastructureError(reason) from None
+
+
+def _decision_state(status: ArtifactStatus) -> JobStatus:
+    return JobStatus(status.value)
+
+
+def _record_verifier_decision(
+    store: JobStore,
+    job_id: JobId,
+    artifact: GeneratedArtifact,
+    decision: Any,
+    from_state: JobStatus,
+    to_state: JobStatus,
+    clock: Callable[[], str],
+) -> None:
+    _append_event(
+        store,
+        job_id,
+        EventType.VERIFIER_FINISHED,
+        from_state,
+        to_state,
+        clock(),
+        VerifierFinishedPayload(
+            0,
+            0,
+            artifact.ref.artifact_id,
+            decision.artifact_status,
+            decision.decision_reason,
+            decision.repair_stop_reason,
+        ),
+    )
+
+
+def _repair_call(
+    operation: Callable[[], Any],
+    store: JobStore,
+    job_id: JobId,
+    state: JobStatus,
+    clock: Callable[[], str],
+) -> Any:
+    failed = False
+    result: Any = None
+    try:
+        result = operation()
+    except Exception:
+        failed = True
+    if failed:
+        reason = "repair composition failed"
+        _record_unknown_fatal(store, job_id, state, clock, reason)
+        raise InfrastructureError(reason) from None
+    return result
+
+
+def _close_repositories(repositories: tuple[Any, ...], *, quiet: bool) -> None:
+    first: Exception | None = None
+    for repository in repositories:
+        try:
+            repository.close()
+        except Exception as error:
+            if first is None:
+                first = error
+    if first is not None and not quiet:
+        raise first
+
+
 class _ProductionGenerationRuntime:
     __slots__ = (
         "_loaded",
         "_verifier_factory",
+        "_report_store",
         "_artifact_store",
         "_environment",
         "_compiler_context",
@@ -420,6 +564,7 @@ class _ProductionGenerationRuntime:
         self,
         loaded: LoadedPipeline,
         verifier_factory: Any,
+        report_store: Any,
         artifact_store: Any,
         environment: EnvironmentSnapshot,
         compiler_context: CompilerContext,
@@ -431,6 +576,7 @@ class _ProductionGenerationRuntime:
     ) -> None:
         self._loaded = loaded
         self._verifier_factory = verifier_factory
+        self._report_store = report_store
         self._artifact_store = artifact_store
         self._environment = environment
         self._compiler_context = compiler_context
@@ -448,6 +594,7 @@ class _ProductionGenerationRuntime:
         cleanup = (
             getattr(factory, "close", None),
             self._loaded.close,
+            self._report_store.close,
             self._artifact_store.close,
         )
         first_error: Exception | None = None
@@ -461,6 +608,26 @@ class _ProductionGenerationRuntime:
                     first_error = error
         if first_error is not None:
             raise first_error
+
+    def _open_attempt(
+        self, request: GenerationRequest, plan: CompiledVerificationPlan
+    ) -> tuple[Any, Any, Verifier]:
+        artifact_repository = self._artifact_store.for_job(request.job_id)
+        try:
+            report_repository = self._report_store.for_attempt(
+                request.job_id, request.attempt_id
+            )
+        except Exception:
+            _close_repositories((artifact_repository,), quiet=True)
+            raise
+        try:
+            verifier = self._verifier_factory.create(
+                request, plan, artifact_repository, self._style_assets
+            )
+        except Exception:
+            _close_repositories((report_repository, artifact_repository), quiet=True)
+            raise
+        return artifact_repository, report_repository, verifier
 
     def _prepare_initial_attempt(
         self, request: ProductionJobRequest
@@ -477,29 +644,22 @@ class _ProductionGenerationRuntime:
             self._control_builder,
             self._environment,
         )
-        repository = self._artifact_store.for_job(request.job_id)
-        try:
-            verifier = self._verifier_factory.create(
-                generation_request,
-                verification_plan,
-                repository,
-                self._style_assets,
-            )
-        except Exception:
-            repository.close()
-            raise
+        repository, report_repository, verifier = self._open_attempt(
+            generation_request, verification_plan
+        )
         return _PreparedInitialAttempt(
             compiled,
             graph,
             verification_plan,
             generation_request,
             repository,
+            report_repository,
             verifier,
         )
 
     def _run_prepared_attempt(
         self, request: ProductionJobRequest, prepared: _PreparedInitialAttempt
-    ) -> _InitialAttemptResult:
+    ) -> ProductionJobResult:
         budget = _create_initial_job(
             self._job_store, request, prepared.compiled, self._clock
         )
@@ -511,57 +671,186 @@ class _ProductionGenerationRuntime:
             budget,
             self._clock,
         )
+        artifact, report = self._run_attempt(
+            prepared.request,
+            prepared.verification_plan,
+            prepared.repository,
+            prepared.report_repository,
+            prepared.verifier,
+            JobStatus.GENERATING,
+        )
+        composed = _repair_call(
+            lambda: _compose_initial_repair(prepared.request, artifact, report),
+            self._job_store,
+            request.job_id,
+            JobStatus.VERIFYING,
+            self._clock,
+        )
+        history, step = composed.history, composed.step
+        if composed.selecting_decision is not None:
+            _record_verifier_decision(
+                self._job_store,
+                request.job_id,
+                artifact,
+                composed.selecting_decision,
+                JobStatus.VERIFYING,
+                JobStatus.REPAIR_SELECTING,
+                self._clock,
+            )
+            if type(step) is RepairTerminal:
+                self._record_terminal(
+                    request.job_id, artifact, step, JobStatus.REPAIR_SELECTING
+                )
+                return self._result(prepared, history, step)
+            return self._run_repair(prepared, history, step)
+        self._record_terminal(request.job_id, artifact, step, JobStatus.VERIFYING)
+        return self._result(prepared, history, step)
+
+    def _run_attempt(
+        self, request, plan, artifact_repository, report_repository, verifier, state
+    ) -> tuple[GeneratedArtifact, VerificationReport]:
         artifact = _run_initial_generation(
             self._loaded,
             self._style_assets,
             self._job_store,
-            prepared.request,
+            request,
             self._clock,
+            state,
         )
-        prepared.repository.put(artifact)
-        _record_attempt_finish(
-            self._job_store, prepared.request, artifact, self._clock()
+        _persist_artifact(
+            artifact_repository, artifact, self._job_store, request, state, self._clock
         )
+        _record_attempt_finish(self._job_store, request, artifact, self._clock(), state)
         report = _run_initial_verification(
-            prepared.verifier,
+            verifier, self._job_store, request, artifact, plan, self._clock
+        )
+        _persist_report(
+            report_repository, request, report, self._job_store, self._clock
+        )
+        return artifact, report
+
+    def _record_terminal(self, job_id, artifact, terminal, from_state) -> None:
+        if type(terminal) is not RepairTerminal:
+            _repair_call(
+                lambda: (_ for _ in ()).throw(DomainError("invalid terminal")),
+                self._job_store,
+                job_id,
+                from_state,
+                self._clock,
+            )
+        decision = terminal.artifact_decision
+        _record_verifier_decision(
             self._job_store,
-            prepared.request,
+            job_id,
             artifact,
-            prepared.verification_plan,
+            decision,
+            from_state,
+            _decision_state(decision.artifact_status),
             self._clock,
         )
-        return _InitialAttemptResult(
+
+    def _run_repair(self, prepared, history, command):
+        resources = _repair_call(
+            lambda: self._open_attempt(command.request, prepared.verification_plan),
+            self._job_store,
+            command.request.job_id,
+            JobStatus.REPAIR_SELECTING,
+            self._clock,
+        )
+        repository, report_repository, verifier = resources
+        try:
+            self._record_repair_step(command)
+            artifact, report = self._run_attempt(
+                command.request,
+                prepared.verification_plan,
+                repository,
+                report_repository,
+                verifier,
+                JobStatus.REPAIRING,
+            )
+        except Exception:
+            _close_repositories((report_repository, repository), quiet=True)
+            raise
+        _close_repositories((report_repository, repository), quiet=False)
+        composed = _repair_call(
+            lambda: _compose_repair_result(history, command, artifact, report),
+            self._job_store,
+            command.request.job_id,
+            JobStatus.VERIFYING,
+            self._clock,
+        )
+        history, terminal = composed.history, composed.terminal
+        self._record_terminal(
+            command.request.job_id, artifact, terminal, JobStatus.VERIFYING
+        )
+        return self._result(prepared, history, terminal)
+
+    def _record_repair_step(self, command: NextGeneration) -> None:
+        decision, request = command.decision, command.request
+        _append_event(
+            self._job_store,
+            request.job_id,
+            EventType.REPAIR_STEP,
+            JobStatus.REPAIR_SELECTING,
+            JobStatus.REPAIRING,
+            self._clock(),
+            RepairStepPayload(
+                0,
+                0,
+                decision.decision_id,
+                decision.action_id,
+                decision.trigger_rule_id,
+                request.parent_attempt_id,
+                request.attempt_id,
+            ),
+        )
+
+    def _result(self, prepared, history, terminal) -> ProductionJobResult:
+        return ProductionJobResult(
             prepared.compiled,
             prepared.graph,
             prepared.verification_plan,
-            prepared.request,
-            artifact,
-            report,
-            self._job_store.load(request.job_id),
+            history.current_request,
+            history.current_artifact,
+            history.current_report,
+            history,
+            terminal,
+            self._job_store.load(history.current_request.job_id),
         )
 
     def _execute_initial_attempt(
         self, request: ProductionJobRequest, /
-    ) -> _InitialAttemptResult:
+    ) -> ProductionJobResult:
         if self._closed:
             raise InfrastructureError("production runtime closed")
         if type(request) is not ProductionJobRequest:
             raise DomainError("invalid production job request")
         prepared = self._prepare_initial_attempt(request)
         try:
-            return self._run_prepared_attempt(request, prepared)
-        finally:
-            prepared.repository.close()
+            result = self._run_prepared_attempt(request, prepared)
+        except Exception:
+            _close_repositories(
+                (prepared.report_repository, prepared.repository), quiet=True
+            )
+            raise
+        _close_repositories(
+            (prepared.report_repository, prepared.repository), quiet=False
+        )
+        return result
 
 
-def _cleanup_failed_open(loaded: LoadedPipeline, artifact_store: Any | None) -> None:
-    try:
-        loaded.close()
-    except Exception:
-        pass
-    if artifact_store is not None:
+def _cleanup_failed_open(
+    loaded: LoadedPipeline,
+    factory: Any | None,
+    report_store: Any | None,
+    artifact_store: Any | None,
+) -> None:
+    for resource in (factory, loaded, report_store, artifact_store):
+        close = getattr(resource, "close", None)
+        if not callable(close):
+            continue
         try:
-            artifact_store.close()
+            close()
         except Exception:
             pass
 
@@ -612,12 +901,16 @@ def _open_production_generation_runtime(
         diffusers_module=diffusers_module,
     )
     artifact_store = None
+    report_store = None
+    verifier_factory = None
     try:
         verifier_factory = _create_production_verifier_factory(loaded, allowlist)
         artifact_store = _open_production_artifact_store(artifact_root_fd)
+        report_store = _open_production_report_store(artifact_root_fd)
         return _ProductionGenerationRuntime(
             loaded,
             verifier_factory,
+            report_store,
             artifact_store,
             environment,
             compiler_context,
@@ -627,5 +920,5 @@ def _open_production_generation_runtime(
             clock,
         )
     except Exception:
-        _cleanup_failed_open(loaded, artifact_store)
+        _cleanup_failed_open(loaded, verifier_factory, report_store, artifact_store)
         raise

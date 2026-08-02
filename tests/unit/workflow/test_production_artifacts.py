@@ -18,9 +18,12 @@ from specstyle.observability.hashing import hash_bytes
 from specstyle.workflow import production_artifacts
 
 
-def _artifact(content: bytes = b"production artifact") -> GeneratedArtifact:
+def _artifact(
+    content: bytes = b"production artifact",
+    artifact_id: str = "artifact-1",
+) -> GeneratedArtifact:
     return GeneratedArtifact(
-        ArtifactRef(ArtifactId("artifact-1"), hash_bytes(content)),
+        ArtifactRef(ArtifactId(artifact_id), hash_bytes(content)),
         content,
         Sha256("1" * 64),
         Sha256("2" * 64),
@@ -38,6 +41,10 @@ def _open_store(root: os.PathLike[str]):
 def _open_repository(root: os.PathLike[str]):
     store = _open_store(root)
     return store, store.for_job(JobId("job-1"))
+
+
+def _artifact_directory(root, artifact_id: str = "artifact-1"):
+    return root / "jobs" / "job-1" / "artifacts" / artifact_id
 
 
 class _IoTrace:
@@ -94,11 +101,14 @@ def test_put_is_durable_commit_and_readback_is_exact(tmp_path) -> None:
 
         assert repository(artifact.ref) == artifact
         job_dir = tmp_path / "jobs" / "job-1"
+        artifact_dir = _artifact_directory(tmp_path)
         assert stat.S_IMODE((tmp_path / "jobs").stat().st_mode) == 0o700
         assert stat.S_IMODE(job_dir.stat().st_mode) == 0o700
-        assert stat.S_IMODE((job_dir / "artifact.png").stat().st_mode) == 0o600
-        assert stat.S_IMODE((job_dir / "metadata.json").stat().st_mode) == 0o600
-        assert (job_dir / "artifact.png").read_bytes() == artifact.content
+        assert stat.S_IMODE((job_dir / "artifacts").stat().st_mode) == 0o700
+        assert stat.S_IMODE(artifact_dir.stat().st_mode) == 0o700
+        assert stat.S_IMODE((artifact_dir / "artifact.png").stat().st_mode) == 0o600
+        assert stat.S_IMODE((artifact_dir / "metadata.json").stat().st_mode) == 0o600
+        assert (artifact_dir / "artifact.png").read_bytes() == artifact.content
 
         expected = {
             "schema": "specstyle.production_artifact.v1",
@@ -110,11 +120,32 @@ def test_put_is_durable_commit_and_readback_is_exact(tmp_path) -> None:
             "request_hash": artifact.request_hash.value,
             "generation_fingerprint": artifact.generation_fingerprint.value,
         }
-        metadata = (job_dir / "metadata.json").read_bytes()
+        metadata = (artifact_dir / "metadata.json").read_bytes()
         assert json.loads(metadata) == expected
         assert metadata == json.dumps(
             expected, sort_keys=True, separators=(",", ":"), ensure_ascii=True
         ).encode("ascii")
+    finally:
+        store.close()
+
+
+def test_job_repository_persists_and_reads_multiple_artifacts(tmp_path) -> None:
+    first = _artifact(b"first artifact", "artifact-1")
+    second = _artifact(b"second artifact", "artifact-2")
+    store, repository = _open_repository(tmp_path)
+    try:
+        repository.put(first)
+        repository.put(second)
+
+        assert repository(first.ref) == first
+        assert repository(second.ref) == second
+        artifacts = tmp_path / "jobs" / "job-1" / "artifacts"
+        assert (artifacts / "artifact-1" / "artifact.png").read_bytes() == first.content
+        assert (
+            artifacts / "artifact-2" / "artifact.png"
+        ).read_bytes() == second.content
+        assert (artifacts / "artifact-1" / "metadata.json").is_file()
+        assert (artifacts / "artifact-2" / "metadata.json").is_file()
     finally:
         store.close()
 
@@ -126,9 +157,9 @@ def test_duplicate_put_is_idempotent_and_clean_absence_is_none(tmp_path) -> None
         assert repository(artifact.ref) is None
 
         repository.put(artifact)
-        metadata_before = (tmp_path / "jobs" / "job-1" / "metadata.json").stat()
+        metadata_before = (_artifact_directory(tmp_path) / "metadata.json").stat()
         repository.put(artifact)
-        metadata_after = (tmp_path / "jobs" / "job-1" / "metadata.json").stat()
+        metadata_after = (_artifact_directory(tmp_path) / "metadata.json").stat()
 
         assert repository(artifact.ref) == artifact
         assert metadata_after.st_ino == metadata_before.st_ino
@@ -138,9 +169,9 @@ def test_duplicate_put_is_idempotent_and_clean_absence_is_none(tmp_path) -> None
 
 def test_content_only_partial_write_can_be_completed(tmp_path) -> None:
     artifact = _artifact()
-    job_dir = tmp_path / "jobs" / "job-1"
-    job_dir.mkdir(parents=True, mode=0o700)
-    content_path = job_dir / "artifact.png"
+    artifact_dir = _artifact_directory(tmp_path)
+    artifact_dir.mkdir(parents=True, mode=0o700)
+    content_path = artifact_dir / "artifact.png"
     content_path.write_bytes(artifact.content)
     content_path.chmod(0o600)
 
@@ -209,7 +240,7 @@ def test_live_repositories_share_holder_without_cross_job_aliasing(tmp_path) -> 
                 pool.submit(third.put, artifact),
             )
         assert all(future.exception() is None for future in futures)
-        content_path = tmp_path / "jobs" / "job-1" / "artifact.png"
+        content_path = _artifact_directory(tmp_path) / "artifact.png"
         inode = content_path.stat().st_ino
         second.put(artifact)
         assert content_path.stat().st_ino == inode
@@ -246,7 +277,9 @@ def test_repository_close_race_never_dereferences_a_released_holder(
         store.close()
 
 
-@pytest.mark.parametrize("link_level", ["jobs", "job", "artifact", "metadata"])
+@pytest.mark.parametrize(
+    "link_level", ["jobs", "job", "artifacts", "artifact_id", "artifact", "metadata"]
+)
 def test_symlinks_are_rejected_without_touching_the_target(
     tmp_path, link_level: str
 ) -> None:
@@ -266,10 +299,20 @@ def test_symlinks_are_rejected_without_touching_the_target(
             job_dir.symlink_to(outside, target_is_directory=True)
         else:
             job_dir.mkdir(mode=0o700)
-            (
-                job_dir
-                / f"{link_level}.{'png' if link_level == 'artifact' else 'json'}"
-            ).symlink_to(target)
+            artifacts_dir = job_dir / "artifacts"
+            if link_level == "artifacts":
+                artifacts_dir.symlink_to(outside, target_is_directory=True)
+            else:
+                artifacts_dir.mkdir(mode=0o700)
+                artifact_dir = artifacts_dir / "artifact-1"
+                if link_level == "artifact_id":
+                    artifact_dir.symlink_to(outside, target_is_directory=True)
+                else:
+                    artifact_dir.mkdir(mode=0o700)
+                    name = (
+                        "artifact.png" if link_level == "artifact" else "metadata.json"
+                    )
+                    (artifact_dir / name).symlink_to(target)
 
     store, repository = _open_repository(tmp_path)
     try:
@@ -287,9 +330,9 @@ def test_hardlinked_content_is_rejected_without_mutation(tmp_path) -> None:
     outside = tmp_path.parent / "outside-hardlink"
     outside.write_bytes(artifact.content)
     outside.chmod(0o644)
-    job_dir = tmp_path / "jobs" / "job-1"
-    job_dir.mkdir(parents=True, mode=0o700)
-    os.link(outside, job_dir / "artifact.png")
+    artifact_dir = _artifact_directory(tmp_path)
+    artifact_dir.mkdir(parents=True, mode=0o700)
+    os.link(outside, artifact_dir / "artifact.png")
     before = outside.stat()
 
     store = _open_store(tmp_path)
@@ -301,7 +344,7 @@ def test_hardlinked_content_is_rejected_without_mutation(tmp_path) -> None:
         after = outside.stat()
         assert outside.read_bytes() == artifact.content
         assert stat.S_IMODE(after.st_mode) == stat.S_IMODE(before.st_mode) == 0o644
-        assert not (job_dir / "metadata.json").exists()
+        assert not (artifact_dir / "metadata.json").exists()
     finally:
         store.close()
 
@@ -350,7 +393,7 @@ def test_metadata_parser_rejects_non_exact_json(tmp_path, mutation: str) -> None
     artifact = _artifact()
     store, repository = _open_repository(tmp_path)
     repository.put(artifact)
-    metadata_path = tmp_path / "jobs" / "job-1" / "metadata.json"
+    metadata_path = _artifact_directory(tmp_path) / "metadata.json"
     metadata_path.write_bytes(_mutated_metadata(metadata_path.read_bytes(), mutation))
     metadata_path.chmod(0o600)
 
@@ -369,8 +412,8 @@ def test_committed_collision_never_overwrites_the_original(tmp_path) -> None:
     store, repository = _open_repository(tmp_path)
     try:
         repository.put(original)
-        content_path = tmp_path / "jobs" / "job-1" / "artifact.png"
-        metadata_path = tmp_path / "jobs" / "job-1" / "metadata.json"
+        content_path = _artifact_directory(tmp_path) / "artifact.png"
+        metadata_path = _artifact_directory(tmp_path) / "metadata.json"
         before = (content_path.read_bytes(), metadata_path.read_bytes())
 
         with pytest.raises(
@@ -444,7 +487,9 @@ def test_content_is_fsynced_before_metadata_commit_marker(
     ]
     assert artifact_order == sorted(artifact_order)
     assert metadata_order == sorted(metadata_order)
-    assert "fsync:job-1" in trace.events[artifact_order[-1] + 1 : metadata_order[0]]
+    assert (
+        "fsync:artifact-1" in trace.events[artifact_order[-1] + 1 : metadata_order[0]]
+    )
 
 
 def test_unsupported_commit_link_leaves_recoverable_content_only_partial(
@@ -469,9 +514,9 @@ def test_unsupported_commit_link_leaves_recoverable_content_only_partial(
         ) as error:
             repository.put(artifact)
         assert "sensitive" not in str(error.value)
-        job_dir = tmp_path / "jobs" / "job-1"
-        assert (job_dir / "artifact.png").read_bytes() == artifact.content
-        assert not (job_dir / "metadata.json").exists()
+        artifact_dir = _artifact_directory(tmp_path)
+        assert (artifact_dir / "artifact.png").read_bytes() == artifact.content
+        assert not (artifact_dir / "metadata.json").exists()
         assert repository(artifact.ref) is None
 
         repository.put(artifact)
@@ -520,9 +565,9 @@ def test_content_fsync_failure_never_creates_commit_marker(
         ) as error:
             repository.put(artifact)
         assert "sensitive" not in str(error.value)
-        job_dir = tmp_path / "jobs" / "job-1"
-        assert not (job_dir / "artifact.png").exists()
-        assert not (job_dir / "metadata.json").exists()
+        artifact_dir = _artifact_directory(tmp_path)
+        assert not (artifact_dir / "artifact.png").exists()
+        assert not (artifact_dir / "metadata.json").exists()
     finally:
         store.close()
 
@@ -531,10 +576,10 @@ def test_recovered_content_is_fsynced_again_before_metadata_commit(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     artifact = _artifact()
-    job_dir = tmp_path / "jobs" / "job-1"
-    job_dir.mkdir(parents=True, mode=0o700)
-    (job_dir / "artifact.png").write_bytes(artifact.content)
-    (job_dir / "artifact.png").chmod(0o600)
+    artifact_dir = _artifact_directory(tmp_path)
+    artifact_dir.mkdir(parents=True, mode=0o700)
+    (artifact_dir / "artifact.png").write_bytes(artifact.content)
+    (artifact_dir / "artifact.png").chmod(0o600)
     store, repository = _open_repository(tmp_path)
     trace = _IoTrace()
     monkeypatch.setattr(production_artifacts.os, "open", trace.open)
@@ -550,7 +595,7 @@ def test_recovered_content_is_fsynced_again_before_metadata_commit(
         if event.startswith("open:.specstyle-metadata.")
     )
     assert "fsync:artifact.png" in trace.events[:metadata_open]
-    assert "fsync:job-1" in trace.events[:metadata_open]
+    assert "fsync:artifact-1" in trace.events[:metadata_open]
 
 
 def test_retry_after_commit_directory_fsync_failure_reestablishes_durability(
@@ -568,7 +613,7 @@ def test_retry_after_commit_directory_fsync_failure_reestablishes_durability(
         trace.events.append(f"fsync:{name}")
         if name.startswith(".specstyle-metadata."):
             metadata_synced = True
-        if name == "job-1" and metadata_synced and fail_commit_directory:
+        if name == "artifact-1" and metadata_synced and fail_commit_directory:
             fail_commit_directory = False
             raise OSError("sensitive directory sync detail")
         trace.real_fsync(fd)
@@ -580,21 +625,21 @@ def test_retry_after_commit_directory_fsync_failure_reestablishes_durability(
             InfrastructureError, match="^production artifact store unavailable$"
         ):
             repository.put(artifact)
-        job_dir = tmp_path / "jobs" / "job-1"
-        assert (job_dir / "artifact.png").exists()
-        assert (job_dir / "metadata.json").exists()
+        artifact_dir = _artifact_directory(tmp_path)
+        assert (artifact_dir / "artifact.png").exists()
+        assert (artifact_dir / "metadata.json").exists()
 
         trace.events.clear()
         repository.put(artifact)
         assert "fsync:artifact.png" in trace.events
         assert "fsync:metadata.json" in trace.events
-        assert "fsync:job-1" in trace.events
+        assert "fsync:artifact-1" in trace.events
         assert repository(artifact.ref) == artifact
     finally:
         store.close()
 
 
-@pytest.mark.parametrize("failed_parent", ("root", "jobs"))
+@pytest.mark.parametrize("failed_parent", ("root", "jobs", "job-1", "artifacts"))
 def test_retry_after_directory_creation_fsync_failure_resyncs_parent_entry(
     tmp_path, monkeypatch: pytest.MonkeyPatch, failed_parent: str
 ) -> None:
@@ -676,8 +721,8 @@ def test_partial_temp_write_never_creates_truncated_final_and_retry_succeeds(
             InfrastructureError, match="^production artifact store unavailable$"
         ):
             repository.put(artifact)
-        job_dir = tmp_path / "jobs" / "job-1"
-        assert not (job_dir / final_name).exists()
+        artifact_dir = _artifact_directory(tmp_path)
+        assert not (artifact_dir / final_name).exists()
 
         monkeypatch.setattr(production_artifacts.os, "write", real_write)
         repository.put(artifact)
@@ -756,7 +801,7 @@ def test_cleanup_failure_preserves_primary_error_and_orphan_fails_closed(
             InfrastructureError, match="^production artifact store corrupted$"
         ):
             repository.put(artifact)
-        assert list((tmp_path / "jobs" / "job-1").glob(".specstyle-artifact.*.tmp"))
+        assert list(_artifact_directory(tmp_path).glob(".specstyle-artifact.*.tmp"))
     finally:
         store.close()
 
@@ -817,15 +862,17 @@ def test_retry_recovers_only_linked_reserved_temp_alias(
             InfrastructureError, match="^production artifact store unavailable$"
         ):
             repository.put(artifact)
-        job_dir = tmp_path / "jobs" / "job-1"
-        aliases = list(job_dir.glob(f"{prefix}*.tmp"))
+        artifact_dir = _artifact_directory(tmp_path)
+        aliases = list(artifact_dir.glob(f"{prefix}*.tmp"))
         assert len(aliases) == 1
-        final = job_dir / ("artifact.png" if "artifact" in prefix else "metadata.json")
+        final = artifact_dir / (
+            "artifact.png" if "artifact" in prefix else "metadata.json"
+        )
         assert final.stat().st_ino == aliases[0].stat().st_ino
         monkeypatch.setattr(production_artifacts.os, "unlink", real_unlink)
         repository.put(artifact)
         assert repository(artifact.ref) == artifact
-        assert not list(job_dir.glob(".specstyle-*.tmp"))
+        assert not list(artifact_dir.glob(".specstyle-*.tmp"))
     finally:
         store.close()
 
@@ -835,20 +882,21 @@ def test_temp_namespace_anomalies_fail_closed_without_deletion(
     tmp_path, kind: str
 ) -> None:
     artifact = _artifact()
-    job_dir = tmp_path / "jobs" / "job-1"
-    job_dir.mkdir(parents=True, mode=0o700)
-    first = job_dir / ".specstyle-artifact.00000000000000000000000000000000.tmp"
+    artifact_dir = _artifact_directory(tmp_path)
+    artifact_dir.mkdir(parents=True, mode=0o700)
+    first = artifact_dir / ".specstyle-artifact.00000000000000000000000000000000.tmp"
     if kind == "malformed":
-        first = job_dir / ".specstyle-artifact.not-hex.tmp"
+        first = artifact_dir / ".specstyle-artifact.not-hex.tmp"
         first.write_bytes(b"orphan")
     elif kind == "orphan":
         first.write_bytes(b"orphan")
     else:
-        final = job_dir / "artifact.png"
+        final = artifact_dir / "artifact.png"
         final.write_bytes(artifact.content)
         os.link(final, first)
         os.link(
-            final, job_dir / ".specstyle-artifact.11111111111111111111111111111111.tmp"
+            final,
+            artifact_dir / ".specstyle-artifact.11111111111111111111111111111111.tmp",
         )
     first.chmod(0o600)
     store = _open_store(tmp_path)
@@ -876,7 +924,7 @@ def test_concurrent_puts_are_idempotent_or_never_overwrite(
         assert all(
             error is None or type(error) is InfrastructureError for error in errors
         )
-        assert (tmp_path / "jobs" / "job-1" / "artifact.png").read_bytes() in {
+        assert (_artifact_directory(tmp_path) / "artifact.png").read_bytes() in {
             artifact.content for artifact in artifacts
         }
     finally:
@@ -897,7 +945,7 @@ def test_link_eexist_with_identical_competing_claim_is_idempotent(
             competitor = tmp_path / "competing-temp"
             competitor.write_bytes(artifact.content)
             competitor.chmod(0o600)
-            real_link(competitor, tmp_path / "jobs" / "job-1" / dst)
+            real_link(competitor, _artifact_directory(tmp_path) / dst)
             competitor.unlink()
             raise FileExistsError
         return real_link(src, dst, **kwargs)
@@ -916,14 +964,14 @@ def test_oversized_sparse_content_is_rejected_before_content_read(
     artifact = _artifact()
     store, repository = _open_repository(tmp_path)
     repository.put(artifact)
-    job_dir = tmp_path / "jobs" / "job-1"
-    metadata = json.loads((job_dir / "metadata.json").read_bytes())
+    artifact_dir = _artifact_directory(tmp_path)
+    metadata = json.loads((artifact_dir / "metadata.json").read_bytes())
     metadata["size_bytes"] = production_artifacts._MAX_PNG + 1
-    (job_dir / "metadata.json").write_bytes(
+    (artifact_dir / "metadata.json").write_bytes(
         json.dumps(metadata, sort_keys=True, separators=(",", ":")).encode("ascii")
     )
-    (job_dir / "metadata.json").chmod(0o600)
-    with (job_dir / "artifact.png").open("r+b") as output:
+    (artifact_dir / "metadata.json").chmod(0o600)
+    with (artifact_dir / "artifact.png").open("r+b") as output:
         output.truncate(production_artifacts._MAX_PNG + 1)
     trace, real_read = _IoTrace(), os.read
 

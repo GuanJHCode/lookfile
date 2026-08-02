@@ -184,24 +184,21 @@ def _open_directory(
         raise
 
 
-def _open_job_directory(
-    root_fd: int, identity: _Identity, job_id: JobId, *, create: bool
-) -> tuple[int | None, int | None]:
-    jobs_fd, _ = _open_directory(root_fd, "jobs", identity, create=create)
-    if jobs_fd is None:
-        return None, None
-    job_fd = None
+def _open_scope(root_fd, identity, job_id, artifact_id, create) -> tuple[int, ...]:
+    opened: list[int] = []
     try:
-        if create:
-            _fsync(root_fd)
-        job_fd, _ = _open_directory(jobs_fd, job_id.value, identity, create=create)
-        if create:
-            _fsync(jobs_fd)
-        return jobs_fd, job_fd
+        for name in ("jobs", job_id.value, "artifacts", artifact_id.value):
+            parent_fd = root_fd if not opened else opened[-1]
+            fd, _ = _open_directory(parent_fd, name, identity, create=create)
+            if fd is None:
+                _close_fds(tuple(reversed(opened)))
+                return ()
+            if create:
+                _fsync(parent_fd)
+            opened.append(fd)
+        return tuple(opened)
     except Exception:
-        if job_fd is not None:
-            _close_quietly(job_fd)
-        _close_quietly(jobs_fd)
+        _close_quietly(*reversed(opened))
         raise
 
 
@@ -425,11 +422,10 @@ def _encode_metadata(job_id: JobId, artifact: GeneratedArtifact) -> bytes:
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=True,
-        allow_nan=False,
     ).encode("ascii")
 
 
-def _parse_metadata(content: bytes, job_id: JobId) -> dict[str, object]:
+def _parse_metadata(content, job_id, artifact_id) -> dict[str, object]:
     try:
         value = json.loads(
             content.decode("ascii"),
@@ -448,12 +444,12 @@ def _parse_metadata(content: bytes, job_id: JobId) -> dict[str, object]:
         if (
             value["schema"] != _SCHEMA
             or value["job_id"] != job_id.value
+            or value["artifact_id"] != artifact_id.value
             or value["media_type"] != "image/png"
             or type(value["size_bytes"]) is not int
             or not 1 <= value["size_bytes"] <= _MAX_PNG
         ):
             raise ValueError
-        ArtifactId(value["artifact_id"])
         Sha256(value["content_sha256"])
         Sha256(value["request_hash"])
         Sha256(value["generation_fingerprint"])
@@ -520,14 +516,15 @@ def _validate_artifact_ref(artifact_ref: ArtifactRef) -> ArtifactRef:
 
 
 def _read_committed(
-    job_fd: int,
+    artifact_fd: int,
     identity: _Identity,
     job_id: JobId,
+    artifact_id: ArtifactId,
     *,
     sync: bool = False,
 ) -> GeneratedArtifact | None:
     raw_metadata = _read_file(
-        job_fd,
+        artifact_fd,
         "metadata.json",
         identity,
         missing_ok=True,
@@ -536,9 +533,9 @@ def _read_committed(
     )
     if raw_metadata is None:
         return None
-    metadata = _parse_metadata(raw_metadata, job_id)
+    metadata = _parse_metadata(raw_metadata, job_id, artifact_id)
     content = _read_file(
-        job_fd,
+        artifact_fd,
         "artifact.png",
         identity,
         missing_ok=False,
@@ -551,7 +548,7 @@ def _read_committed(
     artifact = _artifact_from(metadata, content)
     if sync:
         durable_metadata = _read_file(
-            job_fd,
+            artifact_fd,
             "metadata.json",
             identity,
             missing_ok=False,
@@ -561,7 +558,7 @@ def _read_committed(
         )
         if durable_metadata != raw_metadata:
             raise _corrupted()
-        _fsync(job_fd)
+        _fsync(artifact_fd)
     return artifact
 
 
@@ -673,29 +670,35 @@ class _ProductionArtifactRepository:
 
     def _put_locked(self, artifact: GeneratedArtifact) -> None:
         root_fd, identity = self._store._open_root()
-        jobs_fd, job_fd = _open_job_directory(
-            root_fd, identity, self._job_id, create=True
+        fds = _open_scope(
+            root_fd, identity, self._job_id, artifact.ref.artifact_id, True
         )
-        if jobs_fd is None or job_fd is None:
+        if not fds:
             raise _unavailable()
         try:
-            self._put_open(job_fd, identity, artifact)
+            self._put_open(fds[-1], identity, artifact)
         except Exception:
-            _close_quietly(job_fd, jobs_fd)
+            _close_quietly(*reversed(fds))
             raise
-        _close_fds((job_fd, jobs_fd))
+        _close_fds(tuple(reversed(fds)))
 
     def _put_open(
-        self, job_fd: int, identity: _Identity, artifact: GeneratedArtifact
+        self, artifact_fd: int, identity: _Identity, artifact: GeneratedArtifact
     ) -> None:
-        _recover_namespace(job_fd, identity)
-        committed = _read_committed(job_fd, identity, self._job_id, sync=True)
+        _recover_namespace(artifact_fd, identity)
+        committed = _read_committed(
+            artifact_fd,
+            identity,
+            self._job_id,
+            artifact.ref.artifact_id,
+            sync=True,
+        )
         if committed is not None:
             if committed != artifact:
                 raise _corrupted()
             return
         current = _read_file(
-            job_fd,
+            artifact_fd,
             "artifact.png",
             identity,
             missing_ok=True,
@@ -704,15 +707,15 @@ class _ProductionArtifactRepository:
             sync=True,
         )
         if current is None:
-            _atomic_publish(job_fd, "artifact", artifact.content, identity)
+            _atomic_publish(artifact_fd, "artifact", artifact.content, identity)
         elif current != artifact.content:
             raise _corrupted()
         else:
-            _fsync(job_fd)
+            _fsync(artifact_fd)
         metadata = _encode_metadata(self._job_id, artifact)
         if not 1 <= len(metadata) <= _MAX_METADATA:
             raise DomainError("invalid production artifact")
-        _atomic_publish(job_fd, "metadata", metadata, identity)
+        _atomic_publish(artifact_fd, "metadata", metadata, identity)
 
     def __call__(self, artifact_ref: ArtifactRef, /) -> GeneratedArtifact | None:
         holder = self._holder
@@ -724,25 +727,22 @@ class _ProductionArtifactRepository:
 
     def _read_locked(self, artifact_ref: ArtifactRef) -> GeneratedArtifact | None:
         root_fd, identity = self._store._open_root()
-        jobs_fd, job_fd = _open_job_directory(
-            root_fd, identity, self._job_id, create=False
+        fds = _open_scope(
+            root_fd, identity, self._job_id, artifact_ref.artifact_id, False
         )
-        if jobs_fd is None:
+        if not fds:
             return None
         try:
-            if job_fd is None:
+            _recover_namespace(fds[-1], identity)
+            artifact = _read_committed(
+                fds[-1], identity, self._job_id, artifact_ref.artifact_id
+            )
+            if artifact is not None and artifact.ref != artifact_ref:
                 artifact = None
-            else:
-                _recover_namespace(job_fd, identity)
-                artifact = _read_committed(job_fd, identity, self._job_id)
-                if artifact is not None and artifact.ref != artifact_ref:
-                    artifact = None
         except Exception:
-            fds = (() if job_fd is None else (job_fd,)) + (jobs_fd,)
-            _close_quietly(*fds)
+            _close_quietly(*reversed(fds))
             raise
-        fds = (() if job_fd is None else (job_fd,)) + (jobs_fd,)
-        _close_fds(fds)
+        _close_fds(tuple(reversed(fds)))
         return artifact
 
     def close(self) -> None:
