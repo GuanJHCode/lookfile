@@ -99,6 +99,14 @@ def test_context_config_import_graph_excludes_workflow() -> None:
     )
 
 
+def test_context_config_uses_only_canonical_canny_contract() -> None:
+    contracts = importlib.import_module("specstyle.generation.canny_contracts")
+    module = importlib.import_module("specstyle.production.context_config")
+
+    assert not hasattr(module, "_Canny")
+    assert module.CannyProcessorConfig is contracts.CannyProcessorConfig
+
+
 def _pin(identifier: str, character: str) -> dict[str, str]:
     return {"id": identifier, "revision": "r1", "sha256": character * 64}
 
@@ -253,6 +261,7 @@ import os
 import sys
 
 sys.path.insert(0, sys.argv[1])
+from specstyle.generation.canny_contracts import CannyProcessorConfig
 from specstyle.production.context_config import load_production_context_config
 
 config_fd = os.open(sys.argv[2], os.O_RDONLY | os.O_DIRECTORY)
@@ -263,7 +272,18 @@ finally:
     os.close(evidence_fd)
     os.close(config_fd)
 assert loaded.schema_version == "specstyle.production.context.v1"
-assert "specstyle.workflow.production_service" not in sys.modules
+assert type(loaded.canny) is CannyProcessorConfig
+forbidden = (
+    "cv2",
+    "numpy",
+    "PIL",
+    "Pillow",
+    "diffusers",
+    "torch",
+    "gradio",
+    "specstyle.workflow.production_service",
+)
+assert not [name for name in forbidden if name in sys.modules]
 """
 
     completed = subprocess.run(
@@ -362,6 +382,8 @@ def test_loads_verified_context_without_retaining_paths_or_evidence_bytes(
     assert loaded.l2_threshold_profile.status == "VALIDATED"
     assert loaded.source_preprocess.background == (255, 255, 255)
     assert loaded.canny.low_threshold == 100
+    contracts = importlib.import_module("specstyle.generation.canny_contracts")
+    assert type(loaded.canny) is contracts.CannyProcessorConfig
     assert not any(
         isinstance(value, (bytes, Path))
         for value in (

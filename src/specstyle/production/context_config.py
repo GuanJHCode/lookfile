@@ -12,6 +12,7 @@ from typing import Any
 from specstyle.domain.enums import RuleLevel, RuleScope
 from specstyle.domain.identifiers import Identifier, RuleId, Sha256
 from specstyle.errors import DomainError, InfrastructureError
+from specstyle.generation.canny_contracts import CannyProcessorConfig
 from specstyle.generation.model_registry import ModelDescriptor
 from specstyle.generation.pipeline_factory import PipelineGraph
 from specstyle.observability.environment import EnvironmentSnapshot, hash_environment
@@ -167,31 +168,6 @@ class _SourcePreprocess:
             raise DomainError("invalid production source background")
 
 
-@dataclass(frozen=True, slots=True)
-class _Canny:
-    low_threshold: int
-    high_threshold: int
-    aperture_size: int
-    l2_gradient: bool
-
-    def __post_init__(self) -> None:
-        if (
-            any(
-                type(value) is not int
-                for value in (
-                    self.low_threshold,
-                    self.high_threshold,
-                    self.aperture_size,
-                )
-            )
-            or type(self.l2_gradient) is not bool
-            or not 0 <= self.low_threshold < self.high_threshold <= 255
-            or self.aperture_size != 3
-            or self.l2_gradient
-        ):
-            raise DomainError("invalid production canny parameters")
-
-
 @dataclass(frozen=True, slots=True, init=False)
 class ProductionContextConfig:
     schema_version: str
@@ -202,7 +178,7 @@ class ProductionContextConfig:
     rule_catalog: RuleCatalogCapability
     l2_threshold_profile: _L2ThresholdProfile
     source_preprocess: _SourcePreprocess
-    canny: _Canny
+    canny: CannyProcessorConfig
     _seal: object = field(repr=False, compare=False)
 
     def __init__(self, *_args: object, **_kwargs: object) -> None:
@@ -348,9 +324,9 @@ def _source(value: object) -> _SourcePreprocess:
     )
 
 
-def _canny(value: object) -> _Canny:
+def _canny(value: object) -> CannyProcessorConfig:
     raw = _exact(value, _CANNY_KEYS, "canny")
-    return _Canny(
+    return CannyProcessorConfig(
         raw["low_threshold"],
         raw["high_threshold"],
         raw["aperture_size"],

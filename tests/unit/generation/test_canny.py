@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import ast
 from dataclasses import replace
 import hashlib
+import importlib
 from importlib import metadata
 from io import BytesIO
 import json
+from pathlib import Path
+import subprocess
+import sys
 import zlib
 
 import cv2
@@ -33,6 +38,143 @@ from specstyle.spec.compiled_models import CompiledExecutionGraph, ResourcePin
 from specstyle.spec.compiler import compile_style_spec
 from specstyle.spec.models import StyleSpecV1
 from tests.unit.spec.test_compiler import context, raw_spec
+
+
+def _assert_unique_canny_contract_definitions(project_root: Path) -> None:
+    source_root = project_root / "src"
+    definitions = {
+        "CannyProcessorConfig": [],
+        "_rebuild_canny_processor_config": [],
+    }
+    private_canny_classes: list[str] = []
+    for path in sorted(source_root.rglob("*.py")):
+        relative = path.relative_to(source_root).as_posix()
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef):
+                if node.name == "CannyProcessorConfig":
+                    definitions[node.name].append(relative)
+                elif node.name == "_Canny":
+                    private_canny_classes.append(relative)
+            elif (
+                isinstance(node, ast.FunctionDef)
+                and node.name == "_rebuild_canny_processor_config"
+            ):
+                definitions[node.name].append(relative)
+
+    canonical = ["specstyle/generation/canny_contracts.py"]
+    assert definitions["CannyProcessorConfig"] == canonical
+    assert definitions["_rebuild_canny_processor_config"] == canonical
+    assert not private_canny_classes
+
+
+def test_canny_config_uses_one_canonical_contract() -> None:
+    contracts = importlib.import_module("specstyle.generation.canny_contracts")
+    canny = importlib.import_module("specstyle.generation.canny")
+
+    assert canny.CannyProcessorConfig is contracts.CannyProcessorConfig
+    assert canny.CannyProcessorConfig.__module__ == (
+        "specstyle.generation.canny_contracts"
+    )
+    assert not hasattr(canny, "_rebuild_config")
+
+
+def test_canny_contract_definitions_are_unique_across_source_tree() -> None:
+    project_root = Path(__file__).parents[3]
+
+    _assert_unique_canny_contract_definitions(project_root)
+
+
+@pytest.mark.parametrize(
+    "definition",
+    (
+        "class CannyProcessorConfig:\n    pass\n",
+        "def _rebuild_canny_processor_config():\n    pass\n",
+        "class _Canny:\n    pass\n",
+    ),
+)
+def test_unique_canny_contract_scan_detects_forbidden_source_definition(
+    tmp_path: Path, definition: str
+) -> None:
+    contract = tmp_path / "src/specstyle/generation/canny_contracts.py"
+    contract.parent.mkdir(parents=True)
+    contract.write_text(
+        "class CannyProcessorConfig:\n    pass\n"
+        "def _rebuild_canny_processor_config():\n    pass\n",
+        encoding="utf-8",
+    )
+    outside_source = tmp_path / "tests/unit/test_duplicate.py"
+    outside_source.parent.mkdir(parents=True)
+    outside_source.write_text(
+        "class CannyProcessorConfig:\n    pass\n",
+        encoding="utf-8",
+    )
+
+    _assert_unique_canny_contract_definitions(tmp_path)
+
+    duplicate = tmp_path / "src/specstyle/production/duplicate.py"
+    duplicate.parent.mkdir(parents=True)
+    duplicate.write_text(definition, encoding="utf-8")
+    with pytest.raises(AssertionError):
+        _assert_unique_canny_contract_definitions(tmp_path)
+
+
+def test_context_canny_parser_has_no_parameter_semantics() -> None:
+    project_root = Path(__file__).parents[3]
+    path = project_root / "src/specstyle/production/context_config.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    functions = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_canny"
+    ]
+
+    assert len(functions) == 1
+    function = functions[0]
+    assert len(function.body) == 2
+    assert isinstance(function.body[0], ast.Assign)
+    assert isinstance(function.body[1], ast.Return)
+    assert not any(
+        isinstance(node, (ast.Compare, ast.BoolOp)) for node in ast.walk(function)
+    )
+    calls = [
+        node.func.id
+        for node in ast.walk(function)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    ]
+    assert calls == ["_exact", "CannyProcessorConfig"]
+
+
+def test_importing_canny_contract_does_not_load_runtime_dependencies() -> None:
+    src_root = Path(__file__).parents[3] / "src"
+    script = """
+import sys
+
+sys.path.insert(0, sys.argv[1])
+from specstyle.generation.canny_contracts import CannyProcessorConfig
+
+assert CannyProcessorConfig(100, 200, 3, False).low_threshold == 100
+forbidden = (
+    "cv2",
+    "numpy",
+    "PIL",
+    "Pillow",
+    "diffusers",
+    "torch",
+    "gradio",
+    "specstyle.workflow.production_service",
+)
+assert not [name for name in forbidden if name in sys.modules]
+"""
+
+    completed = subprocess.run(
+        (sys.executable, "-B", "-c", script, str(src_root)),
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
 
 
 def _encoded_square() -> bytes:
