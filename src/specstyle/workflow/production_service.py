@@ -10,7 +10,7 @@ from typing import Any, Callable
 
 from specstyle.domain.artifacts import AssetRef
 from specstyle.domain.enums import ArtifactStatus
-from specstyle.domain.identifiers import AttemptId, JobId, RuleId
+from specstyle.domain.identifiers import AttemptId, JobId
 from specstyle.errors import DomainError, InfrastructureError, _GpuOutOfMemoryError
 from specstyle.generation.diffusers_backend import DiffusersBackend, StyleAssetResolver
 from specstyle.generation.diffusers_loader import (
@@ -43,6 +43,11 @@ from specstyle.spec.compiled_models import (
 )
 from specstyle.spec.compiler import compile_style_spec
 from specstyle.spec.loader import load_style_spec_text
+from specstyle.verification.l1.production_bindings import (
+    ProductionL1RuleBinding,
+    _rebuild_production_l1_rule_bindings,
+    production_l1_rule_bindings,
+)
 from specstyle.verification.production import (
     _L1RuleMapping,
     _ProductionVerificationAllowlist,
@@ -111,13 +116,6 @@ _CLOSE_GUARD = threading.Lock()
 _CLOSE_DONE: dict[int, threading.Event] = {}
 _SET_EVENT = threading.Event()
 _SET_EVENT.set()
-_L1_RULE_BINDING_VALUES = (
-    ("l1_bundle", "technical_rgb_png_bundle_v1"),
-    ("l1_decode", "decode_png_rgb_no_metadata_v1"),
-    ("l1_dimensions", "dimensions_exact_v1"),
-    ("l1_pixels", "pixels_nonblank_v1"),
-)
-_L1_IMPLEMENTATIONS = frozenset(item[1] for item in _L1_RULE_BINDING_VALUES)
 _CONTEXT_FACTORY_ACTIVE = threading.local()
 
 
@@ -134,48 +132,6 @@ class ProductionRuntimeFailureKind(StrEnum):
 
 _RuntimeReadiness = ProductionRuntimeReadiness
 _RuntimeFailureKind = ProductionRuntimeFailureKind
-
-
-@dataclass(frozen=True, slots=True)
-class ProductionL1RuleBinding:
-    rule_id: RuleId
-    implementation: str
-
-    def __post_init__(self) -> None:
-        if (
-            type(self.rule_id) is not RuleId
-            or type(self.rule_id.value) is not str
-            or type(self.implementation) is not str
-            or self.implementation not in _L1_IMPLEMENTATIONS
-        ):
-            raise DomainError("invalid production runtime dependency") from None
-        object.__setattr__(self, "rule_id", RuleId(str.__str__(self.rule_id.value)))
-        object.__setattr__(self, "implementation", str.__str__(self.implementation))
-
-
-def production_l1_rule_bindings() -> tuple[ProductionL1RuleBinding, ...]:
-    return tuple(
-        ProductionL1RuleBinding(RuleId(rule_id), implementation)
-        for rule_id, implementation in _L1_RULE_BINDING_VALUES
-    )
-
-
-def _rebuild_l1_rule_bindings(value: object, /) -> tuple[ProductionL1RuleBinding, ...]:
-    if type(value) is not tuple:
-        raise DomainError("invalid production runtime dependency") from None
-    try:
-        rebuilt = tuple(
-            ProductionL1RuleBinding(item.rule_id, item.implementation)
-            if type(item) is ProductionL1RuleBinding
-            else (_ for _ in ()).throw(ValueError())
-            for item in value
-        )
-    except Exception:
-        raise DomainError("invalid production runtime dependency") from None
-    values = tuple((item.rule_id.value, item.implementation) for item in rebuilt)
-    if values != _L1_RULE_BINDING_VALUES:
-        raise DomainError("invalid production runtime dependency") from None
-    return rebuilt
 
 
 def _utc_now() -> str:
@@ -1548,7 +1504,7 @@ def _validate_runtime_dependencies(
     clock: object,
 ) -> tuple[ProductionL1RuleBinding, ...]:
     _reject_context_factory_reentry()
-    bindings = _rebuild_l1_rule_bindings(l1_rule_bindings)
+    bindings = _rebuild_production_l1_rule_bindings(l1_rule_bindings)
     if (
         not callable(compiler_context_factory)
         or not callable(style_assets)

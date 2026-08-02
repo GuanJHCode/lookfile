@@ -7,12 +7,12 @@ import hashlib
 import json
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
-from enum import StrEnum
 from typing import Any
 
 from specstyle.domain.enums import RuleLevel, RuleScope, StaticApplicability
 from specstyle.domain.artifacts import AssetRef
 from specstyle.domain.identifiers import AssetId, Identifier, RuleId, Sha256
+from specstyle.errors import DomainError
 from specstyle.generation.image_evidence import _ProcessorProvenance
 from specstyle.generation.requests import GenerationRequest
 from specstyle.spec.compiled_models import (
@@ -27,6 +27,9 @@ from specstyle.spec.compiled_models import (
     ThresholdProfileCapability,
 )
 from specstyle.spec.compiler import compile_style_spec
+from specstyle.verification.l1.production_bindings import (
+    _validate_production_l1_rule_registry,
+)
 
 __all__ = ()
 
@@ -36,21 +39,6 @@ _L3_METRIC = Identifier("subject_semantic_similarity")
 
 class _ProductionContractViolation(Exception):
     pass
-
-
-class _L1Implementation(StrEnum):
-    DECODE = "decode_png_rgb_no_metadata_v1"
-    DIMENSIONS = "dimensions_exact_v1"
-    PIXELS = "pixels_nonblank_v1"
-    BUNDLE = "technical_rgb_png_bundle_v1"
-
-
-_L1_IMPLEMENTATION_REGISTRY = (
-    (RuleId("l1_bundle"), _L1Implementation.BUNDLE.value),
-    (RuleId("l1_decode"), _L1Implementation.DECODE.value),
-    (RuleId("l1_dimensions"), _L1Implementation.DIMENSIONS.value),
-    (RuleId("l1_pixels"), _L1Implementation.PIXELS.value),
-)
 
 
 @dataclass(frozen=True, slots=True)
@@ -265,8 +253,10 @@ def _clone_compiler_context(context: object) -> CompilerContext:
 
 
 def _validate_l1_registry(mappings: tuple[tuple[RuleId, str], ...]) -> None:
-    if mappings != _L1_IMPLEMENTATION_REGISTRY:
-        raise _ProductionContractViolation
+    try:
+        _validate_production_l1_rule_registry(mappings)
+    except DomainError:
+        raise _ProductionContractViolation from None
 
 
 def _profile_matches_binding(

@@ -32,10 +32,14 @@ from specstyle.spec.compiled_models import (
 from specstyle.verification.l1.decode import decode_png_bytes
 from specstyle.verification.l1.dimensions import check_dimensions_decoded
 from specstyle.verification.l1.pixels import check_pixels_decoded
+from specstyle.verification.l1.production_bindings import (
+    _PRODUCTION_L1_RULE_REGISTRY,
+    _ProductionL1Implementation,
+    _validate_production_l1_rule_registry,
+)
 from specstyle.verification.production_contracts import (
     _CanonicalProductionState,
     _FactoryIssuedState,
-    _L1Implementation,
     _LoadedVerificationBinding,
     _ProductionContractViolation,
     _binding_digest,
@@ -46,7 +50,6 @@ from specstyle.verification.production_contracts import (
     _descriptor_pin,
     _provenance_snapshot,
     _rebuild_request,
-    _validate_l1_registry,
     _validate_production_binding,
 )
 from specstyle.verification.production_metrics import (
@@ -80,7 +83,8 @@ class _L1RuleMapping:
             valid = (
                 type(self.rule_id) is RuleId
                 and type(self.implementation) is str
-                and _L1Implementation(self.implementation).value == self.implementation
+                and _ProductionL1Implementation(self.implementation).value
+                == self.implementation
             )
         except (TypeError, ValueError):
             valid = False
@@ -103,12 +107,15 @@ class _ProductionVerificationAllowlist:
             or type(self.compiler_context) is not CompilerContext
             or type(self.processor_provenance) is not _ProcessorProvenance
             or type(mappings) is not tuple
-            or not mappings
+            or len(mappings) != len(_PRODUCTION_L1_RULE_REGISTRY)
             or any(type(mapping) is not _L1RuleMapping for mapping in mappings)
             or len({mapping.rule_id for mapping in mappings}) != len(mappings)
             or tuple(sorted(mapping.implementation for mapping in mappings))
             != tuple(
-                sorted(implementation.value for implementation in _L1Implementation)
+                sorted(
+                    implementation.value
+                    for implementation in _ProductionL1Implementation
+                )
             )
         ):
             raise DomainError("invalid production verifier dependency")
@@ -116,8 +123,8 @@ class _ProductionVerificationAllowlist:
             (mapping.rule_id, mapping.implementation) for mapping in mappings
         )
         try:
-            _validate_l1_registry(values)
-        except _ProductionContractViolation:
+            _validate_production_l1_rule_registry(values)
+        except DomainError:
             raise DomainError("invalid production verifier dependency") from None
 
 

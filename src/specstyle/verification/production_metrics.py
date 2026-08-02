@@ -7,7 +7,9 @@ from dataclasses import dataclass
 from typing import Any
 
 from specstyle.domain.enums import RuleStatus
-from specstyle.verification.production_contracts import _L1Implementation
+from specstyle.verification.l1.production_bindings import (
+    _ProductionL1Implementation as _L1Implementation,
+)
 
 __all__ = ()
 
