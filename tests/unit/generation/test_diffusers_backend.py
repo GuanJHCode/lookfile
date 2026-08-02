@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import importlib
 from dataclasses import replace
 from io import BytesIO
 from pathlib import Path
+import threading
 import weakref
 
 import pytest
@@ -314,6 +316,291 @@ def test_cancelled_step_preserves_cancel_signal(
     supply.close()
 
 
+def test_cancel_event_is_shared_across_job_scoped_backends(tmp_path: Path) -> None:
+    style = _png((1024, 1024))
+    supply, graph, request = _production_request(tmp_path, (style,))
+    loaded = load_production_pipeline(
+        supply,
+        graph,
+        _environment(),
+        torch_module=_Torch(),
+        diffusers_module=_Diffusers(),
+    )
+    cancel_event = threading.Event()
+    first = DiffusersBackend(loaded, lambda _ref: style, cancel_event=cancel_event)
+    second = DiffusersBackend(loaded, lambda _ref: style, cancel_event=cancel_event)
+
+    first.cancel()
+
+    assert cancel_event.is_set()
+    with pytest.raises(DomainError, match="^generation cancelled$"):
+        second.generate(request)
+    loaded.close()
+    supply.close()
+
+
+def test_private_cancel_binding_propagates_before_first_use(
+    tmp_path: Path,
+) -> None:
+    style = _png((1024, 1024))
+    supply, graph, _request = _production_request(tmp_path, (style,))
+    loaded = load_production_pipeline(
+        supply,
+        graph,
+        _environment(),
+        torch_module=_Torch(),
+        diffusers_module=_Diffusers(),
+    )
+    shared = threading.Event()
+    backend = DiffusersBackend(loaded, lambda _ref: style)
+
+    backend._bind_cancel_event(shared)
+
+    backend.cancel()
+    assert shared.is_set()
+
+    cancelled = DiffusersBackend(loaded, lambda _ref: style)
+    cancelled.cancel()
+    shared_after_cancel = threading.Event()
+    cancelled._bind_cancel_event(shared_after_cancel)
+    assert shared_after_cancel.is_set()
+
+    started = DiffusersBackend(loaded, lambda _ref: style)
+    with pytest.raises(DomainError, match="invalid generation request"):
+        started.generate(object())  # type: ignore[arg-type]
+    with pytest.raises(DomainError, match="invalid cancellation event"):
+        started._bind_cancel_event(threading.Event())
+    loaded.close()
+    supply.close()
+
+
+def test_private_cancel_binding_serializes_bind_commit_with_cancel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    style = _png((1024, 1024))
+    supply, graph, _request = _production_request(tmp_path, (style,))
+    loaded = load_production_pipeline(
+        supply,
+        graph,
+        _environment(),
+        torch_module=_Torch(),
+        diffusers_module=_Diffusers(),
+    )
+    backend = DiffusersBackend(loaded, lambda _ref: style)
+    shared = threading.Event()
+    captured = threading.Barrier(2)
+    release = threading.Barrier(2)
+    errors: list[BaseException] = []
+
+    def captured_cancel(active_backend: DiffusersBackend) -> None:
+        binding = active_backend._cancelled
+        captured.wait(2)
+        release.wait(2)
+        if isinstance(binding, threading.Event):
+            binding.set()
+        else:
+            binding.cancel()
+
+    def run_cancel() -> None:
+        try:
+            backend.cancel()
+        except BaseException as error:
+            errors.append(error)
+
+    monkeypatch.setattr(DiffusersBackend, "cancel", captured_cancel)
+    cancel_thread = threading.Thread(target=run_cancel)
+    cancel_thread.start()
+    captured.wait(2)
+    backend._bind_cancel_event(shared)
+    release.wait(2)
+    cancel_thread.join(2)
+
+    try:
+        assert not cancel_thread.is_alive()
+        assert errors == []
+        assert shared.is_set()
+    finally:
+        release.abort()
+        loaded.close()
+        supply.close()
+
+
+def test_process_gpu_lease_serializes_backend_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    style = _png((1024, 1024))
+    first_supply, first_graph, first_request = _production_request(
+        tmp_path / "first", (style,)
+    )
+    second_supply, second_graph, second_request = _production_request(
+        tmp_path / "second", (style,)
+    )
+    loaded_instances = []
+    for supply, graph in (
+        (first_supply, first_graph),
+        (second_supply, second_graph),
+    ):
+        torch, diffusers = _Torch(), _Diffusers()
+        torch.Generator = type(
+            "Generator",
+            (),
+            {
+                "__init__": lambda self, device: None,
+                "manual_seed": lambda self, seed: self,
+            },
+        )
+        loaded_instances.append(
+            load_production_pipeline(
+                supply,
+                graph,
+                _environment(),
+                torch_module=torch,
+                diffusers_module=diffusers,
+            )
+        )
+    for loaded in loaded_instances:
+        loaded.borrow_pipeline().set_ip_adapter_scale = lambda _scale: None
+    guard = threading.Lock()
+    first_entered = threading.Event()
+    second_entered = threading.Event()
+    release = threading.Event()
+    active = maximum = calls = 0
+
+    def call_pipeline(_self, **_kwargs):
+        nonlocal active, maximum, calls
+        with guard:
+            calls += 1
+            active += 1
+            maximum = max(maximum, active)
+            marker = first_entered if calls == 1 else second_entered
+            marker.set()
+        assert release.wait(2)
+        with guard:
+            active -= 1
+        return type("Result", (), {"images": [Image.new("RGB", (1024, 1024))]})()
+
+    monkeypatch.setattr(
+        loaded_instances[0].borrow_pipeline().__class__, "__call__", call_pipeline
+    )
+    failures: list[BaseException] = []
+
+    def generate(loaded, request) -> None:
+        try:
+            DiffusersBackend(loaded, lambda _ref: style).generate(request)
+        except BaseException as error:
+            failures.append(error)
+
+    first = threading.Thread(target=generate, args=(loaded_instances[0], first_request))
+    second = threading.Thread(
+        target=generate, args=(loaded_instances[1], second_request)
+    )
+    first.start()
+    assert first_entered.wait(2)
+    second.start()
+    assert not second_entered.wait(0.1)
+    release.set()
+    first.join(2)
+    second.join(2)
+
+    assert not first.is_alive() and not second.is_alive()
+    assert failures == []
+    assert maximum == 1
+    for loaded in loaded_instances:
+        loaded.close()
+    first_supply.close()
+    second_supply.close()
+
+
+def test_pipeline_load_and_generation_share_process_gpu_lease(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    style = _png((1024, 1024))
+    ready_supply, ready_graph, request = _production_request(
+        tmp_path / "ready", (style,)
+    )
+    ready_torch, ready_diffusers = _Torch(), _Diffusers()
+    ready_torch.Generator = type(
+        "Generator",
+        (),
+        {"__init__": lambda self, device: None, "manual_seed": lambda self, seed: self},
+    )
+    loaded = load_production_pipeline(
+        ready_supply,
+        ready_graph,
+        _environment(),
+        torch_module=ready_torch,
+        diffusers_module=ready_diffusers,
+    )
+    loaded.borrow_pipeline().set_ip_adapter_scale = lambda _scale: None
+    generation_entered = threading.Event()
+
+    def generate_pipeline(_self, **_kwargs):
+        generation_entered.set()
+        return type("Result", (), {"images": [Image.new("RGB", (1024, 1024))]})()
+
+    monkeypatch.setattr(
+        loaded.borrow_pipeline().__class__, "__call__", generate_pipeline
+    )
+    loading_supply, loading_graph = _supply(tmp_path / "loading")
+    loading_torch, loading_diffusers = _Torch(), _Diffusers()
+    load_entered = threading.Event()
+    release_load = threading.Event()
+    original_control = loading_diffusers.ControlNetModel.from_pretrained
+
+    def blocked_control(_cls, *args, **kwargs):
+        load_entered.set()
+        assert release_load.wait(2)
+        return original_control(*args, **kwargs)
+
+    monkeypatch.setattr(
+        loading_diffusers.ControlNetModel,
+        "from_pretrained",
+        classmethod(blocked_control),
+    )
+    failures: list[BaseException] = []
+    loaded_results = []
+
+    def load() -> None:
+        try:
+            loaded_results.append(
+                load_production_pipeline(
+                    loading_supply,
+                    loading_graph,
+                    _environment(),
+                    torch_module=loading_torch,
+                    diffusers_module=loading_diffusers,
+                )
+            )
+        except BaseException as error:
+            failures.append(error)
+
+    def generate() -> None:
+        try:
+            DiffusersBackend(loaded, lambda _ref: style).generate(request)
+        except BaseException as error:
+            failures.append(error)
+
+    loader_thread = threading.Thread(target=load)
+    generation_thread = threading.Thread(target=generate)
+    loader_thread.start()
+    assert load_entered.wait(2)
+    generation_thread.start()
+    overlapped = generation_entered.wait(0.1)
+    release_load.set()
+    loader_thread.join(2)
+    generation_thread.join(2)
+    try:
+        assert not loader_thread.is_alive() and not generation_thread.is_alive()
+        assert not overlapped
+        assert failures == []
+    finally:
+        for loaded_result in loaded_results:
+            loaded_result.close()
+        loaded.close()
+        loading_supply.close()
+        ready_supply.close()
+
+
 def test_rejects_legal_bfloat16_request_graph(tmp_path: Path) -> None:
     style = _png((1024, 1024))
     supply, graph, request = _production_request(tmp_path, (style,), dtype="bfloat16")
@@ -469,6 +756,10 @@ def test_generate_normalizes_every_execution_stage(
         )
     with pytest.raises(InfrastructureError, match=expected) as raised:
         DiffusersBackend(loaded, lambda _ref: style).generate(request)
+    oom_type = getattr(
+        importlib.import_module("specstyle.errors"), "_GpuOutOfMemoryError"
+    )
+    assert type(raised.value) is (oom_type if oom else InfrastructureError)
     assert raised.value.__cause__ is None
     assert raised.value.__context__ is None
     assert torch.cuda.empty_cache_calls == (1 if expected == "generation OOM" else 0)

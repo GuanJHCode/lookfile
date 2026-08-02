@@ -15,3 +15,9 @@ class DomainError(SpecStyleError):
 
 class InfrastructureError(SpecStyleError):
     """基础设施错误：GPU/ROCm、文件 IO、依赖缺失等运行环境问题。"""
+
+
+class _GpuOutOfMemoryError(InfrastructureError):
+    """Private structured marker for a genuine runtime GPU OOM."""
+
+    __slots__ = ()

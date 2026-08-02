@@ -4,15 +4,17 @@ from __future__ import annotations
 
 import gc
 from io import BytesIO
+import threading
 from typing import Any, Protocol
 
 from PIL import Image, UnidentifiedImageError
 
 from specstyle.domain.artifacts import ArtifactRef, AssetRef
 from specstyle.domain.identifiers import ArtifactId
-from specstyle.errors import DomainError, InfrastructureError
+from specstyle.errors import DomainError, InfrastructureError, _GpuOutOfMemoryError
 from specstyle.generation.diffusers_loader import (
     LoadedPipeline,
+    _GPU_LEASE,
     _validate_loaded_pipeline,
 )
 from specstyle.generation.protocols import GeneratedArtifact
@@ -22,6 +24,39 @@ from specstyle.observability.hashing import hash_bytes
 
 class StyleAssetResolver(Protocol):
     def __call__(self, reference: AssetRef, /) -> bytes: ...
+
+
+class _CancelBinding:
+    __slots__ = ("_lock", "_event", "_bound", "_frozen")
+
+    def __init__(self, event: threading.Event | None, /) -> None:
+        self._lock = threading.Lock()
+        self._event = threading.Event() if event is None else event
+        self._bound = event is not None
+        self._frozen = False
+
+    def bind(self, event: threading.Event, /) -> None:
+        if type(event) is not threading.Event:
+            raise DomainError("invalid cancellation event")
+        with self._lock:
+            if self._bound or self._frozen:
+                raise DomainError("invalid cancellation event")
+            if self._event.is_set():
+                event.set()
+            self._event = event
+            self._bound = True
+
+    def cancel(self) -> None:
+        with self._lock:
+            self._event.set()
+
+    def freeze(self) -> None:
+        with self._lock:
+            self._frozen = True
+
+    def is_set(self) -> bool:
+        with self._lock:
+            return self._event.is_set()
 
 
 def _contract_failure() -> InfrastructureError:
@@ -36,8 +71,12 @@ def _empty_cache(torch: Any) -> None:
 
 
 def _is_oom(error: Exception, torch: Any) -> bool:
-    oom_type = getattr(getattr(torch, "cuda", None), "OutOfMemoryError", None)
-    return type(oom_type) is type and isinstance(error, oom_type)
+    candidates = (
+        getattr(torch, "OutOfMemoryError", None),
+        getattr(getattr(torch, "cuda", None), "OutOfMemoryError", None),
+    )
+    classes = tuple(item for item in candidates if isinstance(item, type))
+    return bool(classes) and isinstance(error, classes)
 
 
 def _execute_pipeline(
@@ -53,8 +92,10 @@ def _execute_pipeline(
     except DomainError:
         failure = DomainError("generation cancelled")
     except Exception as error:
-        failure = InfrastructureError(
-            "generation OOM" if _is_oom(error, torch) else "generation failed"
+        failure = (
+            _GpuOutOfMemoryError("generation OOM")
+            if _is_oom(error, torch)
+            else InfrastructureError("generation failed")
         )
     finally:
         kwargs.clear()
@@ -63,7 +104,7 @@ def _execute_pipeline(
     if type(failure) is DomainError:
         raise failure
     if failure is not None:
-        if failure.args == ("generation OOM",):
+        if type(failure) is _GpuOutOfMemoryError:
             _empty_cache(torch)
         raise failure
     raise AssertionError("pipeline execution must return or raise")
@@ -191,28 +232,49 @@ class DiffusersBackend:
 
     __slots__ = ("_loaded", "_resolver", "_cancelled")
 
-    def __init__(self, loaded: LoadedPipeline, resolver: StyleAssetResolver, /) -> None:
+    def __init__(
+        self,
+        loaded: LoadedPipeline,
+        resolver: StyleAssetResolver,
+        /,
+        *,
+        cancel_event: threading.Event | None = None,
+    ) -> None:
         try:
             _validate_loaded_pipeline(loaded, require_open=True)
         except DomainError:
             raise DomainError("invalid loaded production pipeline") from None
         if not callable(resolver):
             raise DomainError("invalid style asset resolver")
+        if cancel_event is not None and type(cancel_event) is not threading.Event:
+            raise DomainError("invalid cancellation event")
         self._loaded = loaded
         self._resolver = resolver
-        self._cancelled = False
+        self._cancelled = _CancelBinding(cancel_event)
+
+    def _bind_cancel_event(self, cancel_event: threading.Event) -> None:
+        self._cancelled.bind(cancel_event)
 
     def cancel(self) -> None:
-        self._cancelled = True
+        self._cancelled.cancel()
 
     def _callback(self, _pipe: Any, _step: int, _timestep: Any, kwargs: Any) -> Any:
-        if self._cancelled:
+        if self._cancelled.is_set():
             raise DomainError("generation cancelled")
         return kwargs
 
     def generate(self, request: GenerationRequest) -> GeneratedArtifact:
+        self._cancelled.freeze()
+        if self._cancelled.is_set():
+            raise DomainError("generation cancelled")
+        with _GPU_LEASE:
+            if self._cancelled.is_set():
+                raise DomainError("generation cancelled")
+            return self._generate_under_lease(request)
+
+    def _generate_under_lease(self, request: GenerationRequest) -> GeneratedArtifact:
         _validate_loaded_pipeline(self._loaded, require_open=True)
-        if self._cancelled:
+        if self._cancelled.is_set():
             raise DomainError("generation cancelled")
         request = _validate_request(self._loaded, request)
         size = request.graph.resolution

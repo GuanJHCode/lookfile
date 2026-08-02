@@ -607,6 +607,49 @@ def test_failed_load_releases_pipeline_before_empty_cache(
     supply.close()
 
 
+@pytest.mark.parametrize("real_oom", (True, False))
+def test_load_classifies_only_the_real_torch_oom_type(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, real_oom: bool
+) -> None:
+    supply, graph = _supply(tmp_path)
+    torch, diffusers = _Torch(), _Diffusers()
+
+    class PublicOom(Exception):
+        pass
+
+    class FakeNamedOutOfMemoryError(Exception):
+        pass
+
+    torch.cuda.OutOfMemoryError = PublicOom
+    failure_type = PublicOom if real_oom else FakeNamedOutOfMemoryError
+    monkeypatch.setattr(
+        diffusers.ControlNetModel,
+        "from_pretrained",
+        classmethod(lambda cls, *args, **kwargs: (_ for _ in ()).throw(failure_type())),
+    )
+    try:
+        with pytest.raises(InfrastructureError) as raised:
+            load_production_pipeline(
+                supply,
+                graph,
+                _environment(),
+                torch_module=torch,
+                diffusers_module=diffusers,
+            )
+        errors = __import__("specstyle.errors", fromlist=["_GpuOutOfMemoryError"])
+        expected_type = (
+            getattr(errors, "_GpuOutOfMemoryError") if real_oom else InfrastructureError
+        )
+        assert type(raised.value) is expected_type
+        assert str(raised.value) == (
+            "pipeline loading OOM" if real_oom else "pipeline loading failed"
+        )
+        assert raised.value.__cause__ is None
+        assert raised.value.__context__ is None
+    finally:
+        supply.close()
+
+
 def _inject_transformers(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         diffusers_loader_module,

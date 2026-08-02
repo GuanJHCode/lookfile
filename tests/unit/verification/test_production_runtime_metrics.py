@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib
 from io import BytesIO
 from pathlib import Path
+import threading
 
 import pytest
 from PIL import Image
@@ -12,6 +13,8 @@ from PIL import Image
 from specstyle.domain.artifacts import ArtifactRef
 from specstyle.domain.enums import RuleStatus
 from specstyle.errors import DomainError, InfrastructureError
+from specstyle.generation.diffusers_backend import DiffusersBackend
+from specstyle.generation.diffusers_loader import load_production_pipeline
 from specstyle.generation.protocols import GeneratedArtifact
 from specstyle.observability.hashing import hash_bytes
 from tests.unit.verification._production_fixtures import (
@@ -21,6 +24,11 @@ from tests.unit.verification._production_fixtures import (
     _make_production_case,
     _png,
 )
+from tests.unit.generation.test_diffusers_backend import (
+    _png as _backend_png,
+    _production_request,
+)
+from tests.unit.generation.test_diffusers_loader import _Diffusers, _Torch, _environment
 
 
 def _bind(case: _ProductionCase) -> tuple[object, tuple[object, ...]]:
@@ -73,6 +81,177 @@ def _callback_result(case: _ProductionCase, failure: bool) -> GeneratedArtifact:
     if failure:
         raise RuntimeError("private callback failure")
     return case.artifact
+
+
+class _CountingLease:
+    def __init__(self) -> None:
+        self.enter_count = 0
+        self.depth = 0
+
+    def __enter__(self):
+        self.enter_count += 1
+        self.depth += 1
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.depth -= 1
+
+
+def test_production_modules_share_one_process_gpu_lease() -> None:
+    backend = importlib.import_module("specstyle.generation.diffusers_backend")
+    loader = importlib.import_module("specstyle.generation.diffusers_loader")
+    production = importlib.import_module("specstyle.verification.production")
+    service = importlib.import_module("specstyle.workflow.production_service")
+
+    assert backend._GPU_LEASE is loader._GPU_LEASE
+    assert production._GPU_LEASE is loader._GPU_LEASE
+    assert service._GPU_LEASE is loader._GPU_LEASE
+
+
+def test_run_verifier_acquires_its_outer_gpu_lease_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    production = importlib.import_module("specstyle.verification.production")
+    protocols = importlib.import_module("specstyle.verification.protocols")
+    lease = _CountingLease()
+    monkeypatch.setattr(production, "_GPU_LEASE", lease, raising=False)
+    case = _make_production_case(tmp_path)
+    try:
+        verifier, rules = _bind(case)
+        results = protocols.run_verifier(verifier, (case.artifact.ref,), rules)
+        assert results
+        assert lease.enter_count == 1
+        assert lease.depth == 0
+    finally:
+        case.close()
+
+
+def _generation_lease_probe(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    style = _backend_png((1024, 1024))
+    supply, graph, request = _production_request(tmp_path, (style,))
+    torch, diffusers = _Torch(), _Diffusers()
+    torch.Generator = type(
+        "Generator",
+        (),
+        {"__init__": lambda self, device: None, "manual_seed": lambda self, seed: self},
+    )
+    loaded = load_production_pipeline(
+        supply, graph, _environment(), torch_module=torch, diffusers_module=diffusers
+    )
+    loaded.borrow_pipeline().set_ip_adapter_scale = lambda _scale: None
+    entered = threading.Event()
+
+    def call_pipeline(_self, **_kwargs):
+        entered.set()
+        return type("Result", (), {"images": [Image.new("RGB", (1024, 1024))]})()
+
+    monkeypatch.setattr(loaded.borrow_pipeline().__class__, "__call__", call_pipeline)
+    backend = DiffusersBackend(loaded, lambda _reference: style)
+    return supply, loaded, backend, request, entered
+
+
+def test_run_verifier_and_generation_are_process_serialized(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    protocols = importlib.import_module("specstyle.verification.protocols")
+    case = _make_production_case(tmp_path / "verify")
+    supply, loaded, backend, request, generation_entered = _generation_lease_probe(
+        tmp_path / "generate", monkeypatch
+    )
+    verify_entered = threading.Event()
+    release_verify = threading.Event()
+    failures: list[BaseException] = []
+
+    def artifact_resolver(_reference):
+        verify_entered.set()
+        assert release_verify.wait(2)
+        return case.artifact
+
+    verifier, rules = _bind_with(case, artifact_resolver, case.style_resolver)
+
+    def verify() -> None:
+        try:
+            protocols.run_verifier(verifier, (case.artifact.ref,), rules)
+        except BaseException as error:
+            failures.append(error)
+
+    def generate() -> None:
+        try:
+            backend.generate(request)
+        except BaseException as error:
+            failures.append(error)
+
+    verify_thread = threading.Thread(target=verify)
+    generate_thread = threading.Thread(target=generate)
+    verify_thread.start()
+    assert verify_entered.wait(2)
+    generate_thread.start()
+    overlapped = generation_entered.wait(0.1)
+    release_verify.set()
+    verify_thread.join(2)
+    generate_thread.join(2)
+    try:
+        assert not verify_thread.is_alive() and not generate_thread.is_alive()
+        assert not overlapped
+        assert failures == []
+    finally:
+        release_verify.set()
+        loaded.close()
+        supply.close()
+        case.close()
+
+
+def test_loaded_close_waits_for_complete_run_verifier_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    production = importlib.import_module("specstyle.verification.production")
+    protocols = importlib.import_module("specstyle.verification.protocols")
+    case = _make_production_case(tmp_path)
+    verifier, rules = _bind(case)
+    evaluated = threading.Event()
+    release_verify = threading.Event()
+    close_done = threading.Event()
+    failures: list[BaseException] = []
+    original = production._evaluate_rules
+
+    def blocked_evaluation(*args):
+        results = original(*args)
+        evaluated.set()
+        assert release_verify.wait(2)
+        return results
+
+    monkeypatch.setattr(production, "_evaluate_rules", blocked_evaluation)
+
+    def verify() -> None:
+        try:
+            protocols.run_verifier(verifier, (case.artifact.ref,), rules)
+        except BaseException as error:
+            failures.append(error)
+
+    def close() -> None:
+        try:
+            case.loaded.close()
+        except BaseException as error:
+            failures.append(error)
+        finally:
+            close_done.set()
+
+    verify_thread = threading.Thread(target=verify)
+    close_thread = threading.Thread(target=close)
+    verify_thread.start()
+    assert evaluated.wait(2)
+    close_thread.start()
+    overlapped = close_done.wait(0.1)
+    release_verify.set()
+    verify_thread.join(2)
+    close_thread.join(2)
+    try:
+        assert not verify_thread.is_alive() and not close_thread.is_alive()
+        assert not overlapped
+        assert failures == []
+    finally:
+        release_verify.set()
+        case.close()
 
 
 def _animated_rgb_webp() -> bytes:
@@ -265,8 +444,17 @@ def test_b0_runtime_failures_map_to_frozen_verification_errors(
         _ for _ in ()
     ).throw(failure)
     try:
-        with pytest.raises(InfrastructureError, match=f"^{message}$"):
+        with pytest.raises(InfrastructureError, match=f"^{message}$") as raised:
             _result(case, "l2_style")
+        errors = importlib.import_module("specstyle.errors")
+        expected_type = (
+            getattr(errors, "_GpuOutOfMemoryError")
+            if type(failure) is _OOM
+            else InfrastructureError
+        )
+        assert type(raised.value) is expected_type
+        assert raised.value.__cause__ is None
+        assert raised.value.__context__ is None
     finally:
         case.close()
 

@@ -8,10 +8,11 @@ from typing import Protocol, runtime_checkable
 from specstyle.domain.artifacts import ArtifactRef
 from specstyle.domain.enums import RuleLevel, RuleStatus
 from specstyle.domain.identifiers import ArtifactId, RuleId, Sha256
-from specstyle.errors import DomainError, InfrastructureError
+from specstyle.errors import DomainError, InfrastructureError, _GpuOutOfMemoryError
 from specstyle.generation.diffusers_backend import StyleAssetResolver
 from specstyle.generation.diffusers_loader import (
     LoadedPipeline,
+    _GPU_LEASE,
     _VerifiedImageEvidenceEncoder,
 )
 from specstyle.generation.image_evidence import (
@@ -179,6 +180,15 @@ class _BoundProductionVerifier:
         raise TypeError("production verifiers are issued only")
 
     def verify(
+        self,
+        artifacts: tuple[ArtifactRef, ...],
+        rules: tuple[RuleDefinition, ...],
+        /,
+    ) -> tuple[RuleResult, ...]:
+        with _GPU_LEASE:
+            return self._verify_under_lease(artifacts, rules)
+
+    def _verify_under_lease(
         self,
         artifacts: tuple[ArtifactRef, ...],
         rules: tuple[RuleDefinition, ...],
@@ -492,6 +502,7 @@ def _encode_evidence(
     if digest in cache:
         _checkpoint(verifier)
         return cache[digest]
+    failure: InfrastructureError | None = None
     try:
         value = verifier._canonical.issued.evidence.encode(content, digest)
     except DomainError as error:
@@ -499,19 +510,26 @@ def _encode_evidence(
         if error.args != ("invalid image evidence input",):
             raise _contract_failure() from None
         value = None
+    except _GpuOutOfMemoryError:
+        _checkpoint(verifier)
+        value = None
+        failure = _GpuOutOfMemoryError("verification OOM")
     except InfrastructureError as error:
         _checkpoint(verifier)
         messages = {
-            "image evidence OOM": "verification OOM",
             "image evidence contract violation": "production verification contract violation",
             "image evidence encoding failed": "production verification encoder failed",
         }
-        raise InfrastructureError(
+        value = None
+        failure = InfrastructureError(
             messages.get(str(error), "production verification encoder failed")
-        ) from None
+        )
     except Exception:
         _checkpoint(verifier)
-        raise InfrastructureError("production verification encoder failed") from None
+        value = None
+        failure = InfrastructureError("production verification encoder failed")
+    if failure is not None:
+        raise failure
     _checkpoint(verifier)
     if value is not None and (
         type(value) is not _VerifiedImageEvidence or value.asset_sha256 != digest

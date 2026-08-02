@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import gc
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from importlib import metadata as importlib_metadata
@@ -11,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from specstyle.domain.identifiers import Sha256
-from specstyle.errors import DomainError, InfrastructureError
+from specstyle.errors import DomainError, InfrastructureError, _GpuOutOfMemoryError
 from specstyle.generation.image_evidence import (
     _EVIDENCE_CONTRACT_ERROR,
     _ProcessorProvenance,
@@ -22,6 +23,7 @@ from specstyle.generation.image_evidence import (
     _decode_image_evidence_input,
     _derive_preprocessing_version,
     _encoder_placement,
+    _is_torch_oom,
     _run_image_evidence_encoder,
     _validate_frozen_encoder_placement,
     _validate_image_processor,
@@ -39,6 +41,7 @@ _ROCM_VERSION = "7.2.1"
 _DIFFUSERS_VERSION = "0.39.0"
 _IMAGE_EVIDENCE_CAPABILITY_SEAL = object()
 _EVIDENCE_LAYER = "hidden_states[-2]"
+_GPU_LEASE = threading.RLock()
 
 
 @dataclass(frozen=True, slots=True, init=False)
@@ -76,6 +79,10 @@ class LoadedPipeline:
         return capability
 
     def close(self) -> None:
+        with _GPU_LEASE:
+            self._close_under_lease()
+
+    def _close_under_lease(self) -> None:
         _validate_loaded_pipeline(self, require_open=False)
         if self._closed:
             return
@@ -139,8 +146,9 @@ class _VerifiedImageEvidenceEncoder:
     def encode(
         self, image_bytes: bytes, asset_sha256: Sha256, /
     ) -> _VerifiedImageEvidence:
-        _validate_image_evidence_encoder(self)
-        return _encode_image_evidence(self._owner, image_bytes, asset_sha256)
+        with _GPU_LEASE:
+            _validate_image_evidence_encoder(self)
+            return _encode_image_evidence(self._owner, image_bytes, asset_sha256)
 
     def __copy__(self) -> _VerifiedImageEvidenceEncoder:
         raise TypeError("image evidence encoders cannot be copied")
@@ -296,7 +304,7 @@ def _map_encoding_failure(error: BaseException, torch: Any) -> InfrastructureErr
     if failure_kind == "oom":
         gc.collect()
         _empty_cache(torch)
-        return InfrastructureError("image evidence OOM")
+        return _GpuOutOfMemoryError("image evidence OOM")
     if failure_kind == "contract":
         return InfrastructureError("image evidence contract violation")
     return InfrastructureError("image evidence encoding failed")
@@ -454,6 +462,25 @@ def load_production_pipeline(
     torch_module: Any | None = None,
     diffusers_module: Any | None = None,
 ) -> LoadedPipeline:
+    with _GPU_LEASE:
+        return _load_production_pipeline_under_lease(
+            supply,
+            graph,
+            environment,
+            torch_module=torch_module,
+            diffusers_module=diffusers_module,
+        )
+
+
+def _load_production_pipeline_under_lease(
+    supply: VerifiedPipelineSupply,
+    graph: PipelineGraph,
+    environment: EnvironmentSnapshot,
+    /,
+    *,
+    torch_module: Any | None = None,
+    diffusers_module: Any | None = None,
+) -> LoadedPipeline:
     """Load the one supported SDXL/Canny production topology from borrowed paths."""
     runtime_failure: InfrastructureError | None = None
     try:
@@ -517,8 +544,12 @@ def load_production_pipeline(
         processor_provenance = _build_processor_provenance(
             transformers, image_processor, _installed_transformers_version()
         )
-    except Exception:
-        failure = InfrastructureError("pipeline loading failed")
+    except Exception as error:
+        failure = (
+            _GpuOutOfMemoryError("pipeline loading OOM")
+            if _is_torch_oom(error, torch)
+            else InfrastructureError("pipeline loading failed")
+        )
 
     if failure is not None:
         _release_failed_pipeline(control, pipeline, torch)

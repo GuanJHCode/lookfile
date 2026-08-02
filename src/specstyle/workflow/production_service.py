@@ -4,15 +4,18 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from enum import StrEnum
+import threading
 from typing import Any, Callable
 
 from specstyle.domain.artifacts import AssetRef
 from specstyle.domain.enums import ArtifactStatus
 from specstyle.domain.identifiers import AttemptId, JobId
-from specstyle.errors import DomainError, InfrastructureError
+from specstyle.errors import DomainError, InfrastructureError, _GpuOutOfMemoryError
 from specstyle.generation.diffusers_backend import DiffusersBackend, StyleAssetResolver
 from specstyle.generation.diffusers_loader import (
     LoadedPipeline,
+    _GPU_LEASE,
     load_production_pipeline,
 )
 from specstyle.generation.model_approval import VerifiedPipelineSupply
@@ -49,6 +52,7 @@ from specstyle.verification.rule_models import VerificationReport
 from specstyle.workflow.job_models import (
     AttemptFinishedPayload,
     AttemptStartedPayload,
+    CancelRequestedPayload,
     Event,
     EventType,
     FatalPayload,
@@ -77,6 +81,23 @@ from specstyle.workflow.production_reports import _open_production_report_store
 __all__ = ("ProductionJobRequest", "ProductionJobResult")
 
 _OUTPUT_PROFILES = {"xhs_grid", "talking_head_cover", "background_sequence"}
+_PRODUCTION_BACKEND_TYPE = DiffusersBackend
+_ACTIVE_RUNTIME = threading.local()
+_CLOSE_GUARD = threading.Lock()
+_CLOSE_DONE: dict[int, threading.Event] = {}
+_SET_EVENT = threading.Event()
+_SET_EVENT.set()
+
+
+class _RuntimeReadiness(StrEnum):
+    READY = "READY"
+    BUSY = "BUSY"
+    QUARANTINED = "QUARANTINED"
+    CLOSED = "CLOSED"
+
+
+class _RuntimeFailureKind(StrEnum):
+    GPU_OOM = "GPU_OOM"
 
 
 def _utc_now() -> str:
@@ -297,6 +318,7 @@ def _record_attempt_start(
     generation_request: GenerationRequest,
     budget: JobBudget,
     clock: Callable[[], str],
+    checkpoint: Callable[[], None],
 ) -> None:
     transitions = (
         (
@@ -321,9 +343,11 @@ def _record_attempt_start(
         ),
     )
     for event_type, from_state, to_state, payload in transitions:
+        checkpoint()
         _append_event(
             store, request.job_id, event_type, from_state, to_state, clock(), payload
         )
+        checkpoint()
 
 
 def _run_initial_generation(
@@ -333,27 +357,44 @@ def _run_initial_generation(
     request: GenerationRequest,
     clock: Callable[[], str],
     from_state: JobStatus = JobStatus.GENERATING,
+    cancel_event: threading.Event | None = None,
 ) -> GeneratedArtifact:
+    del store, clock, from_state
+    factory = DiffusersBackend
+    if factory is _PRODUCTION_BACKEND_TYPE:
+        backend = factory(loaded, style_assets, cancel_event=cancel_event)
+    else:
+        backend = factory(loaded, style_assets)
+        if type(backend) is not _PRODUCTION_BACKEND_TYPE:
+            raise InfrastructureError("invalid generation backend")
+        if cancel_event is not None:
+            backend._bind_cancel_event(cancel_event)
+    return run_generation(backend, request)
+
+
+def _record_generation_fatal(
+    store: JobStore,
+    request: GenerationRequest,
+    state: JobStatus,
+    clock: Callable[[], str],
+    *,
+    oom: bool,
+) -> None:
     try:
-        return run_generation(DiffusersBackend(loaded, style_assets), request)
-    except (DomainError, InfrastructureError) as error:
-        oom = type(error) is InfrastructureError and error.args == ("generation OOM",)
-        try:
-            _append_event(
-                store,
-                request.job_id,
-                EventType.FATAL,
-                from_state,
-                JobStatus.JOB_FAILED,
-                clock(),
-                FatalPayload(
-                    "GENERATION_OOM" if oom else "GENERATION_FAILED",
-                    "generation OOM" if oom else "generation failed",
-                ),
-            )
-        except Exception:
-            pass
-        raise
+        _append_event(
+            store,
+            request.job_id,
+            EventType.FATAL,
+            state,
+            JobStatus.JOB_FAILED,
+            clock(),
+            FatalPayload(
+                "GENERATION_OOM" if oom else "GENERATION_FAILED",
+                "generation OOM" if oom else "generation failed",
+            ),
+        )
+    except Exception:
+        pass
 
 
 def _record_attempt_finish(
@@ -411,6 +452,8 @@ def _run_initial_verification(
     try:
         results = run_verifier(verifier, artifacts, rules)
         report = VerificationReport(artifacts, rules, results)
+    except _GpuOutOfMemoryError:
+        raise
     except Exception:
         failed = True
     if failed:
@@ -447,10 +490,22 @@ def _persist_artifact(
     request: GenerationRequest,
     state: JobStatus,
     clock: Callable[[], str],
+    checkpoint: Callable[[], None],
 ) -> None:
+    checkpoint()
     failed = False
     try:
         repository.put(artifact)
+    except Exception:
+        failed = True
+    if failed:
+        _record_unknown_fatal(
+            store, request.job_id, state, clock, "artifact persistence failed"
+        )
+        raise InfrastructureError("artifact persistence failed") from None
+    checkpoint()
+    failed = False
+    try:
         if repository(artifact.ref) != artifact:
             raise InfrastructureError("artifact readback mismatch")
     except Exception:
@@ -460,6 +515,7 @@ def _persist_artifact(
             store, request.job_id, state, clock, "artifact persistence failed"
         )
         raise InfrastructureError("artifact persistence failed") from None
+    checkpoint()
 
 
 def _persist_report(
@@ -468,18 +524,29 @@ def _persist_report(
     report: VerificationReport,
     store: JobStore,
     clock: Callable[[], str],
+    checkpoint: Callable[[], None],
 ) -> None:
+    reason = "verification report persistence failed"
+    checkpoint()
     failed = False
     try:
         repository.put(request, report)
+    except Exception:
+        failed = True
+    if failed:
+        _record_unknown_fatal(store, request.job_id, JobStatus.VERIFYING, clock, reason)
+        raise InfrastructureError(reason) from None
+    checkpoint()
+    failed = False
+    try:
         if repository() != report:
             raise InfrastructureError("report readback mismatch")
     except Exception:
         failed = True
     if failed:
-        reason = "verification report persistence failed"
         _record_unknown_fatal(store, request.job_id, JobStatus.VERIFYING, clock, reason)
         raise InfrastructureError(reason) from None
+    checkpoint()
 
 
 def _decision_state(status: ArtifactStatus) -> JobStatus:
@@ -545,9 +612,26 @@ def _close_repositories(repositories: tuple[Any, ...], *, quiet: bool) -> None:
         raise first
 
 
+def _close_all(
+    resources: tuple[Any, ...], first: Exception | None = None
+) -> Exception | None:
+    for resource in resources:
+        close = getattr(resource, "close", None)
+        if not callable(close):
+            continue
+        try:
+            close()
+        except Exception as error:
+            if first is None:
+                first = error
+    return first
+
+
 class _ProductionGenerationRuntime:
     __slots__ = (
         "_loaded",
+        "_load_pipeline",
+        "_allowlist",
         "_verifier_factory",
         "_report_store",
         "_artifact_store",
@@ -557,12 +641,21 @@ class _ProductionGenerationRuntime:
         "_control_builder",
         "_job_store",
         "_clock",
+        "_state_lock",
+        "_run_lock",
+        "_active_job_id",
+        "_active_cancel",
+        "_active_cancel_reason",
+        "_readiness_value",
+        "_failure_kind_value",
         "_closed",
     )
 
     def __init__(
         self,
         loaded: LoadedPipeline,
+        load_pipeline: Callable[[], LoadedPipeline],
+        allowlist: _ProductionVerificationAllowlist,
         verifier_factory: Any,
         report_store: Any,
         artifact_store: Any,
@@ -575,6 +668,8 @@ class _ProductionGenerationRuntime:
         /,
     ) -> None:
         self._loaded = loaded
+        self._load_pipeline = load_pipeline
+        self._allowlist = allowlist
         self._verifier_factory = verifier_factory
         self._report_store = report_store
         self._artifact_store = artifact_store
@@ -584,30 +679,295 @@ class _ProductionGenerationRuntime:
         self._control_builder = control_builder
         self._job_store = job_store
         self._clock = _NondecreasingAuditClock(clock)
+        self._state_lock = threading.RLock()
+        self._run_lock = threading.Lock()
+        self._active_job_id: JobId | None = None
+        self._active_cancel: threading.Event | None = None
+        self._active_cancel_reason: str | None = None
+        self._readiness_value = _RuntimeReadiness.READY
+        self._failure_kind_value: _RuntimeFailureKind | None = None
         self._closed = False
 
-    def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        factory, self._verifier_factory = self._verifier_factory, None
-        cleanup = (
-            getattr(factory, "close", None),
-            self._loaded.close,
-            self._report_store.close,
-            self._artifact_store.close,
-        )
+    @property
+    def readiness(self) -> _RuntimeReadiness:
+        with self._state_lock:
+            return self._readiness_value
+
+    @property
+    def failure_kind(self) -> _RuntimeFailureKind | None:
+        with self._state_lock:
+            return self._failure_kind_value
+
+    def _close_resources(self) -> None:
+        with self._state_lock:
+            factory, self._verifier_factory = self._verifier_factory, None
         first_error: Exception | None = None
-        for close in cleanup:
-            if not callable(close):
-                continue
-            try:
-                close()
-            except Exception as error:
-                if first_error is None:
-                    first_error = error
+        with _GPU_LEASE:
+            first_error = _close_all((factory, self._loaded), first_error)
+        first_error = _close_all(
+            (self._report_store, self._artifact_store), first_error
+        )
         if first_error is not None:
             raise first_error
+
+    def close(self) -> None:
+        if getattr(_ACTIVE_RUNTIME, "current", None) is self:
+            raise InfrastructureError("production runtime close from active run")
+        owner, done, job_id = self._begin_close()
+        if not owner:
+            done.wait()
+            return
+        first_error = self._request_close_cancel(job_id, signal_missing=True)
+        try:
+            with self._run_lock:
+                error = self._request_close_cancel(job_id, signal_missing=False)
+                if first_error is None:
+                    first_error = error
+                try:
+                    self._close_resources()
+                except Exception as error:
+                    if first_error is None:
+                        first_error = error
+            if first_error is not None:
+                raise first_error
+        finally:
+            with _CLOSE_GUARD:
+                done.set()
+                _CLOSE_DONE.pop(id(self), None)
+
+    def _begin_close(self) -> tuple[bool, threading.Event, JobId | None]:
+        with self._state_lock:
+            if self._closed:
+                with _CLOSE_GUARD:
+                    done = _CLOSE_DONE.get(id(self))
+                return False, done or _SET_EVENT, None
+            done = threading.Event()
+            with _CLOSE_GUARD:
+                _CLOSE_DONE[id(self)] = done
+            self._closed = True
+            self._readiness_value = _RuntimeReadiness.CLOSED
+            if self._active_cancel is not None:
+                self._active_cancel_reason = "runtime closed"
+            return True, done, self._active_job_id
+
+    def _publish_close_signal(self, job_id: JobId | None) -> None:
+        with self._state_lock:
+            if self._active_job_id == job_id and self._active_cancel is not None:
+                self._active_cancel_reason = "runtime closed"
+                self._active_cancel.set()
+
+    def _request_close_cancel(
+        self, job_id: JobId | None, *, signal_missing: bool
+    ) -> Exception | None:
+        if job_id is None:
+            if signal_missing:
+                self._publish_close_signal(None)
+            return None
+        try:
+            snapshot = self._job_store.get_snapshot(job_id)
+        except Exception as error:
+            return error
+        if snapshot is None:
+            if signal_missing:
+                self._publish_close_signal(job_id)
+            return None
+        try:
+            self._cancel_durable(job_id, CancelRequestedPayload("runtime closed"))
+        except DomainError as error:
+            if error.args in {("job not found",), ("job is terminal",)}:
+                if signal_missing and error.args == ("job not found",):
+                    self._publish_close_signal(job_id)
+                return None
+            return error
+        except Exception as error:
+            return error
+        self._publish_close_signal(job_id)
+        return None
+
+    def _start_run(self, request: object) -> None:
+        with self._state_lock:
+            if self._closed:
+                raise InfrastructureError("production runtime closed")
+            if self._readiness_value is _RuntimeReadiness.QUARANTINED:
+                raise InfrastructureError("production runtime quarantined")
+            if self._readiness_value is _RuntimeReadiness.BUSY:
+                raise InfrastructureError("production runtime busy")
+            if not self._run_lock.acquire(blocking=False):
+                raise InfrastructureError("production runtime busy")
+            if type(request) is not ProductionJobRequest:
+                self._run_lock.release()
+                raise DomainError("invalid production job request")
+            self._readiness_value = _RuntimeReadiness.BUSY
+            self._active_job_id = request.job_id
+            self._active_cancel = threading.Event()
+            self._active_cancel_reason = None
+
+    def _finish_run(self) -> None:
+        with self._state_lock:
+            self._active_job_id = None
+            self._active_cancel = None
+            self._active_cancel_reason = None
+            if not self._closed and self._readiness_value is _RuntimeReadiness.BUSY:
+                self._readiness_value = _RuntimeReadiness.READY
+        self._run_lock.release()
+
+    @staticmethod
+    def _cancel_terminal(state: JobState) -> JobState | None:
+        status = state.job.status
+        if status is JobStatus.CANCELLED:
+            return state
+        if status in {JobStatus.JOB_FAILED, JobStatus.COMPLETED}:
+            raise DomainError("job is terminal")
+        return None
+
+    def _cancel_durable(
+        self, job_id: JobId, payload: CancelRequestedPayload
+    ) -> JobState:
+        stalled_status: JobStatus | None = None
+        while True:
+            state = self._job_store.load(job_id)
+            terminal = self._cancel_terminal(state)
+            if terminal is not None:
+                self._mark_durable_cancel(job_id, payload.reason)
+                return terminal
+            self._mark_durable_cancel(job_id, payload.reason)
+            try:
+                _append_event(
+                    self._job_store,
+                    job_id,
+                    EventType.CANCEL_REQUESTED,
+                    state.job.status,
+                    JobStatus.CANCELLED,
+                    self._clock(),
+                    payload,
+                )
+            except DomainError:
+                if state.job.status is stalled_status:
+                    raise
+                stalled_status = state.job.status
+                continue
+            state = self._job_store.load(job_id)
+            return state
+
+    def _mark_durable_cancel(self, job_id: JobId, reason: str) -> None:
+        with self._state_lock:
+            if self._active_job_id == job_id:
+                self._active_cancel_reason = reason
+
+    def cancel(
+        self,
+        job_id: JobId,
+        /,
+        *,
+        reason: str = "user requested",
+    ) -> JobState:
+        with self._state_lock:
+            if self._closed:
+                raise InfrastructureError("production runtime closed")
+        if type(job_id) is not JobId:
+            raise DomainError("invalid production job id")
+        payload = CancelRequestedPayload(reason)
+        state = self._cancel_durable(job_id, payload)
+        with self._state_lock:
+            if self._active_job_id == job_id and self._active_cancel is not None:
+                self._active_cancel_reason = payload.reason
+                self._active_cancel.set()
+        return state
+
+    def _cancellation_won(self, job_id: JobId) -> bool:
+        with self._state_lock:
+            durable_hint = (
+                self._active_job_id == job_id and self._active_cancel_reason is not None
+            )
+        if not durable_hint:
+            return False
+        snapshot = self._job_store.get_snapshot(job_id)
+        if snapshot is None:
+            return False
+        return self._job_store.load(job_id).job.status is JobStatus.CANCELLED
+
+    def _persist_close_cancel_at_checkpoint(self, job_id: JobId) -> None:
+        with self._state_lock:
+            requested = (
+                self._closed
+                and self._active_job_id == job_id
+                and self._active_cancel is not None
+                and self._active_cancel.is_set()
+                and self._active_cancel_reason == "runtime closed"
+            )
+        if not requested or self._job_store.get_snapshot(job_id) is None:
+            return
+        try:
+            self._cancel_durable(job_id, CancelRequestedPayload("runtime closed"))
+        except DomainError as error:
+            if error.args == ("job is terminal",):
+                return
+            raise
+
+    def _checkpoint(self, job_id: JobId) -> None:
+        self._persist_close_cancel_at_checkpoint(job_id)
+        if self._cancellation_won(job_id):
+            raise DomainError("production job cancelled")
+
+    def reopen(self) -> None:
+        with self._state_lock:
+            if self._closed:
+                raise InfrastructureError("production runtime closed")
+            if self._readiness_value is not _RuntimeReadiness.QUARANTINED:
+                raise InfrastructureError("production runtime is not quarantined")
+            if not self._run_lock.acquire(blocking=False):
+                raise InfrastructureError("production runtime busy")
+        try:
+            self._reopen_under_run_lock()
+        finally:
+            self._run_lock.release()
+
+    def _reopen_under_run_lock(self) -> None:
+        loaded = factory = None
+        failure: Exception | None = None
+        with _GPU_LEASE:
+            try:
+                loaded = self._load_pipeline()
+                factory = _create_production_verifier_factory(loaded, self._allowlist)
+            except Exception as error:
+                failure = error
+            if failure is None:
+                with self._state_lock:
+                    if self._closed:
+                        failure = InfrastructureError("production runtime closed")
+                    else:
+                        self._loaded = loaded
+                        self._verifier_factory = factory
+                        self._failure_kind_value = None
+                        self._readiness_value = _RuntimeReadiness.READY
+            if failure is not None:
+                _close_all((factory, loaded))
+        if failure is not None:
+            raise failure
+
+    def run(self, request: ProductionJobRequest, /) -> ProductionJobResult:
+        self._start_run(request)
+        previous = getattr(_ACTIVE_RUNTIME, "current", None)
+        _ACTIVE_RUNTIME.current = self
+        cancelled = False
+        try:
+            try:
+                result = self._run_request(request)
+                self._checkpoint(request.job_id)
+                return result
+            except _GpuOutOfMemoryError:
+                raise
+            except Exception:
+                if self._cancellation_won(request.job_id):
+                    cancelled = True
+                else:
+                    raise
+            if cancelled:
+                raise DomainError("production job cancelled")
+            raise AssertionError("run failure must raise")
+        finally:
+            _ACTIVE_RUNTIME.current = previous
+            self._finish_run()
 
     def _open_attempt(
         self, request: GenerationRequest, plan: CompiledVerificationPlan
@@ -657,12 +1017,14 @@ class _ProductionGenerationRuntime:
             verifier,
         )
 
-    def _run_prepared_attempt(
+    def _start_prepared_job(
         self, request: ProductionJobRequest, prepared: _PreparedInitialAttempt
-    ) -> ProductionJobResult:
+    ) -> None:
+        self._checkpoint(request.job_id)
         budget = _create_initial_job(
             self._job_store, request, prepared.compiled, self._clock
         )
+        self._checkpoint(request.job_id)
         _record_attempt_start(
             self._job_store,
             request,
@@ -670,7 +1032,13 @@ class _ProductionGenerationRuntime:
             prepared.request,
             budget,
             self._clock,
+            lambda: self._checkpoint(request.job_id),
         )
+
+    def _run_prepared_attempt(
+        self, request: ProductionJobRequest, prepared: _PreparedInitialAttempt
+    ) -> ProductionJobResult:
+        self._start_prepared_job(request, prepared)
         artifact, report = self._run_attempt(
             prepared.request,
             prepared.verification_plan,
@@ -679,6 +1047,7 @@ class _ProductionGenerationRuntime:
             prepared.verifier,
             JobStatus.GENERATING,
         )
+        self._checkpoint(request.job_id)
         composed = _repair_call(
             lambda: _compose_initial_repair(prepared.request, artifact, report),
             self._job_store,
@@ -686,8 +1055,10 @@ class _ProductionGenerationRuntime:
             JobStatus.VERIFYING,
             self._clock,
         )
+        self._checkpoint(request.job_id)
         history, step = composed.history, composed.step
         if composed.selecting_decision is not None:
+            self._checkpoint(request.job_id)
             _record_verifier_decision(
                 self._job_store,
                 request.job_id,
@@ -697,6 +1068,7 @@ class _ProductionGenerationRuntime:
                 JobStatus.REPAIR_SELECTING,
                 self._clock,
             )
+            self._checkpoint(request.job_id)
             if type(step) is RepairTerminal:
                 self._record_terminal(
                     request.job_id, artifact, step, JobStatus.REPAIR_SELECTING
@@ -709,25 +1081,110 @@ class _ProductionGenerationRuntime:
     def _run_attempt(
         self, request, plan, artifact_repository, report_repository, verifier, state
     ) -> tuple[GeneratedArtifact, VerificationReport]:
-        artifact = _run_initial_generation(
-            self._loaded,
-            self._style_assets,
+        artifact = self._run_generation_phase(request, state)
+        self._checkpoint(request.job_id)
+        _persist_artifact(
+            artifact_repository,
+            artifact,
             self._job_store,
             request,
-            self._clock,
             state,
+            self._clock,
+            lambda: self._checkpoint(request.job_id),
         )
-        _persist_artifact(
-            artifact_repository, artifact, self._job_store, request, state, self._clock
-        )
+        self._checkpoint(request.job_id)
         _record_attempt_finish(self._job_store, request, artifact, self._clock(), state)
-        report = _run_initial_verification(
-            verifier, self._job_store, request, artifact, plan, self._clock
-        )
+        self._checkpoint(request.job_id)
+        report = self._run_verification_phase(verifier, request, artifact, plan)
+        self._checkpoint(request.job_id)
         _persist_report(
-            report_repository, request, report, self._job_store, self._clock
+            report_repository,
+            request,
+            report,
+            self._job_store,
+            self._clock,
+            lambda: self._checkpoint(request.job_id),
         )
+        self._checkpoint(request.job_id)
         return artifact, report
+
+    def _quarantine_under_lease(self) -> None:
+        with self._state_lock:
+            factory, self._verifier_factory = self._verifier_factory, None
+            self._failure_kind_value = _RuntimeFailureKind.GPU_OOM
+            if not self._closed:
+                self._readiness_value = _RuntimeReadiness.QUARANTINED
+        _close_all((factory, self._loaded))
+
+    def _run_generation_phase(
+        self, request: GenerationRequest, state: JobStatus
+    ) -> GeneratedArtifact:
+        self._checkpoint(request.job_id)
+        with self._state_lock:
+            cancel_event = self._active_cancel
+        artifact: GeneratedArtifact | None = None
+        failure: DomainError | InfrastructureError | None = None
+        self._checkpoint(request.job_id)
+        with _GPU_LEASE:
+            try:
+                artifact = _run_initial_generation(
+                    self._loaded,
+                    self._style_assets,
+                    self._job_store,
+                    request,
+                    self._clock,
+                    state,
+                    cancel_event,
+                )
+            except (DomainError, InfrastructureError) as error:
+                failure = error
+                if type(error) is _GpuOutOfMemoryError:
+                    self._quarantine_under_lease()
+        if failure is not None:
+            cancelled = self._cancellation_won(request.job_id)
+            oom = type(failure) is _GpuOutOfMemoryError
+            if not cancelled:
+                _record_generation_fatal(
+                    self._job_store, request, state, self._clock, oom=oom
+                )
+            raise failure
+        if artifact is None:
+            raise AssertionError("generation must return or raise")
+        self._checkpoint(request.job_id)
+        return artifact
+
+    def _run_verification_phase(
+        self,
+        verifier: Verifier,
+        request: GenerationRequest,
+        artifact: GeneratedArtifact,
+        plan: CompiledVerificationPlan,
+    ) -> VerificationReport:
+        self._checkpoint(request.job_id)
+        report: VerificationReport | None = None
+        failure: _GpuOutOfMemoryError | None = None
+        with _GPU_LEASE:
+            try:
+                report = _run_initial_verification(
+                    verifier, self._job_store, request, artifact, plan, self._clock
+                )
+            except _GpuOutOfMemoryError as error:
+                failure = error
+                self._quarantine_under_lease()
+        if failure is None:
+            if report is None:
+                raise AssertionError("verification must return or raise")
+            self._checkpoint(request.job_id)
+            return report
+        if not self._cancellation_won(request.job_id):
+            _record_generation_fatal(
+                self._job_store,
+                request,
+                JobStatus.VERIFYING,
+                self._clock,
+                oom=True,
+            )
+        raise failure
 
     def _record_terminal(self, job_id, artifact, terminal, from_state) -> None:
         if type(terminal) is not RepairTerminal:
@@ -739,6 +1196,7 @@ class _ProductionGenerationRuntime:
                 self._clock,
             )
         decision = terminal.artifact_decision
+        self._checkpoint(job_id)
         _record_verifier_decision(
             self._job_store,
             job_id,
@@ -748,8 +1206,10 @@ class _ProductionGenerationRuntime:
             _decision_state(decision.artifact_status),
             self._clock,
         )
+        self._checkpoint(job_id)
 
     def _run_repair(self, prepared, history, command):
+        self._checkpoint(command.request.job_id)
         resources = _repair_call(
             lambda: self._open_attempt(command.request, prepared.verification_plan),
             self._job_store,
@@ -759,7 +1219,9 @@ class _ProductionGenerationRuntime:
         )
         repository, report_repository, verifier = resources
         try:
+            self._checkpoint(command.request.job_id)
             self._record_repair_step(command)
+            self._checkpoint(command.request.job_id)
             artifact, report = self._run_attempt(
                 command.request,
                 prepared.verification_plan,
@@ -772,6 +1234,7 @@ class _ProductionGenerationRuntime:
             _close_repositories((report_repository, repository), quiet=True)
             raise
         _close_repositories((report_repository, repository), quiet=False)
+        self._checkpoint(command.request.job_id)
         composed = _repair_call(
             lambda: _compose_repair_result(history, command, artifact, report),
             self._job_store,
@@ -779,6 +1242,7 @@ class _ProductionGenerationRuntime:
             JobStatus.VERIFYING,
             self._clock,
         )
+        self._checkpoint(command.request.job_id)
         history, terminal = composed.history, composed.terminal
         self._record_terminal(
             command.request.job_id, artifact, terminal, JobStatus.VERIFYING
@@ -806,6 +1270,7 @@ class _ProductionGenerationRuntime:
         )
 
     def _result(self, prepared, history, terminal) -> ProductionJobResult:
+        self._checkpoint(history.current_request.job_id)
         return ProductionJobResult(
             prepared.compiled,
             prepared.graph,
@@ -818,15 +1283,11 @@ class _ProductionGenerationRuntime:
             self._job_store.load(history.current_request.job_id),
         )
 
-    def _execute_initial_attempt(
-        self, request: ProductionJobRequest, /
-    ) -> ProductionJobResult:
-        if self._closed:
-            raise InfrastructureError("production runtime closed")
-        if type(request) is not ProductionJobRequest:
-            raise DomainError("invalid production job request")
+    def _run_request(self, request: ProductionJobRequest, /) -> ProductionJobResult:
+        self._checkpoint(request.job_id)
         prepared = self._prepare_initial_attempt(request)
         try:
+            self._checkpoint(request.job_id)
             result = self._run_prepared_attempt(request, prepared)
         except Exception:
             _close_repositories(
@@ -837,6 +1298,11 @@ class _ProductionGenerationRuntime:
             (prepared.report_repository, prepared.repository), quiet=False
         )
         return result
+
+    def _execute_initial_attempt(
+        self, request: ProductionJobRequest, /
+    ) -> ProductionJobResult:
+        return self.run(request)
 
 
 def _cleanup_failed_open(
@@ -874,6 +1340,48 @@ def _validate_runtime_dependencies(
         raise DomainError("invalid production runtime dependency")
 
 
+def _bind_pipeline_loader(
+    supply: VerifiedPipelineSupply,
+    pipeline_graph: PipelineGraph,
+    environment: EnvironmentSnapshot,
+    torch_module: Any | None,
+    diffusers_module: Any | None,
+) -> Callable[[], LoadedPipeline]:
+    def load_pipeline() -> LoadedPipeline:
+        return load_production_pipeline(
+            supply,
+            pipeline_graph,
+            environment,
+            torch_module=torch_module,
+            diffusers_module=diffusers_module,
+        )
+
+    return load_pipeline
+
+
+def _open_runtime_owned_resources(
+    load_pipeline: Callable[[], LoadedPipeline],
+    allowlist: _ProductionVerificationAllowlist,
+    artifact_root_fd: int,
+) -> tuple[LoadedPipeline, Any, Any, Any]:
+    artifact_store = None
+    report_store = None
+    with _GPU_LEASE:
+        loaded = load_pipeline()
+        try:
+            verifier_factory = _create_production_verifier_factory(loaded, allowlist)
+        except Exception:
+            _cleanup_failed_open(loaded, None, None, None)
+            raise
+    try:
+        artifact_store = _open_production_artifact_store(artifact_root_fd)
+        report_store = _open_production_report_store(artifact_root_fd)
+    except Exception:
+        _cleanup_failed_open(loaded, verifier_factory, report_store, artifact_store)
+        raise
+    return loaded, verifier_factory, report_store, artifact_store
+
+
 def _open_production_generation_runtime(
     supply: VerifiedPipelineSupply,
     pipeline_graph: PipelineGraph,
@@ -893,32 +1401,23 @@ def _open_production_generation_runtime(
     _validate_runtime_dependencies(
         compiler_context, style_assets, control_builder, allowlist, job_store, clock
     )
-    loaded = load_production_pipeline(
-        supply,
-        pipeline_graph,
-        environment,
-        torch_module=torch_module,
-        diffusers_module=diffusers_module,
+    load_pipeline = _bind_pipeline_loader(
+        supply, pipeline_graph, environment, torch_module, diffusers_module
     )
-    artifact_store = None
-    report_store = None
-    verifier_factory = None
-    try:
-        verifier_factory = _create_production_verifier_factory(loaded, allowlist)
-        artifact_store = _open_production_artifact_store(artifact_root_fd)
-        report_store = _open_production_report_store(artifact_root_fd)
-        return _ProductionGenerationRuntime(
-            loaded,
-            verifier_factory,
-            report_store,
-            artifact_store,
-            environment,
-            compiler_context,
-            style_assets,
-            control_builder,
-            job_store,
-            clock,
-        )
-    except Exception:
-        _cleanup_failed_open(loaded, verifier_factory, report_store, artifact_store)
-        raise
+    loaded, verifier_factory, report_store, artifact_store = (
+        _open_runtime_owned_resources(load_pipeline, allowlist, artifact_root_fd)
+    )
+    return _ProductionGenerationRuntime(
+        loaded,
+        load_pipeline,
+        allowlist,
+        verifier_factory,
+        report_store,
+        artifact_store,
+        environment,
+        compiler_context,
+        style_assets,
+        control_builder,
+        job_store,
+        clock,
+    )

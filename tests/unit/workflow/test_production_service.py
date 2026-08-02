@@ -6,6 +6,7 @@ import ast
 import importlib
 import inspect
 import os
+import threading
 from dataclasses import fields
 from dataclasses import FrozenInstanceError
 from io import BytesIO
@@ -402,15 +403,60 @@ def test_private_factory_loads_and_owns_only_the_loaded_pipeline(
         diffusers_module=diffusers,
     )
     os.close(artifact_root_fd)
-    pipeline = runtime._loaded.borrow_pipeline()
+    initial_loaded = runtime._loaded
+    pipeline = initial_loaded.borrow_pipeline()
     owned_factory = runtime._verifier_factory
+    assert callable(runtime._load_pipeline)
+    assert runtime._allowlist is allowlist
+
+    runtime._loaded.close()
+    runtime._verifier_factory = None
+    runtime._readiness_value = module._RuntimeReadiness.QUARANTINED
+    runtime._failure_kind_value = module._RuntimeFailureKind.GPU_OOM
+    runtime.reopen()
+    reopened_loaded = runtime._loaded
+    reopened_pipeline = reopened_loaded.borrow_pipeline()
+    reopened_factory = runtime._verifier_factory
+    with pytest.raises(DomainError, match="closed"):
+        initial_loaded.borrow_pipeline()
+
+    reopened_loaded.close()
+    runtime._verifier_factory = None
+    runtime._readiness_value = module._RuntimeReadiness.QUARANTINED
+    runtime._failure_kind_value = module._RuntimeFailureKind.GPU_OOM
+    failed_loaded: list[object] = []
+    retained_load = runtime._load_pipeline
+
+    def tracked_load():
+        loaded = retained_load()
+        failed_loaded.append(loaded)
+        return loaded
+
+    primary = InfrastructureError("reopen factory failed")
+    runtime._load_pipeline = tracked_load
+    monkeypatch.setattr(
+        module,
+        "_create_production_verifier_factory",
+        lambda *_args: (_ for _ in ()).throw(primary),
+    )
+    with pytest.raises(InfrastructureError) as raised:
+        runtime.reopen()
+    assert raised.value is primary
+    assert runtime._loaded is reopened_loaded
+    assert runtime.readiness is module._RuntimeReadiness.QUARANTINED
+    assert runtime.failure_kind is module._RuntimeFailureKind.GPU_OOM
+    with pytest.raises(DomainError, match="closed"):
+        failed_loaded[0].borrow_pipeline()
 
     runtime.close()
     runtime.close()
 
-    assert issued_factories == [owned_factory]
+    assert issued_factories == [owned_factory, reopened_factory]
     assert runtime._verifier_factory is None
     assert pipeline.hooks == 1
+    assert reopened_pipeline is not pipeline
+    assert reopened_pipeline.hooks == 1
+    assert failed_loaded[0]._closed is True
     assert supply.borrow_component("base").model_id == "base"
     supply.close()
 
@@ -455,6 +501,8 @@ def test_private_factory_and_runtime_shapes_are_frozen() -> None:
     )
     assert module._ProductionGenerationRuntime.__slots__ == (
         "_loaded",
+        "_load_pipeline",
+        "_allowlist",
         "_verifier_factory",
         "_report_store",
         "_artifact_store",
@@ -464,6 +512,13 @@ def test_private_factory_and_runtime_shapes_are_frozen() -> None:
         "_control_builder",
         "_job_store",
         "_clock",
+        "_state_lock",
+        "_run_lock",
+        "_active_job_id",
+        "_active_cancel",
+        "_active_cancel_reason",
+        "_readiness_value",
+        "_failure_kind_value",
         "_closed",
     )
 
@@ -493,6 +548,8 @@ def _runtime_with_close_probes(module, events: list[str], first_error: Exception
 
     values = {
         "_loaded": Loaded(),
+        "_load_pipeline": lambda: None,
+        "_allowlist": object(),
         "_verifier_factory": Factory(),
         "_report_store": ReportStore(),
         "_artifact_store": ArtifactStore(),
@@ -502,6 +559,13 @@ def _runtime_with_close_probes(module, events: list[str], first_error: Exception
         "_control_builder": object(),
         "_job_store": object(),
         "_clock": lambda: "2026-08-01T00:00:00.000Z",
+        "_state_lock": threading.RLock(),
+        "_run_lock": threading.Lock(),
+        "_active_job_id": None,
+        "_active_cancel": None,
+        "_active_cancel_reason": None,
+        "_readiness_value": module._RuntimeReadiness.READY,
+        "_failure_kind_value": None,
         "_closed": False,
     }
     for name, value in values.items():
@@ -550,8 +614,11 @@ def test_failed_runtime_open_cleanup_uses_runtime_ownership_order() -> None:
 
 def test_execute_after_close_fails_before_validating_the_request() -> None:
     module = _request_type()[0]
-    runtime = object.__new__(module._ProductionGenerationRuntime)
+    runtime = _runtime_with_close_probes(
+        module, [], InfrastructureError("unused close failure")
+    )
     runtime._closed = True
+    runtime._readiness_value = module._RuntimeReadiness.CLOSED
 
     with pytest.raises(InfrastructureError, match="^production runtime closed$"):
         runtime._execute_initial_attempt(object())
@@ -765,6 +832,8 @@ def _flow_runtime(
         report_repository = _FlowReportRepository(events)
     values = {
         "_loaded": object(),
+        "_load_pipeline": lambda: None,
+        "_allowlist": object(),
         "_verifier_factory": factory,
         "_artifact_store": _FlowArtifactStore(events, repository),
         "_report_store": _FlowReportStore(events, report_repository),
@@ -774,6 +843,13 @@ def _flow_runtime(
         "_control_builder": object(),
         "_job_store": _FlowJobStore(events, state),
         "_clock": lambda: "2026-08-01T00:00:00.000Z",
+        "_state_lock": threading.RLock(),
+        "_run_lock": threading.Lock(),
+        "_active_job_id": None,
+        "_active_cancel": None,
+        "_active_cancel_reason": None,
+        "_readiness_value": module._RuntimeReadiness.READY,
+        "_failure_kind_value": None,
         "_closed": False,
     }
     for name, value in values.items():
@@ -1109,6 +1185,9 @@ class _VerificationEventStore:
     def append_event(self, _job_id: JobId, event: object) -> None:
         self.events.append(event)
 
+    def get_snapshot(self, _job_id: JobId, /) -> None:
+        return None
+
 
 def test_verification_report_preserves_exact_artifact_rules_and_results() -> None:
     module = _request_type()[0]
@@ -1227,6 +1306,11 @@ def test_repair_step_event_failure_closes_both_child_repositories_without_maskin
     runtime = object.__new__(module._ProductionGenerationRuntime)
     runtime._job_store = _VerificationEventStore()
     runtime._clock = lambda: "2026-08-01T00:00:00.000Z"
+    runtime._state_lock = threading.RLock()
+    runtime._active_job_id = None
+    runtime._active_cancel = None
+    runtime._active_cancel_reason = None
+    runtime._closed = False
     error = InfrastructureError("repair step event failure")
     request = SimpleNamespace(job_id=JobId("job-1"))
     command = SimpleNamespace(request=request)
