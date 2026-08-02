@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import importlib
-import importlib.metadata
 import json
+import os
 import platform
 import re
+import stat
 from dataclasses import dataclass
 from typing import Literal, Protocol, TypeAlias, runtime_checkable
 
@@ -46,6 +47,9 @@ _PATH_TEXT = re.compile(
     re.ASCII,
 )
 _FORWARD_UNC = re.compile(r"(?:^|[\x20='\"(\[{},;])//[^/\x00-\x20]+/", re.ASCII)
+_ROCM_RELEASE = re.compile(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\n?")
+_ROCM_VERSION_PATH = "/opt/rocm/.info/version"
+_ROCM_VERSION_MAX_BYTES = 128
 
 
 def _status(status: object, value: object, reason: object, validator: object) -> None:
@@ -248,13 +252,13 @@ class DefaultEnvironmentProbe:
         return platform.python_version()
 
     def rocm_version(self) -> str | None:
-        return None
+        return _read_rocm_release()
 
     def pytorch_version(self) -> str | None:
-        return _package_version("torch")
+        return importlib.import_module("torch").__version__
 
     def diffusers_version(self) -> str | None:
-        return _package_version("diffusers")
+        return importlib.import_module("diffusers").__version__
 
     def hip_version(self) -> str | None:
         return importlib.import_module("torch").version.hip
@@ -281,11 +285,40 @@ class DefaultEnvironmentProbe:
         )
 
 
-def _package_version(name: str) -> str | None:
+def _read_rocm_release() -> str | None:
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
     try:
-        return importlib.metadata.version(name)
-    except importlib.metadata.PackageNotFoundError:
+        file_fd = os.open(_ROCM_VERSION_PATH, flags)
+    except (OSError, ValueError):
         return None
+    try:
+        before = os.fstat(file_fd)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or not 1 <= before.st_size <= _ROCM_VERSION_MAX_BYTES
+        ):
+            return None
+        payload = os.read(file_fd, before.st_size + 1)
+        after = os.fstat(file_fd)
+        if (
+            len(payload) != before.st_size
+            or before.st_dev != after.st_dev
+            or before.st_ino != after.st_ino
+            or before.st_size != after.st_size
+            or before.st_mtime_ns != after.st_mtime_ns
+            or before.st_ctime_ns != after.st_ctime_ns
+        ):
+            return None
+        decoded = payload.decode("ascii", errors="strict")
+        match = _ROCM_RELEASE.fullmatch(decoded)
+        return None if match is None else decoded.rstrip("\n")
+    except (OSError, UnicodeDecodeError, AttributeError, ValueError):
+        return None
+    finally:
+        try:
+            os.close(file_fd)
+        except OSError:
+            pass
 
 
 def _text_probe(

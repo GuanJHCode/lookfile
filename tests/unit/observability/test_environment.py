@@ -4,11 +4,15 @@ from dataclasses import FrozenInstanceError
 import os
 import socket
 import subprocess
+from pathlib import Path
+import stat
+from types import SimpleNamespace
 
 import pytest
 
 from specstyle.errors import DomainError
 from specstyle.observability.environment import (
+    DefaultEnvironmentProbe,
     DeviceInventory,
     DeviceSnapshot,
     EnvironmentSnapshot,
@@ -19,6 +23,7 @@ from specstyle.observability.environment import (
     environment_to_primitive,
     hash_environment,
 )
+import specstyle.observability.environment as environment_module
 
 
 class FakeProbe:
@@ -379,3 +384,96 @@ def test_capture_default_probe_does_not_need_shell_network_or_environment(
     assert snapshot.schema_version == "1.0"
     assert snapshot.os_name.status in {"AVAILABLE", "UNAVAILABLE"}
     assert snapshot.hip_devices.status in {"AVAILABLE", "UNAVAILABLE"}
+
+
+def test_default_probe_reads_rocm_only_from_fixed_regular_release_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    evidence = tmp_path / "version"
+    evidence.write_bytes(b"7.2.1\n")
+    real_open = os.open
+
+    def open_evidence(path: str, flags: int) -> int:
+        assert path == "/opt/rocm/.info/version"
+        assert flags & os.O_NOFOLLOW
+        return real_open(evidence, flags)
+
+    monkeypatch.setattr(environment_module.os, "open", open_evidence)
+
+    assert DefaultEnvironmentProbe().rocm_version() == "7.2.1"
+
+
+@pytest.mark.parametrize(
+    "evidence",
+    [b"7.2\n", b"release 7.2.1\n", b"7.2.1\n7.2.2\n", b"7.2.1-123\n"],
+)
+def test_default_probe_rejects_ambiguous_rocm_release_evidence(
+    evidence: bytes, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    evidence_path = tmp_path / "version"
+    evidence_path.write_bytes(evidence)
+    real_open = os.open
+    monkeypatch.setattr(
+        environment_module.os,
+        "open",
+        lambda _path, flags: real_open(evidence_path, flags),
+    )
+    assert DefaultEnvironmentProbe().rocm_version() is None
+
+
+def test_default_probe_requires_bounded_regular_rocm_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_open = os.open
+    target = tmp_path
+    monkeypatch.setattr(
+        environment_module.os, "open", lambda _path, flags: real_open(target, flags)
+    )
+    assert stat.S_ISDIR(target.stat().st_mode)
+    assert DefaultEnvironmentProbe().rocm_version() is None
+
+    target = tmp_path / "version"
+    target.write_bytes(b"7.2.1" + b" " * 128)
+    assert DefaultEnvironmentProbe().rocm_version() is None
+
+
+def test_default_probe_reports_none_when_rocm_evidence_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def missing(*_args: object, **_kwargs: object) -> int:
+        raise FileNotFoundError
+
+    monkeypatch.setattr(environment_module.os, "open", missing)
+    assert DefaultEnvironmentProbe().rocm_version() is None
+
+
+def test_default_probe_uses_versions_from_imported_packages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    modules = {
+        "torch": SimpleNamespace(
+            __version__="2.9.0+rocm7.2.1", version=SimpleNamespace(hip="7.2.1")
+        ),
+        "diffusers": SimpleNamespace(__version__="0.35.1"),
+    }
+    monkeypatch.setattr(
+        environment_module.importlib, "import_module", lambda name: modules[name]
+    )
+    probe = DefaultEnvironmentProbe()
+    assert probe.pytorch_version() == "2.9.0+rocm7.2.1"
+    assert probe.diffusers_version() == "0.35.1"
+    assert probe.hip_version() == "7.2.1"
+
+
+def test_capture_environment_isolates_imported_package_version_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def broken_import(_name: str) -> object:
+        raise ImportError("package unavailable")
+
+    monkeypatch.setattr(environment_module.importlib, "import_module", broken_import)
+    snapshot = capture_environment(DefaultEnvironmentProbe())
+    assert snapshot.pytorch_version.reason == "PROBE_FAILED"
+    assert snapshot.diffusers_version.reason == "PROBE_FAILED"
+    assert snapshot.hip_version.reason == "NOT_INSTALLED"
