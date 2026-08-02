@@ -157,6 +157,73 @@ def test_request_and_result_are_the_only_public_frozen_slotted_surfaces() -> Non
         request.bundle_name = "other"
 
 
+def test_prepare_export_builds_one_approved_xhs_item_without_expanding_public_api(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module, request_type = _request_type()
+    from specstyle.reliability.fixtures import sample_approved_export_request
+    from specstyle.workflow.job_models import Job, JobBudget, JobState, JobStatus
+
+    prepared = sample_approved_export_request()
+    item = prepared.cohorts[0].items[0]
+    generation_request = item.history.current_request
+    job_request = request_type(
+        generation_request.job_id,
+        generation_request.compiled_spec.source_spec.model_dump_json(),
+        generation_request.source,
+        generation_request.style_references,
+        generation_request.prompt,
+        generation_request.output_profile,
+        generation_request.variation_index,
+        "bundle",
+    )
+    job = Job(
+        generation_request.job_id,
+        generation_request.compiled_spec.compiled_spec_hash,
+        (generation_request.output_profile,),
+        JobBudget(2),
+        JobStatus.APPROVED,
+        "2026-08-02T00:00:00.000Z",
+        "2026-08-02T00:00:01.000Z",
+    )
+    result = module.ProductionJobResult(
+        generation_request.compiled_spec,
+        generation_request.compiled_spec.production_graphs[0],
+        generation_request.compiled_spec.verification_plans[0],
+        generation_request,
+        item.history.current_artifact,
+        item.history.current_report,
+        item.history,
+        item.terminal,
+        JobState(job, 5, (generation_request.attempt_id,), ()),
+    )
+    runtime = object.__new__(module._ProductionGenerationRuntime)
+    runtime._environment = prepared.environment
+    from specstyle.reliability.fixtures import sample_compiler_context
+
+    runtime._compiler_context = sample_compiler_context()
+    monkeypatch.setattr(
+        module,
+        "_select_initial_contract",
+        lambda *_args: (
+            result.compiled,
+            result.graph,
+            result.verification_plan,
+        ),
+    )
+
+    command = runtime.prepare_export(job_request, result, prepared.asset_credits)
+
+    assert module.__all__ == ("ProductionJobRequest", "ProductionJobResult")
+    assert command.job_id == generation_request.job_id
+    assert command.bundle_name == "bundle"
+    assert len(command.export_request.cohorts) == 1
+    cohort = command.export_request.cohorts[0]
+    assert cohort.output_profile == "xhs_grid"
+    assert len(cohort.items) == 1
+    assert cohort.items[0].sequence_index is None
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [

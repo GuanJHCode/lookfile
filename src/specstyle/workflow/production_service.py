@@ -70,6 +70,10 @@ from specstyle.workflow.job_models import (
 )
 from specstyle.workflow.job_store import JobStore
 from specstyle.workflow.production_artifacts import _open_production_artifact_store
+from specstyle.workflow.production_export import (
+    ProductionExportCommand,
+    _prepare_production_export_command,
+)
 from specstyle.workflow.production_repair import (
     _compose_initial_repair,
     _compose_repair_result,
@@ -169,6 +173,24 @@ class ProductionJobResult:
     history: RepairHistory
     terminal: RepairTerminal
     job_state: JobState
+
+
+def _rebuild_production_job_request(value: object) -> ProductionJobRequest:
+    if type(value) is not ProductionJobRequest:
+        raise DomainError("invalid production export") from None
+    try:
+        return ProductionJobRequest(
+            value.job_id,
+            value.spec_text,
+            value.source,
+            value.style_references,
+            value.prompt,
+            value.output_profile,
+            value.variation_index,
+            value.bundle_name,
+        )
+    except Exception:
+        raise DomainError("invalid production export") from None
 
 
 @dataclass(frozen=True, slots=True)
@@ -697,6 +719,21 @@ class _ProductionGenerationRuntime:
     def failure_kind(self) -> _RuntimeFailureKind | None:
         with self._state_lock:
             return self._failure_kind_value
+
+    def prepare_export(
+        self,
+        request: ProductionJobRequest,
+        result: ProductionJobResult,
+        asset_credits: tuple[Any, ...],
+        /,
+    ) -> ProductionExportCommand:
+        if type(result) is not ProductionJobResult:
+            raise DomainError("invalid production export") from None
+        request = _rebuild_production_job_request(request)
+        recompiled = _select_initial_contract(request, self._compiler_context)
+        return _prepare_production_export_command(
+            request, result, self._environment, asset_credits, recompiled
+        )
 
     def _close_resources(self) -> None:
         with self._state_lock:
