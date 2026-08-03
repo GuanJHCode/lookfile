@@ -22,13 +22,29 @@ The following path has been exercised on an AMD Radeon ROCm 7.2.1 runtime:
 2. Upload one source image, one style reference, and one Style Spec through the
    authenticated Gradio application.
 3. Run a production job or a sequential two-to-four variation batch.
-4. Display approved and rejected outputs, QA rows, deterministic seed evidence,
-   and the published bundle digest.
+4. Observe live persisted job status, request cancellation, and display approved
+   and rejected outputs, QA rows, deterministic seed evidence, and the published
+   bundle digest.
 
-The AMD validation snapshot used PyTorch `2.9.1+gitff65f5b` with HIP
-`7.2.53211-e1a6bc5663`, Diffusers `0.39.0`, and candidate commit `ec1e27d`.
-A two-item engineering smoke completed with distinct deterministic seeds and
-distinct artifact hashes. It is not a calibrated perceptual-diversity result.
+The current AMD candidate is `f0d258d`. It serves 49 Gradio components on the
+isolated candidate port and passed 846 affected AMD tests with one capability
+skip, plus repository-configured Ruff check and format gates. The stable
+`1a1af45` service remained online during candidate validation.
+
+The Radeon runtime used PyTorch `2.9.1+gitff65f5b` with HIP
+`7.2.53211-e1a6bc5663` and Diffusers `0.39.0`. Real GPU evidence was collected
+on the following commits, all of which are ancestors of the current candidate:
+
+- `a3832be`: one interactive job traversed `OPENING`, `GENERATING`,
+  `VERIFYING`, `CLEANUP`, and `COMPLETED`; controls stayed responsive during
+  generation. A separate real job was cancelled during `GENERATING` and
+  published no bundle.
+- `ec1e27d`: a two-item engineering smoke completed with distinct deterministic
+  seeds and artifact hashes. This proves batch wiring, not calibrated
+  perceptual diversity.
+- `ec1e27d`: two new synthetic source materials reused the same Spec, style
+  reference, compiler graph, rules, and environment and both completed. This is
+  new-material contract reuse, not same-input semantic replay.
 
 ## Known submission gaps
 
@@ -38,9 +54,9 @@ distinct artifact hashes. It is not a calibrated perceptual-diversity result.
   placeholder calibration evidence. No universal L2 threshold is claimed.
 - No calibrated L3 domain plugin is enabled. `NOT_APPLICABLE` and
   `UNVERIFIABLE` are not presented as `PASS`.
-- A real failure-to-repair-to-reverification Radeon comparison, second-material
-  replay evidence, five-arm equal-budget ablation, and blind human evaluation
-  are still required for the full competition claim.
+- A real failure-to-repair-to-reverification Radeon comparison, same-input
+  semantic replay evidence, five-arm equal-budget ablation, and blind human
+  evaluation are still required for the full competition claim.
 - The current production upload contract accepts `xhs_grid`; the other output
   profiles are not yet productized.
 
