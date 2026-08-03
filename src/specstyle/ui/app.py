@@ -46,25 +46,31 @@ class UiServices:
     get_repair_timeline: Callable[[], str] | None = None
     get_export_summary: Callable[[], str] | None = None
     run_replay: Callable[[], str] | None = None
-    run_production_job: Callable[
-        [object, object, object, str, str, str | None, str | None, str | None, str],
-        ProductionRunUiView,
-    ] | None = None
-    run_production_batch: Callable[
-        [
-            object,
-            object,
-            object,
-            str,
-            str,
-            str | None,
-            str | None,
-            str | None,
-            str,
-            int,
-        ],
-        ProductionBatchUiView,
-    ] | None = None
+    run_production_job: (
+        Callable[
+            [object, object, object, str, str, str | None, str | None, str | None, str],
+            ProductionRunUiView,
+        ]
+        | None
+    ) = None
+    run_production_batch: (
+        Callable[
+            [
+                object,
+                object,
+                object,
+                str,
+                str,
+                str | None,
+                str | None,
+                str | None,
+                str,
+                int,
+            ],
+            ProductionBatchUiView,
+        ]
+        | None
+    ) = None
 
 
 def build_default_services(context: object) -> UiServices:
@@ -145,6 +151,18 @@ def bind_job_result_services(
         run_production_job=base.run_production_job,
         run_production_batch=base.run_production_batch,
     )
+
+
+def _production_event_options(kind: str) -> dict[str, object]:
+    if kind == "run":
+        return {"concurrency_id": "production-run", "concurrency_limit": 2}
+    if kind == "control":
+        return {"concurrency_id": "production-control", "concurrency_limit": 4}
+    raise DomainError("invalid production event kind")
+
+
+def _enable_production_queue(app: Any) -> Any:
+    return app.queue(default_concurrency_limit=1)
 
 
 def create_app(services: UiServices) -> Any:
@@ -313,6 +331,7 @@ def create_app(services: UiServices) -> Any:
                     consent,
                 ],
                 outputs=[run_status, approved_gallery, rejected_gallery, run_qa],
+                **_production_event_options("run"),
             )
             batch_count = gr.Slider(
                 minimum=2,
@@ -345,20 +364,45 @@ def create_app(services: UiServices) -> Any:
                     batch_rejected,
                     batch_evidence,
                 ],
+                **_production_event_options("run"),
             )
             status_out = gr.Textbox(label="Job status (preview|production labeled)")
-            gr.Button("Refresh status").click(on_status, outputs=[status_out])
-            gr.Button("Cancel job").click(on_cancel, outputs=[status_out])
+            gr.Button("Refresh status").click(
+                on_status,
+                outputs=[status_out],
+                **_production_event_options("control"),
+            )
+            gr.Button("Cancel job").click(
+                on_cancel,
+                outputs=[status_out],
+                **_production_event_options("control"),
+            )
             qa_out = gr.Textbox(label="QA table (UNVERIFIABLE not green PASS)")
-            gr.Button("Refresh QA").click(on_qa, outputs=[qa_out])
+            gr.Button("Refresh QA").click(
+                on_qa,
+                outputs=[qa_out],
+                **_production_event_options("control"),
+            )
         with gr.Tab("Repair / Export / Replay (UI-003)"):
             repair_out = gr.Textbox(label="Repair timeline")
-            gr.Button("Repair timeline").click(on_repair, outputs=[repair_out])
+            gr.Button("Repair timeline").click(
+                on_repair,
+                outputs=[repair_out],
+                **_production_event_options("control"),
+            )
             export_out = gr.Textbox(label="Export summary")
-            gr.Button("Export summary").click(on_export, outputs=[export_out])
+            gr.Button("Export summary").click(
+                on_export,
+                outputs=[export_out],
+                **_production_event_options("control"),
+            )
             replay_out = gr.Textbox(label="Replay assessment")
-            gr.Button("Replay").click(on_replay, outputs=[replay_out])
-    return demo
+            gr.Button("Replay").click(
+                on_replay,
+                outputs=[replay_out],
+                **_production_event_options("control"),
+            )
+    return _enable_production_queue(demo)
 
 
 def launch_app(services: UiServices, **kwargs: object) -> Any:

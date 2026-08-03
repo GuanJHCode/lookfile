@@ -16,11 +16,30 @@ from pathlib import Path
 import shutil
 import stat
 import tempfile
-import threading
 
 from specstyle.errors import DomainError, InfrastructureError
+from specstyle.domain.identifiers import JobId
 from specstyle.ui.app import UiServices
-from specstyle.ui.presenters import format_qa_table, present_qa_report
+from specstyle.ui.production_ui_projection import (
+    batch_busy as _batch_busy,
+    batch_failure as _batch_failure,
+    batch_projection as _batch_projection,
+    batch_view as _batch_view,
+    busy as _busy,
+    cancelled as _cancelled,
+    cancelled_batch_item as _cancelled_batch_item,
+    failed_batch_item as _failed_batch_item,
+    failure as _failure,
+    failure_projection as _failure_projection,
+    projection_with_message as _projection_with_message,
+    successful_batch_item as _successful_batch_item,
+    status_projection as _status_projection,
+    terminal_projection as _terminal_projection,
+)
+from specstyle.ui.production_ui_state import (
+    ProductionTerminalProjection,
+    ProductionUiState,
+)
 from specstyle.ui.view_models import (
     ProductionBatchItemUiView,
     ProductionBatchUiView,
@@ -32,9 +51,25 @@ from specstyle.workflow.run_one import (
     open_production_run_one,
     reserve_production_run_one,
 )
+from specstyle.workflow.job_store import JobStore
 from specstyle.workflow.production_job_input import (
     validate_production_job_spec_text,
 )
+
+
+def _read_persisted_job_status(state_root: Path, job_id: str) -> str | None:
+    store = JobStore(state_root)
+    try:
+        try:
+            state = store.load(JobId(job_id))
+        except DomainError as exc:
+            if str(exc) == "job not found":
+                return None
+            raise
+        return state.job.status.value
+    finally:
+        store.close()
+
 
 _METADATA_VERSION = "specstyle.production.job_input.v1"
 _PROMPT_TEMPLATE_ID = "ui-prompt-template"
@@ -72,6 +107,10 @@ class _UiRunInputError(DomainError):
     pass
 
 
+def _safe_message(value: object) -> str:
+    return str(value).replace("\t", " ").replace("\r", " ").replace("\n", " ")[:160]
+
+
 def bind_production_run_one_services(
     base: UiServices,
     paths: ProductionUiRuntimePaths,
@@ -83,7 +122,9 @@ def bind_production_run_one_services(
 ) -> UiServices:
     if type(base) is not UiServices or type(paths) is not ProductionUiRuntimePaths:
         raise DomainError("invalid production ui services")
-    active_run = threading.Lock()
+    ui_state = ProductionUiState(
+        lambda job_id: _read_persisted_job_status(paths.state_root, job_id)
+    )
 
     def run(
         source: object,
@@ -96,10 +137,11 @@ def bind_production_run_one_services(
         attribution: str | None,
         consent: str,
     ) -> ProductionRunUiView:
-        if not active_run.acquire(blocking=False):
+        token = ui_state.try_begin("single", 1)
+        if token is None:
             return _busy()
         try:
-            return _run(
+            projection = _run(
                 paths,
                 reserve,
                 open_run_one,
@@ -112,9 +154,14 @@ def bind_production_run_one_services(
                 license_,
                 attribution,
                 consent,
+                ui_state,
+                token,
             )
-        finally:
-            active_run.release()
+            ui_state.finish(token, projection)
+            return projection.run_view
+        except BaseException:
+            ui_state.abandon(token)
+            raise
 
     def run_batch(
         source: object,
@@ -128,10 +175,11 @@ def bind_production_run_one_services(
         consent: str,
         count: int,
     ) -> ProductionBatchUiView:
-        if not active_run.acquire(blocking=False):
+        token = ui_state.try_begin("batch", count if type(count) is int else 1)
+        if token is None:
             return _batch_busy()
         try:
-            return _run_batch(
+            view = _run_batch(
                 paths,
                 reserve,
                 open_run_one,
@@ -145,18 +193,26 @@ def bind_production_run_one_services(
                 attribution,
                 consent,
                 count,
+                ui_state,
+                token,
             )
-        finally:
-            active_run.release()
+            ui_state.finish(
+                token,
+                _batch_projection(view, ui_state.item_projections(token)),
+            )
+            return view
+        except BaseException:
+            ui_state.abandon(token)
+            raise
 
     return UiServices(
         base.compile_spec,
-        get_job_status=base.get_job_status,
-        cancel_job=base.cancel_job,
-        get_qa_table=base.get_qa_table,
-        get_repair_timeline=base.get_repair_timeline,
-        get_export_summary=base.get_export_summary,
-        run_replay=base.run_replay,
+        get_job_status=ui_state.get_job_status,
+        cancel_job=ui_state.cancel_job,
+        get_qa_table=ui_state.get_qa_table,
+        get_repair_timeline=ui_state.get_repair_timeline,
+        get_export_summary=ui_state.get_export_summary,
+        run_replay=ui_state.run_replay,
         run_production_job=run,
         run_production_batch=run_batch,
     )
@@ -175,10 +231,13 @@ def _run(
     license_: str | None,
     attribution: str | None,
     consent: str,
-) -> ProductionRunUiView:
+    ui_state: ProductionUiState,
+    token: int,
+) -> ProductionTerminalProjection:
     job_id = ""
     staged: _StagedInputs | None = None
     try:
+        ui_state.set_phase(token, "STAGING")
         staged = _stage_inputs(
             paths,
             source,
@@ -193,13 +252,17 @@ def _run(
         )
         reservation = reserve()
         job_id = getattr(getattr(reservation, "job_id", None), "value", "")
-        return _execute(paths, staged, reservation, open_run_one)
+        ui_state.set_phase(token, "RESERVED", job_id=job_id)
+        if ui_state.is_cancel_requested(token):
+            return _failure_projection(_cancelled(job_id))
+        ui_state.set_phase(token, "OPENING", job_id=job_id)
+        return _execute(paths, staged, reservation, open_run_one, ui_state, token)
     except _UiRunInputError as exc:
-        return _failure(job_id, str(exc))
+        return _failure_projection(_failure(job_id, _safe_message(exc)))
     except (DomainError, InfrastructureError) as exc:
-        return _failure(job_id, str(exc))
+        return _failure_projection(_failure(job_id, _safe_message(exc)))
     except Exception:
-        return _failure(job_id, "internal error")
+        return _failure_projection(_failure(job_id, "internal error"))
     finally:
         if staged is not None:
             _cleanup_staging(staged.directory)
@@ -219,32 +282,66 @@ def _run_batch(
     attribution: str | None,
     consent: str,
     count: int,
+    ui_state: ProductionUiState,
+    token: int,
 ) -> ProductionBatchUiView:
     if type(count) is not int or not 2 <= count <= 4:
         return _batch_failure("batch count must be an exact int from 2 to 4")
     staged: _StagedInputs | None = None
     try:
+        ui_state.set_phase(token, "STAGING")
         staged = _stage_inputs(
-            paths, source, style, spec, positive, negative,
-            source_url, license_, attribution, consent,
+            paths,
+            source,
+            style,
+            spec,
+            positive,
+            negative,
+            source_url,
+            license_,
+            attribution,
+            consent,
         )
         stride = staged.max_rounds + 1
-        items = tuple(
-            _reserve_batch_item(
-                paths, staged, reserve, open_run_one, index, index * stride
+        items: list[ProductionBatchItemUiView] = []
+        for index in range(count):
+            if ui_state.is_cancel_requested(token):
+                break
+            ui_state.set_phase(token, "STAGING", job_id="", current_index=index)
+            outcome = _reserve_batch_item(
+                paths,
+                staged,
+                reserve,
+                open_run_one,
+                index,
+                index * stride,
+                ui_state,
+                token,
             )
-            for index in range(count)
-        )
-        return _batch_view(items)
+            items.append(outcome.item)
+            ui_state.add_item_projection(token, outcome.projection)
+            if ui_state.is_cancel_requested(token):
+                break
+        return _batch_view(tuple(items))
     except _UiRunInputError as exc:
-        return _batch_failure(str(exc))
+        return _batch_failure(_safe_message(exc))
     except (DomainError, InfrastructureError) as exc:
-        return _batch_failure(str(exc))
+        return _batch_failure(_safe_message(exc))
     except Exception:
         return _batch_failure("internal error")
     finally:
         if staged is not None:
             _cleanup_staging(staged.directory)
+
+
+@dataclass(frozen=True, slots=True)
+class _BatchItemOutcome:
+    item: ProductionBatchItemUiView
+    projection: ProductionTerminalProjection
+
+
+def _item_outcome(item: ProductionBatchItemUiView) -> _BatchItemOutcome:
+    return _BatchItemOutcome(item, _failure_projection(item.run))
 
 
 def _reserve_batch_item(
@@ -254,17 +351,35 @@ def _reserve_batch_item(
     open_run_one: Callable[[ProductionRunOneFds, object], object],
     item_index: int,
     requested_variation: int,
-) -> ProductionBatchItemUiView:
+    ui_state: ProductionUiState,
+    token: int,
+) -> _BatchItemOutcome:
     try:
         reservation = reserve(requested_variation)
         job_id = getattr(getattr(reservation, "job_id", None), "value", "")
+        ui_state.set_phase(token, "RESERVED", job_id=job_id, current_index=item_index)
+        if ui_state.is_cancel_requested(token):
+            return _item_outcome(
+                _cancelled_batch_item(item_index, requested_variation, job_id)
+            )
     except (DomainError, InfrastructureError) as exc:
-        return _failed_batch_item(item_index, requested_variation, "", str(exc))
+        return _item_outcome(
+            _failed_batch_item(item_index, requested_variation, "", _safe_message(exc))
+        )
     except Exception:
-        return _failed_batch_item(item_index, requested_variation, "", "internal error")
+        return _item_outcome(
+            _failed_batch_item(item_index, requested_variation, "", "internal error")
+        )
     return _execute_batch_item(
-        paths, staged, reservation, open_run_one,
-        item_index, requested_variation, job_id,
+        paths,
+        staged,
+        reservation,
+        open_run_one,
+        item_index,
+        requested_variation,
+        job_id,
+        ui_state,
+        token,
     )
 
 
@@ -276,55 +391,101 @@ def _execute_batch_item(
     item_index: int,
     requested_variation: int,
     job_id: str,
-) -> ProductionBatchItemUiView:
+    ui_state: ProductionUiState,
+    token: int,
+) -> _BatchItemOutcome:
     try:
+        ui_state.set_phase(token, "OPENING", job_id=job_id, current_index=item_index)
         with _OpenFds(paths, staged) as fds:
             execution = open_run_one(fds, reservation)
     except (DomainError, InfrastructureError) as exc:
-        return _failed_batch_item(item_index, requested_variation, job_id, str(exc))
+        return _item_outcome(
+            _failed_batch_item(
+                item_index, requested_variation, job_id, _safe_message(exc)
+            )
+        )
     except Exception:
-        return _failed_batch_item(item_index, requested_variation, job_id, "internal error")
+        return _item_outcome(
+            _failed_batch_item(
+                item_index, requested_variation, job_id, "internal error"
+            )
+        )
+    pending_cancel = ui_state.register_execution(token, execution)
+    if pending_cancel:
+        ui_state.cancel_registered_execution(token)
     try:
         result = execution.run()
     except BaseException as primary:
-        _ignored, cleanup_error = _close_batch_execution(execution)
+        _ignored, cleanup_error = _close_single_execution(ui_state, token, execution)
         if not isinstance(primary, Exception):
             if cleanup_error is not None:
                 primary.add_note("production batch item cleanup failed")
             raise
-        message = str(primary) if isinstance(primary, (DomainError, InfrastructureError)) else "internal error"
-        return _failed_batch_item(
-            item_index, requested_variation, job_id, message, cleanup_error
+        if isinstance(primary, DomainError) and ui_state.is_cancel_requested(token):
+            return _item_outcome(
+                _cancelled_batch_item(
+                    item_index, requested_variation, job_id, cleanup_error
+                )
+            )
+        message = (
+            _safe_message(primary)
+            if isinstance(primary, (DomainError, InfrastructureError))
+            else "internal error"
         )
-    cleanup_result, cleanup_error = _close_batch_execution(execution)
+        return _item_outcome(
+            _failed_batch_item(
+                item_index, requested_variation, job_id, message, cleanup_error
+            )
+        )
+    ui_state.set_phase(token, "RESULT_READY", job_id=job_id, current_index=item_index)
+    cleanup_result, cleanup_error = _close_single_execution(ui_state, token, execution)
     if cleanup_error is not None and cleanup_result is None:
-        return _failed_batch_item(
-            item_index, requested_variation, job_id, cleanup_error, cleanup_error
+        return _item_outcome(
+            _failed_batch_item(
+                item_index,
+                requested_variation,
+                job_id,
+                cleanup_error,
+                cleanup_error,
+            )
         )
     result = cleanup_result if cleanup_result is not None else result
     try:
-        return _successful_batch_item(
-            paths.export_root, result, item_index, requested_variation,
-            staged.max_rounds, job_id, cleanup_error,
+        projection = _terminal_projection(paths.export_root, result, job_id)
+        item = _successful_batch_item(
+            paths.export_root,
+            result,
+            item_index,
+            requested_variation,
+            staged.max_rounds,
+            job_id,
+            cleanup_error,
         )
+        if cleanup_error is not None:
+            projection = _projection_with_message(
+                projection, "production run completed; cleanup failed"
+            )
+        return _BatchItemOutcome(item, projection)
     except (DomainError, InfrastructureError) as exc:
-        return _failed_batch_item(
-            item_index, requested_variation, job_id, str(exc), cleanup_error
+        return _item_outcome(
+            _failed_batch_item(
+                item_index,
+                requested_variation,
+                job_id,
+                _safe_message(exc),
+                cleanup_error,
+            )
         )
     except Exception:
-        return _failed_batch_item(
-            item_index, requested_variation, job_id, "internal error", cleanup_error
+        return _item_outcome(
+            _failed_batch_item(
+                item_index,
+                requested_variation,
+                job_id,
+                "internal error",
+                cleanup_error,
+            )
         )
-
-
-def _close_batch_execution(execution: object) -> tuple[object | None, str | None]:
-    try:
-        execution.close()
-    except ProductionRunOneCleanupError as exc:
-        return exc.result, str(exc)
-    except Exception:
-        return None, "internal cleanup error"
-    return None, None
 
 
 @dataclass(frozen=True, slots=True)
@@ -474,15 +635,62 @@ def _execute(
     staged: _StagedInputs,
     reservation: object,
     open_run_one: Callable[[ProductionRunOneFds, object], object],
-) -> ProductionRunUiView:
+    ui_state: ProductionUiState,
+    token: int,
+) -> ProductionTerminalProjection:
     job_id = getattr(getattr(reservation, "job_id", None), "value", "")
     with _OpenFds(paths, staged) as fds:
         execution = open_run_one(fds, reservation)
+    pending_cancel = ui_state.register_execution(token, execution)
+    if pending_cancel:
+        ui_state.cancel_registered_execution(token)
     try:
         result = execution.run()
-    finally:
-        execution.close()
-    return _view(paths.export_root, result, job_id)
+    except BaseException as primary:
+        _cleanup_result, cleanup_error = _close_single_execution(
+            ui_state, token, execution
+        )
+        if not isinstance(primary, Exception):
+            if cleanup_error is not None:
+                primary.add_note("production run cleanup failed")
+            raise
+        if isinstance(primary, DomainError) and ui_state.is_cancel_requested(token):
+            projection = _failure_projection(_cancelled(job_id))
+            if cleanup_error is not None:
+                projection = _projection_with_message(
+                    projection, "production run cancelled; cleanup failed"
+                )
+            return projection
+        raise
+    ui_state.set_phase(token, "RESULT_READY", job_id=job_id)
+    cleanup_result, cleanup_error = _close_single_execution(ui_state, token, execution)
+    if cleanup_error is not None and cleanup_result is None:
+        try:
+            persisted = _read_persisted_job_status(paths.state_root, job_id)
+        except Exception:
+            persisted = None
+        if persisted is not None:
+            return _status_projection(job_id, persisted, cleanup_error)
+        raise InfrastructureError(cleanup_error)
+    result = cleanup_result if cleanup_result is not None else result
+    projection = _terminal_projection(paths.export_root, result, job_id)
+    if cleanup_error is not None:
+        projection = _projection_with_message(
+            projection, "production run completed; cleanup failed"
+        )
+    return projection
+
+
+def _close_single_execution(
+    ui_state: ProductionUiState, token: int, execution: object
+) -> tuple[object | None, str | None]:
+    try:
+        ui_state.close_execution(token, execution)
+    except ProductionRunOneCleanupError as exc:
+        return exc.result, str(exc)
+    except Exception:
+        return None, "internal cleanup error"
+    return None, None
 
 
 class _OpenFds:
@@ -528,249 +736,4 @@ def _root_paths(paths: ProductionUiRuntimePaths) -> tuple[Path, ...]:
         paths.artifact_root,
         paths.style_asset_root,
         paths.export_root,
-    )
-
-
-def _view(export_root: Path, result: object, job_id: str) -> ProductionRunUiView:
-    export = getattr(result, "export_result")
-    bundle = getattr(export, "bundle")
-    status = _status(export)
-    qa_table = _qa_table(getattr(getattr(result, "job_result", None), "report", None))
-    approved = _image_paths(export_root, bundle, "approved/")
-    rejected = _image_paths(export_root, bundle, "rejected/")
-    return ProductionRunUiView(
-        _job_id(export) or job_id,
-        status,
-        "production run completed",
-        "production",
-        bundle.bundle_name,
-        getattr(getattr(bundle, "bundle_sha256", None), "value", None),
-        approved,
-        rejected,
-        qa_table,
-    )
-
-
-def _status(export: object) -> str:
-    job = getattr(getattr(export, "job_state", None), "job", None)
-    status = getattr(job, "status", None)
-    return getattr(status, "value", str(status or "COMPLETED"))
-
-
-def _job_id(export: object) -> str:
-    job = getattr(getattr(export, "job_state", None), "job", None)
-    job_id = getattr(job, "job_id", None)
-    return getattr(job_id, "value", "")
-
-
-def _qa_table(report: object | None) -> str:
-    if report is None:
-        return "no qa"
-    return format_qa_table(present_qa_report(report))  # type: ignore[arg-type]
-
-
-def _image_paths(export_root: Path, bundle: object, prefix: str) -> tuple[str, ...]:
-    result: list[str] = []
-    for file in getattr(bundle, "files", ()):
-        relative = getattr(file, "relative_path", "")
-        if relative.startswith(prefix) and relative.endswith(".png"):
-            result.append(str(export_root / bundle.bundle_name / relative))
-    return tuple(sorted(result))
-
-
-def _successful_batch_item(
-    export_root: Path,
-    result: object,
-    item_index: int,
-    requested_variation: int,
-    max_rounds: int,
-    job_id: str,
-    cleanup_error: str | None,
-) -> ProductionBatchItemUiView:
-    job_result = getattr(result, "job_result", None)
-    history = getattr(job_result, "history", None)
-    initial_attempt = getattr(history, "initial_attempt", None)
-    initial_request = getattr(initial_attempt, "request", None)
-    final_request = getattr(job_result, "request", None)
-    initial_variation, initial_seed = _seed_evidence(initial_request)
-    final_variation, final_seed = _seed_evidence(final_request)
-    if (
-        initial_variation != requested_variation
-        or not requested_variation <= final_variation <= requested_variation + max_rounds
-    ):
-        raise InfrastructureError("production batch evidence unavailable")
-    return ProductionBatchItemUiView(
-        item_index,
-        requested_variation,
-        initial_seed,
-        final_variation,
-        final_seed,
-        _view(export_root, result, job_id),
-        cleanup_error,
-    )
-
-
-def _seed_evidence(request: object) -> tuple[int, int]:
-    variation = getattr(request, "variation_index", None)
-    snapshot = getattr(request, "seed", None)
-    snapshot_variation = getattr(snapshot, "variation_index", None)
-    seed = getattr(snapshot, "seed", None)
-    if (
-        type(variation) is not int
-        or not 0 <= variation < 2**31
-        or type(snapshot_variation) is not int
-        or snapshot_variation != variation
-        or type(seed) is not int
-        or not 0 <= seed < 2**63
-    ):
-        raise InfrastructureError("production batch evidence unavailable")
-    return variation, seed
-
-
-def _failed_batch_item(
-    item_index: int,
-    requested_variation: int,
-    job_id: str,
-    message: str,
-    cleanup_error: str | None = None,
-) -> ProductionBatchItemUiView:
-    return ProductionBatchItemUiView(
-        item_index,
-        requested_variation,
-        None,
-        None,
-        None,
-        _failure(job_id, message),
-        cleanup_error,
-    )
-
-
-def _batch_view(
-    items: tuple[ProductionBatchItemUiView, ...],
-) -> ProductionBatchUiView:
-    completed = sum(item.run.status == "COMPLETED" for item in items)
-    cleanup_failed = any(item.cleanup_error is not None for item in items)
-    if completed == 0:
-        status = "JOB_FAILED"
-    elif completed == len(items) and not cleanup_failed:
-        status = "COMPLETED"
-    else:
-        status = "PARTIAL"
-    final_seeds = tuple(
-        item.final_seed
-        for item in items
-        if item.run.status == "COMPLETED" and item.final_seed is not None
-    )
-    collision = len(final_seeds) != len(set(final_seeds))
-    diversity = status == "COMPLETED" and not collision
-    return ProductionBatchUiView(
-        status,
-        f"{completed}/{len(items)} exports completed",
-        "production",
-        items,
-        collision,
-        diversity,
-        tuple(path for item in items for path in item.run.approved_images),
-        tuple(path for item in items for path in item.run.rejected_images),
-        _batch_tsv(items, status, collision, diversity),
-    )
-
-
-def _batch_tsv(
-    items: tuple[ProductionBatchItemUiView, ...],
-    status: str,
-    collision: bool,
-    diversity: bool,
-) -> str:
-    if collision:
-        evidence = "NOT_DIVERSITY_EVIDENCE_FINAL_SEED_COLLISION"
-    elif diversity:
-        evidence = "VALID_DIVERSITY_EVIDENCE"
-    else:
-        evidence = "NOT_DIVERSITY_EVIDENCE_INCOMPLETE_BATCH"
-    rows = [
-        "item_index\trequested_variation\tinitial_seed\tfinal_variation\t"
-        "final_seed\tjob_id\tjob_status\tmessage\tbundle\tbundle_sha256\t"
-        "cleanup_error\tqa\tbatch_status\tevidence"
-    ]
-    for item in items:
-        values = (
-            item.item_index,
-            item.requested_variation_index,
-            item.initial_seed,
-            item.final_variation_index,
-            item.final_seed,
-            item.run.job_id,
-            item.run.status,
-            item.run.message,
-            item.run.bundle_name,
-            item.run.bundle_sha256,
-            item.cleanup_error,
-            item.run.qa_table,
-            status,
-            evidence,
-        )
-        rows.append("\t".join(_tsv_value(value) for value in values))
-    return "\n".join(rows)
-
-
-def _tsv_value(value: object) -> str:
-    if value is None:
-        return ""
-    return str(value).replace("\t", " ").replace("\r", " ").replace("\n", " ")
-
-
-def _failure(job_id: str, message: str) -> ProductionRunUiView:
-    return ProductionRunUiView(
-        job_id,
-        "JOB_FAILED",
-        message,
-        "production",
-        "",
-        None,
-        (),
-        (),
-        "no qa",
-    )
-
-
-def _busy() -> ProductionRunUiView:
-    return ProductionRunUiView(
-        "",
-        "BUSY",
-        "production run busy",
-        "production",
-        "",
-        None,
-        (),
-        (),
-        "no qa",
-    )
-
-
-def _batch_failure(message: str) -> ProductionBatchUiView:
-    return ProductionBatchUiView(
-        "JOB_FAILED",
-        message,
-        "production",
-        (),
-        False,
-        False,
-        (),
-        (),
-        _batch_tsv((), "JOB_FAILED", False, False),
-    )
-
-
-def _batch_busy() -> ProductionBatchUiView:
-    return ProductionBatchUiView(
-        "BUSY",
-        "production run busy",
-        "production",
-        (),
-        False,
-        False,
-        (),
-        (),
-        _batch_tsv((), "BUSY", False, False),
     )
