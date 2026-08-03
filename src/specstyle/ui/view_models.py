@@ -54,3 +54,16 @@ class ReplayView:
     status: str  # EXACT|COMPATIBLE|REJECTED
     mode: str
     reasons: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ProductionRunUiView:
+    job_id: str
+    status: str
+    message: str
+    profile_label: str
+    bundle_name: str
+    bundle_sha256: str | None
+    approved_images: tuple[str, ...]
+    rejected_images: tuple[str, ...]
+    qa_table: str

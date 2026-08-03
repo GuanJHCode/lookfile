@@ -24,6 +24,7 @@ from specstyle.ui.presenters import (
 from specstyle.ui.view_models import (
     ExportView,
     JobStatusView,
+    ProductionRunUiView,
     QaRuleView,
     RepairStepView,
     ReplayView,
@@ -44,6 +45,10 @@ class UiServices:
     get_repair_timeline: Callable[[], str] | None = None
     get_export_summary: Callable[[], str] | None = None
     run_replay: Callable[[], str] | None = None
+    run_production_job: Callable[
+        [object, object, object, str, str, str | None, str | None, str | None, str],
+        ProductionRunUiView,
+    ] | None = None
 
 
 def build_default_services(context: object) -> UiServices:
@@ -121,6 +126,7 @@ def bind_job_result_services(
         get_repair_timeline=repair,
         get_export_summary=export,
         run_replay=replay,
+        run_production_job=base.run_production_job,
     )
 
 
@@ -173,6 +179,42 @@ def create_app(services: UiServices) -> Any:
             return "no replay"
         return services.run_replay()
 
+    def on_run_production(
+        source_file: object,
+        style_file: object,
+        spec_file: object,
+        positive_prompt: str,
+        negative_prompt: str,
+        source_url: str,
+        license_: str,
+        attribution: str,
+        consent: str,
+    ) -> tuple[str, list[str], list[str], str]:
+        if services.run_production_job is None:
+            return "production run unavailable", [], [], "no qa"
+        view = services.run_production_job(
+            source_file,
+            style_file,
+            spec_file,
+            positive_prompt or "",
+            negative_prompt or "",
+            source_url or None,
+            license_ or None,
+            attribution or None,
+            consent,
+        )
+        status = (
+            f"{view.job_id}\t{view.status}\tprofile={view.profile_label}\t"
+            f"bundle={view.bundle_name}\tsha={view.bundle_sha256 or ''}\t"
+            f"{view.message}"
+        )
+        return (
+            status,
+            list(view.approved_images),
+            list(view.rejected_images),
+            view.qa_table,
+        )
+
     with gr.Blocks(title="SpecStyle") as demo:
         gr.Markdown("# SpecStyle StyleOps")
         with gr.Tab("Spec (UI-001)"):
@@ -182,6 +224,38 @@ def create_app(services: UiServices) -> Any:
                 on_compile, inputs=[spec_in], outputs=[compile_out]
             )
         with gr.Tab("Job / QA (UI-002)"):
+            source_file = gr.File(label="Source image")
+            style_file = gr.File(label="Style reference")
+            production_spec = gr.File(label="Production spec")
+            positive_prompt = gr.Textbox(label="Positive prompt")
+            negative_prompt = gr.Textbox(label="Negative prompt")
+            source_url = gr.Textbox(label="Source URL")
+            license_ = gr.Textbox(label="License")
+            attribution = gr.Textbox(label="Attribution")
+            consent = gr.Dropdown(
+                choices=["not_applicable", "obtained"],
+                value="not_applicable",
+                label="Consent",
+            )
+            run_status = gr.Textbox(label="Production run status")
+            approved_gallery = gr.Gallery(label="Approved")
+            rejected_gallery = gr.Gallery(label="Rejected")
+            run_qa = gr.Textbox(label="Production QA table")
+            gr.Button("Run production").click(
+                on_run_production,
+                inputs=[
+                    source_file,
+                    style_file,
+                    production_spec,
+                    positive_prompt,
+                    negative_prompt,
+                    source_url,
+                    license_,
+                    attribution,
+                    consent,
+                ],
+                outputs=[run_status, approved_gallery, rejected_gallery, run_qa],
+            )
             status_out = gr.Textbox(label="Job status (preview|production labeled)")
             gr.Button("Refresh status").click(on_status, outputs=[status_out])
             gr.Button("Cancel job").click(on_cancel, outputs=[status_out])
@@ -211,6 +285,7 @@ __all__ = [
     "launch_app",
     "ExportView",
     "JobStatusView",
+    "ProductionRunUiView",
     "QaRuleView",
     "RepairStepView",
     "ReplayView",
