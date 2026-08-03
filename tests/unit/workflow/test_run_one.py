@@ -57,7 +57,9 @@ def test_run_aligns_pre_export_job_state_with_completed_export_state() -> None:
     budget = JobBudget(2)
     ts = "2026-08-03T00:00:00.000Z"
     pre_export = JobState(
-        Job(job_id, Sha256("a" * 64), ("xhs_grid",), budget, JobStatus.APPROVED, ts, ts),
+        Job(
+            job_id, Sha256("a" * 64), ("xhs_grid",), budget, JobStatus.APPROVED, ts, ts
+        ),
         5,
         (AttemptId("run-one-test-a0-xhs_grid-0"),),
         (),
@@ -128,7 +130,8 @@ def test_reservation_revalidates_variation_when_consumed() -> None:
 
 
 def test_open_duplicates_borrowed_fds_and_uses_the_shared_config_root(
-    monkeypatch: pytest.MonkeyPatch, tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
 ) -> None:
     import specstyle.workflow.run_one as module
 
@@ -174,12 +177,16 @@ def test_open_duplicates_borrowed_fds_and_uses_the_shared_config_root(
         seen["context"] = (config, evidence)
         return _Context()
 
-    monkeypatch.setattr(module, "load_production_job_input_metadata", lambda fd: object())
+    monkeypatch.setattr(
+        module, "load_production_job_input_metadata", lambda fd: object()
+    )
     monkeypatch.setattr(module, "load_production_context_config", load_context_config)
     monkeypatch.setattr(module, "load_production_supply_config", load_supply)
     monkeypatch.setattr(module, "verify_pipeline_supply", lambda *_args: supply)
     monkeypatch.setattr(module, "capture_environment", lambda: object())
-    monkeypatch.setattr(module, "make_production_compiler_context_factory", lambda *_args: object())
+    monkeypatch.setattr(
+        module, "make_production_compiler_context_factory", lambda *_args: object()
+    )
     monkeypatch.setattr(module.JobStore, "from_root_fd", lambda _fd: store)
 
     def open_job_input(*_args: object, **kwargs: object) -> object:

@@ -58,9 +58,7 @@ def _file(path: Path, content: bytes) -> str:
 def _production_spec():
     return raw_spec().model_copy(
         update={
-            "repair": raw_spec().repair.model_copy(
-                update={"policy_version": "1.0"}
-            )
+            "repair": raw_spec().repair.model_copy(update={"policy_version": "1.0"})
         }
     )
 
@@ -105,9 +103,7 @@ def _batch_result(
     rejected: bool = False,
 ):
     final_variation = (
-        variation_index
-        if final_variation_index is None
-        else final_variation_index
+        variation_index if final_variation_index is None else final_variation_index
     )
     route = "rejected" if rejected else "approved/xhs_grid"
     filename = f"artifact-{job_id}.png"
@@ -131,9 +127,7 @@ def _batch_result(
             bundle=SimpleNamespace(
                 bundle_name=f"bundle-{job_id}",
                 bundle_sha256=Sha256("d" * 64),
-                files=(
-                    ExportedFile(f"{route}/{filename}", Sha256("e" * 64), 3),
-                ),
+                files=(ExportedFile(f"{route}/{filename}", Sha256("e" * 64), 3),),
             ),
             job_state=SimpleNamespace(
                 job=SimpleNamespace(
@@ -563,10 +557,15 @@ def test_production_batch_runs_four_disjoint_variation_ranges_and_emits_tsv(
     assert tuple(item.requested_variation_index for item in view.items) == (0, 2, 4, 6)
     assert tuple(item.initial_seed for item in view.items) == (1001, 1002, 1003, 1004)
     assert tuple(item.final_seed for item in view.items) == (2001, 2002, 2003, 2004)
-    assert all(item.final_variation_index == item.requested_variation_index for item in view.items)
+    assert all(
+        item.final_variation_index == item.requested_variation_index
+        for item in view.items
+    )
     assert len(view.approved_images) == 4
     assert view.rejected_images == ()
-    assert view.evidence_tsv.splitlines()[0].startswith("item_index\trequested_variation")
+    assert view.evidence_tsv.splitlines()[0].startswith(
+        "item_index\trequested_variation"
+    )
     assert "VALID_DIVERSITY_EVIDENCE" in view.evidence_tsv
     assert list(roots.staging_root.iterdir()) == []
 

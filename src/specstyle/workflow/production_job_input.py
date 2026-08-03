@@ -426,9 +426,7 @@ def _validate_spec(raw: object) -> tuple[object, str, tuple[int, int]]:
     return raw, canonical_json_bytes(primitive).decode("utf-8"), resolution
 
 
-def validate_production_job_spec_text(
-    text: str, /
-) -> ProductionJobSpecSummary:
+def validate_production_job_spec_text(text: str, /) -> ProductionJobSpecSummary:
     try:
         if type(text) is not str:
             raise _domain()

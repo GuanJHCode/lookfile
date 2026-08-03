@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
+import tomllib
 
 
 _ROOT = Path(__file__).resolve().parents[3]
@@ -33,3 +34,17 @@ def test_checked_in_runtime_lock_never_contains_torch_packages() -> None:
     }
 
     assert names.isdisjoint({"torch", "torchvision", "torchaudio", "pytorch"})
+
+
+def test_ruff_configuration_matches_the_runtime_lock() -> None:
+    lock = _ROOT / "deployment" / "amd" / "requirements.lock.txt"
+    locked_version = next(
+        line.split("==", 1)[1]
+        for line in lock.read_text(encoding="ascii").splitlines()
+        if line.startswith("ruff==")
+    )
+    config = tomllib.loads((_ROOT / "ruff.toml").read_text(encoding="ascii"))
+
+    assert config["required-version"] == f"=={locked_version}"
+    assert config["target-version"] == "py312"
+    assert config["lint"]["select"] == ["E4", "E7", "E9", "F"]

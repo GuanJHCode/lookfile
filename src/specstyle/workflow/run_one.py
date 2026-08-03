@@ -69,9 +69,16 @@ class ProductionRunOneFds:
 
     def __post_init__(self) -> None:
         for descriptor in (
-            self.config_root_fd, self.evidence_root_fd, self.model_root_fd,
-            self.state_root_fd, self.artifact_root_fd, self.style_asset_root_fd,
-            self.export_root_fd, self.source_fd, self.style_fd, self.spec_fd,
+            self.config_root_fd,
+            self.evidence_root_fd,
+            self.model_root_fd,
+            self.state_root_fd,
+            self.artifact_root_fd,
+            self.style_asset_root_fd,
+            self.export_root_fd,
+            self.source_fd,
+            self.style_fd,
+            self.spec_fd,
             self.metadata_fd,
         ):
             if type(descriptor) is not int or descriptor < 0:
@@ -83,7 +90,9 @@ class ProductionRunOneReservation:
 
     def __init__(self, token: object, job_id: JobId, variation_index: int, /) -> None:
         if token is not _RESERVATION_TOKEN:
-            raise TypeError("production run-one reservations are issued only by reserve")
+            raise TypeError(
+                "production run-one reservations are issued only by reserve"
+            )
         self._token, self._consumed, self._job_id = token, False, job_id
         self._variation_index = _validate_variation_index(variation_index)
         self._lock = threading.Lock()
@@ -160,17 +169,35 @@ class ProductionRunOneCleanupError(InfrastructureError):
 
 class ProductionRunOneExecution:
     __slots__ = (
-        "_asset_input", "_closed", "_export_root_fd", "_job_id", "_job_store",
-        "_lock", "_pending_cancel", "_result", "_run_started", "_runtime",
+        "_asset_input",
+        "_closed",
+        "_export_root_fd",
+        "_job_id",
+        "_job_store",
+        "_lock",
+        "_pending_cancel",
+        "_result",
+        "_run_started",
+        "_runtime",
         "_supply",
     )
 
     def __init__(
-        self, job_id: JobId, runtime: Any, asset_input: ProductionJobInput,
-        supply: Any, job_store: JobStore, export_root_fd: int, /
+        self,
+        job_id: JobId,
+        runtime: Any,
+        asset_input: ProductionJobInput,
+        supply: Any,
+        job_store: JobStore,
+        export_root_fd: int,
+        /,
     ) -> None:
         self._job_id, self._runtime, self._asset_input = job_id, runtime, asset_input
-        self._supply, self._job_store, self._export_root_fd = supply, job_store, export_root_fd
+        self._supply, self._job_store, self._export_root_fd = (
+            supply,
+            job_store,
+            export_root_fd,
+        )
         self._lock, self._closed, self._run_started = threading.RLock(), False, False
         self._pending_cancel: str | None = None
         self._result: ProductionRunOneResult | None = None
@@ -203,7 +230,10 @@ class ProductionRunOneExecution:
             # run() returns pre-export job_state (APPROVED); export_result is COMPLETED.
             # Align both sides of the public result on the post-export JobStore state.
             if job_result.job_state != export_result.job_state:
-                if job_result.job_state.job.job_id != export_result.job_state.job.job_id:
+                if (
+                    job_result.job_state.job.job_id
+                    != export_result.job_state.job.job_id
+                ):
                     raise _unavailable()
                 job_result = replace(job_result, job_state=export_result.job_state)
             result = ProductionRunOneResult(job_result, export_result)
@@ -235,7 +265,12 @@ class ProductionRunOneExecution:
                 return
             self._closed = True
         failures: list[BaseException] = []
-        for resource in (self._runtime, self._asset_input, self._supply, self._job_store):
+        for resource in (
+            self._runtime,
+            self._asset_input,
+            self._supply,
+            self._job_store,
+        ):
             try:
                 resource.close()
             except BaseException as error:
@@ -256,8 +291,13 @@ class ProductionRunOneExecution:
                 raise _unavailable()
         return self
 
-    def __exit__(self, exc_type: type[BaseException] | None, exc: BaseException | None,
-                 traceback: TracebackType | None, /) -> None:
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+        /,
+    ) -> None:
         try:
             self.close()
         except ProductionRunOneCleanupError:
@@ -286,9 +326,16 @@ def _owned_descriptors(fds: ProductionRunOneFds) -> tuple[int, ...]:
     copies: list[int] = []
     try:
         for descriptor in (
-            fds.config_root_fd, fds.evidence_root_fd, fds.model_root_fd,
-            fds.state_root_fd, fds.artifact_root_fd, fds.style_asset_root_fd,
-            fds.export_root_fd, fds.source_fd, fds.style_fd, fds.spec_fd,
+            fds.config_root_fd,
+            fds.evidence_root_fd,
+            fds.model_root_fd,
+            fds.state_root_fd,
+            fds.artifact_root_fd,
+            fds.style_asset_root_fd,
+            fds.export_root_fd,
+            fds.source_fd,
+            fds.style_fd,
+            fds.spec_fd,
             fds.metadata_fd,
         ):
             copies.append(_duplicate(descriptor))
@@ -330,7 +377,19 @@ def _open_resources(
     # Lazy: CannyControlInputBuilder pulls OpenCV; keep run_one importable without cv2.
     from specstyle.generation.canny import CannyControlInputBuilder
 
-    config, evidence, models, state, artifacts, styles, _export, source, style, spec, metadata = owned
+    (
+        config,
+        evidence,
+        models,
+        state,
+        artifacts,
+        styles,
+        _export,
+        source,
+        style,
+        spec,
+        metadata,
+    ) = owned
     input_metadata = load_production_job_input_metadata(metadata)
     context = load_production_context_config(config, evidence)
     supply_config = load_production_supply_config(config)
@@ -343,13 +402,25 @@ def _open_resources(
     )
     store = JobStore.from_root_fd(state)
     job_input = open_production_job_input(
-        source, style, spec, styles, input_metadata, context, job_id,
+        source,
+        style,
+        spec,
+        styles,
+        input_metadata,
+        context,
+        job_id,
         f"bundle-{job_id.value}",
         variation_index=variation_index,
     )
     runtime = open_production_runtime(
-        supply, supply_config.graph, environment, factory, job_input.style_assets,
-        CannyControlInputBuilder(context.canny), production_l1_rule_bindings(), store,
+        supply,
+        supply_config.graph,
+        environment,
+        factory,
+        job_input.style_assets,
+        CannyControlInputBuilder(context.canny),
+        production_l1_rule_bindings(),
+        store,
         artifacts,
     )
     return runtime, job_input, supply, store

@@ -924,7 +924,9 @@ def test_prepare_export_does_not_touch_store_gpu_or_runtime_state(
     runtime = _runtime(case)
 
     class Trap:
-        def __getattribute__(self, _name: str) -> object:
+        def __getattribute__(self, name: str) -> object:
+            if name == "__class__":
+                return object.__getattribute__(self, name)
             raise AssertionError("side effect dependency was touched")
 
         def __enter__(self) -> None:

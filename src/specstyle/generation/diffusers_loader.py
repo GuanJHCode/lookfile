@@ -220,7 +220,10 @@ def _validate_environment(environment: object, torch: Any, diffusers: Any) -> Sh
     _require_text(environment.hip_version, getattr(torch.version, "hip", None))
     _require_text(environment.pytorch_version, getattr(torch, "__version__", None))
     _require_text(environment.diffusers_version, _DIFFUSERS_VERSION)
-    if _plain_expected_text(getattr(diffusers, "__version__", None)) != _DIFFUSERS_VERSION:
+    if (
+        _plain_expected_text(getattr(diffusers, "__version__", None))
+        != _DIFFUSERS_VERSION
+    ):
         raise DomainError("production environment mismatch")
     devices = environment.hip_devices
     if getattr(devices, "status", None) != "AVAILABLE" or not devices.devices:

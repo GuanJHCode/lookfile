@@ -19,6 +19,22 @@ from specstyle.workflow import _production_input_cas as cas
 from specstyle.workflow._production_input_cas import _PROC_SUPER_MAGIC, store_style
 
 
+_UNSUPPORTED_TMPFILE_ERRNOS = frozenset(
+    (errno.ENOSYS, errno.EOPNOTSUPP, errno.EINVAL, errno.EISDIR)
+)
+
+
+def _require_anonymous_tmpfile(parent: int) -> None:
+    try:
+        probe = cas._LinuxBackend().open_tmp(parent)
+    except OSError as error:
+        if error.errno not in _UNSUPPORTED_TMPFILE_ERRNOS:
+            raise
+        pytest.skip(f"filesystem does not support O_TMPFILE: errno={error.errno}")
+    else:
+        os.close(probe)
+
+
 @dataclass
 class _Node:
     ino: int
@@ -593,12 +609,40 @@ def test_two_publishers_converge_on_one_valid_winner() -> None:
     assert failures == []
 
 
+@pytest.mark.parametrize("code", sorted(_UNSUPPORTED_TMPFILE_ERRNOS))
+def test_anonymous_tmpfile_probe_skips_only_unsupported_errors(
+    monkeypatch: pytest.MonkeyPatch, code: int
+) -> None:
+    def unsupported(_self: object, _parent: int) -> int:
+        raise OSError(code, "unsupported")
+
+    monkeypatch.setattr(cas._LinuxBackend, "open_tmp", unsupported)
+
+    with pytest.raises(pytest.skip.Exception):
+        _require_anonymous_tmpfile(10)
+
+
+def test_anonymous_tmpfile_probe_propagates_other_os_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def bad_descriptor(_self: object, _parent: int) -> int:
+        raise OSError(errno.EBADF, "bad descriptor")
+
+    monkeypatch.setattr(cas._LinuxBackend, "open_tmp", bad_descriptor)
+
+    with pytest.raises(OSError, match="bad descriptor") as captured:
+        _require_anonymous_tmpfile(10)
+
+    assert captured.value.errno == errno.EBADF
+
+
 @pytest.mark.skipif(os.uname().sysname != "Linux", reason="requires Linux O_TMPFILE")
 def test_real_linux_anonymous_publish_smoke(tmp_path) -> None:
     root = tmp_path / "cas"
     root.mkdir(mode=0o700)
     fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
     try:
+        _require_anonymous_tmpfile(fd)
         content = _png()
         store_style(fd, hash_bytes(content).value, content, (64, 64))
     finally:
