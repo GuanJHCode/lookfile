@@ -208,6 +208,25 @@ def test_select_returns_no_action_for_render_unknown_and_highest_blocker_only() 
     )
 
 
+def test_production_bundle_failure_discloses_retry_but_requires_compiled_whitelist() -> (
+    None
+):
+    request, plan = _request_and_plan(
+        (("l1_bundle", RuleLevel.L1, RuleScope.ITEM, 1, ()),)
+    )
+    report = _report(plan, {"l1_bundle": RuleStatus.FAIL})
+
+    selection = select_repair(
+        request, plan, report, ArtifactId("target"), DecisionId("decision")
+    )
+
+    assert selection == NoAction(
+        DecisionId("decision"),
+        (RuleId("l1_bundle"),),
+        (RETRY_SAMPLING,),
+    )
+
+
 def test_select_orders_l1_l3_l2_then_priority_and_rule_id() -> None:
     entries = (
         ("STYLE_LOW", RuleLevel.L2, RuleScope.ITEM, 0, (INCREASE_STYLE_SCALE,)),

@@ -18,6 +18,7 @@ from specstyle.domain.identifiers import (
     ArtifactId,
     AssetId,
     AttemptId,
+    Identifier,
     JobId,
     RuleId,
 )
@@ -379,6 +380,7 @@ def _compile_case(
     l3_kind: str,
     l3_requirement: str,
     fidelity_required: bool,
+    l1_bundle_actions: tuple[Identifier, ...],
 ) -> tuple[CompilerContext, object]:
     capability = loaded._borrow_image_evidence_encoder()
     context = _compiler_context(
@@ -388,6 +390,7 @@ def _compile_case(
         l3_status=l3_status,
         l3_kind=l3_kind,
         l3_requirement=l3_requirement,
+        l1_bundle_actions=l1_bundle_actions,
     )
     raw = _raw_spec(
         pipeline_graph,
@@ -468,6 +471,7 @@ def _make_production_case(
     l3_kind: str = "L3_DIAGNOSTIC",
     l3_requirement: str = "always_advisory",
     fidelity_required: bool = False,
+    l1_bundle_actions: tuple[Identifier, ...] = (),
 ) -> _ProductionCase:
     styles = (_png((10, 10, 200)),) if style_contents is None else style_contents
     supply, pipeline_graph, torch, loaded = _load_case_pipeline(tmp_path)
@@ -480,6 +484,7 @@ def _make_production_case(
         l3_kind=l3_kind,
         l3_requirement=l3_requirement,
         fidelity_required=fidelity_required,
+        l1_bundle_actions=l1_bundle_actions,
     )
     request, references = _generation_request(compiled, styles)
     artifact = _generated_artifact(request)

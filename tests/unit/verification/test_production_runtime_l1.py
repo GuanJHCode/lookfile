@@ -13,11 +13,15 @@ import pytest
 from PIL import Image, PngImagePlugin
 
 from specstyle.domain.artifacts import ArtifactRef
-from specstyle.domain.enums import RuleStatus
+from specstyle.domain.enums import RepairStopReason, RuleStatus
 from specstyle.domain.identifiers import ArtifactId, Sha256
 from specstyle.errors import DomainError, InfrastructureError
 from specstyle.generation.protocols import GeneratedArtifact
+from specstyle.generation.requests import GenerationRequest
 from specstyle.observability.hashing import hash_bytes
+from specstyle.repair.actions import RETRY_SAMPLING
+from specstyle.repair.loop import NextGeneration
+from specstyle.verification.rule_models import VerificationReport
 from tests.unit.verification._production_fixtures import (
     _ProductionCase,
     _make_production_case,
@@ -54,6 +58,17 @@ def _artifact(case: _ProductionCase, content: bytes) -> GeneratedArtifact:
         content,
         case.request.request_hash,
         case.request.generation_fingerprint,
+    )
+
+
+def _attempt_artifact(
+    request: GenerationRequest, artifact_id: str, content: bytes
+) -> GeneratedArtifact:
+    return GeneratedArtifact(
+        ArtifactRef(ArtifactId(artifact_id), hash_bytes(content)),
+        content,
+        request.request_hash,
+        request.generation_fingerprint,
     )
 
 
@@ -96,6 +111,94 @@ def test_verify_returns_canonical_applicable_results_without_na_or_gpu(
     assert draft_case.artifact_resolver.calls == [draft_case.artifact.ref]
     assert draft_case.style_resolver.calls == []
     assert draft_case.evidence_calls == {}
+
+
+def test_real_production_l1_bundle_failure_retries_and_guardrail_accepts_child(
+    tmp_path: Path,
+) -> None:
+    production = importlib.import_module("specstyle.verification.production")
+    repair = importlib.import_module("specstyle.workflow.production_repair")
+    case = _make_production_case(
+        tmp_path,
+        l2_status="DRAFT",
+        l3_status="DRAFT",
+        l1_bundle_actions=(RETRY_SAMPLING,),
+    )
+    try:
+        factory = production._create_production_verifier_factory(
+            case.loaded, case.allowlist(production)
+        )
+        rules = case.plan.applicable_rule_definitions
+
+        def verify(
+            request: GenerationRequest, artifact: GeneratedArtifact
+        ) -> VerificationReport:
+            case.artifact_resolver.value = artifact
+            verifier = factory.create(
+                request,
+                case.plan,
+                case.artifact_resolver,
+                case.style_resolver,
+            )
+            results = verifier.verify((artifact.ref,), rules)
+            return VerificationReport((artifact.ref,), rules, results)
+
+        initial = _attempt_artifact(
+            case.request, "fault-injected-initial", _png((0, 0, 0))
+        )
+        initial_report = verify(case.request, initial)
+        initial_statuses = _statuses(initial_report.results)
+
+        assert initial_statuses == {
+            "l1_bundle": RuleStatus.FAIL,
+            "l1_decode": RuleStatus.PASS,
+            "l1_dimensions": RuleStatus.PASS,
+            "l1_pixels": RuleStatus.FAIL,
+            "l2_style": RuleStatus.UNVERIFIABLE,
+            "l3_diagnostic": RuleStatus.UNVERIFIABLE,
+        }
+        l2_rule = next(rule for rule in rules if rule.rule_id.value == "l2_style")
+        assert l2_rule.required is False
+
+        composed = repair._compose_initial_repair(case.request, initial, initial_report)
+
+        assert type(composed.step) is NextGeneration
+        assert composed.step.decision.trigger_rule_id.value == "l1_bundle"
+        assert composed.step.decision.action_id == RETRY_SAMPLING
+        assert (
+            composed.step.decision.patch.after_parameters
+            == composed.step.decision.patch.before_parameters
+        )
+        assert composed.step.request.parent_attempt_id == case.request.attempt_id
+        assert composed.step.request.variation_index == case.request.variation_index + 1
+        assert composed.step.request.seed != case.request.seed
+        assert composed.step.request.request_hash != case.request.request_hash
+
+        child = _attempt_artifact(
+            composed.step.request, "artifact-child", _png((10, 200, 10))
+        )
+        child_report = verify(composed.step.request, child)
+        terminal = repair._compose_repair_result(
+            composed.history, composed.step, child, child_report
+        )
+
+        assert _statuses(child_report.results) == {
+            "l1_bundle": RuleStatus.PASS,
+            "l1_decode": RuleStatus.PASS,
+            "l1_dimensions": RuleStatus.PASS,
+            "l1_pixels": RuleStatus.PASS,
+            "l2_style": RuleStatus.UNVERIFIABLE,
+            "l3_diagnostic": RuleStatus.UNVERIFIABLE,
+        }
+        assert terminal.history.rounds == 1
+        assert len(terminal.history.repair_attempts) == 1
+        assert terminal.history.consecutive_no_improvement == 0
+        assert (
+            terminal.terminal.artifact_decision.repair_stop_reason
+            is RepairStopReason.PASS_ALL_REQUIRED
+        )
+    finally:
+        case.close()
 
 
 def test_l1_uses_existing_decoded_dimension_and_pixel_primitives(

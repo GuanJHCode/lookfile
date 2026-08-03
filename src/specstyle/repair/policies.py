@@ -31,6 +31,7 @@ from specstyle.verification.routing import decide_artifact as _decide
 from specstyle.verification.rule_models import VerificationReport as _Report
 
 _POLICY_ACTIONS = (
+    ("l1_bundle", (_RETRY,)),
     ("STYLE_LOW", (_INCREASE,)),
     ("STYLE_OVERPOWERED", (_DECREASE, _DENOISE)),
     ("CONTENT_DRIFT", (_DENOISE, _STRUCTURE)),

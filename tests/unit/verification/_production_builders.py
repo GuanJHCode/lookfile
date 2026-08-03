@@ -38,7 +38,9 @@ def _pin(identifier: str, material: str) -> ResourcePin:
     return ResourcePin(identifier, "r1", hash_bytes(material.encode()))
 
 
-def _l1_rules() -> tuple[RuleCapability, ...]:
+def _l1_rules(
+    bundle_actions: tuple[Identifier, ...] = (),
+) -> tuple[RuleCapability, ...]:
     return tuple(
         RuleCapability(
             rule_id,
@@ -52,7 +54,7 @@ def _l1_rules() -> tuple[RuleCapability, ...]:
             "none",
             None,
             index,
-            (),
+            bundle_actions if rule_id == RuleId("l1_bundle") else (),
         )
         for index, (rule_id, _implementation) in enumerate(_L1_MAPPINGS)
     )
@@ -215,6 +217,7 @@ def _compiler_context(
     l3_status: str,
     l3_kind: str,
     l3_requirement: str,
+    l1_bundle_actions: tuple[Identifier, ...] = (),
 ) -> CompilerContext:
     runtime_pin = _pin("runtime", "runtime")
     ip_pin = _ip_adapter_pin(pipeline_graph)
@@ -244,7 +247,9 @@ def _compiler_context(
         (output,),
         (
             RuleCatalogCapability(
-                "1", _pin("rules", "rules"), _l1_rules() + _l2_rules()
+                "1",
+                _pin("rules", "rules"),
+                _l1_rules(l1_bundle_actions) + _l2_rules(),
             ),
         ),
         _threshold_profiles(ip_pin, plugin_pin, l2_status, l3_status),
@@ -409,7 +414,7 @@ def _raw_spec(
         **_style_contract_sections(fidelity_required),
         "verification": _verification_spec(pipeline_graph, context),
         "repair": {
-            "policy_version": "1",
+            "policy_version": "1.0",
             "max_rounds": 1,
             "stop_after_no_improvement": 1,
         },
