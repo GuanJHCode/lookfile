@@ -459,8 +459,7 @@ def test_rocm_reader_rejects_untrusted_file_state_without_blocking(
     path = tmp_path / "version"
     path.write_bytes(b"" if condition == "empty" else b"7.2.1")
     if condition == "owner":
-        uid = os.geteuid()
-        monkeypatch.setattr(probe.os, "geteuid", lambda: uid + 1)
+        monkeypatch.setattr(probe.os, "fstat", changing_fstat(probe, call=1, index=4))
     elif condition == "changed":
         monkeypatch.setattr(probe.os, "fstat", changing_fstat(probe))
     elif condition == "symlink":
@@ -783,9 +782,13 @@ def test_standalone_runs_with_cleared_environment(tmp_path: Path) -> None:
         text=True,
         check=False,
     )
-    assert completed.returncode == 10 and completed.stderr == ""
+    record = json.loads(completed.stdout)
+    expected_by_reason = {"OK": 0, "HOST_UNSUPPORTED": 10, "PYTHON_UNSUPPORTED": 10, "ROCM_VERSION_MISMATCH": 10, "TORCH_UNAVAILABLE": 11, "HIP_VERSION_MISMATCH": 11, "GPU_UNAVAILABLE": 12, "FP16_CHECK_FAILED": 12}  # fmt: skip
+    assert completed.returncode == expected_by_reason[record["reason_code"]]
+    assert record["status"] == ("PASS" if completed.returncode == 0 else "FAIL")
+    assert completed.stderr == ""
     assert completed.stdout == output.read_text()
-    assert set(json.loads(completed.stdout)) == probe.SCHEMA_KEYS
+    assert set(record) == probe.SCHEMA_KEYS
 
 
 def test_public_orchestrators_and_files_stay_within_size_limits() -> None:

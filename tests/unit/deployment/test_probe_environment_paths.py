@@ -372,7 +372,7 @@ def forged_info(info, *, uid: int, permissions: int):
     [
         (0, 0o1777, 0),
         (0, 0o3777, 70),
-        (os.geteuid(), 0o1777, 70),
+        (os.geteuid(), 0o1777, 0 if os.geteuid() == 0 else 70),
         (os.geteuid() + 1, 0o755, 70),
     ],
 )

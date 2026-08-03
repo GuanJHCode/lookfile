@@ -422,6 +422,9 @@ def test_list_job_ids_detects_state_file_mutation_during_descriptor_read(
     store.save_snapshot(JobId("job1"), _initial_snapshot("job1"))
     snapshot = tmp_path / "jobs" / "job1" / "snapshot.json"
     content = snapshot.read_bytes()
+    replacement = tmp_path / "replacement-snapshot.json"
+    replacement.write_bytes(content)
+    replacement.chmod(0o600)
     real_read = os.read
     mutated = False
 
@@ -430,7 +433,7 @@ def test_list_job_ids_detects_state_file_mutation_during_descriptor_read(
         result = real_read(fd, amount)
         if result and not mutated:
             mutated = True
-            snapshot.write_bytes(content)
+            replacement.replace(snapshot)
         return result
 
     monkeypatch.setattr(store_mod.os, "read", mutate_after_read)
