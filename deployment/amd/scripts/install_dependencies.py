@@ -7,8 +7,8 @@ import argparse
 import hashlib
 import importlib.metadata
 import importlib.util
-import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -38,6 +38,8 @@ SCHEMA_KEYS = frozenset(
         "torch_after",
         "torch_unchanged",
         "pip_command",
+        "pip_check_command",
+        "pip_check_external_conflicts",
     )
 )
 
@@ -59,15 +61,30 @@ torch_fingerprints = _PROBE.torch_fingerprints
 
 
 def normalize_name(name: str) -> str:
-    return name.lower().replace("_", "-")
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def valid_distribution_name(name: object) -> bool:
+    return (
+        type(name) is str
+        and re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?", name)
+        is not None
+    )
 
 
 def locked_requirements(dependencies: Mapping[str, str] = DEPENDENCIES) -> list[str]:
     planned: list[str] = []
+    normalized: set[str] = set()
     for name, version in dependencies.items():
         if type(name) is not str or type(version) is not str:
             raise ValueError("invalid dependency pin")
-        if normalize_name(name) in FORBIDDEN:
+        if not valid_distribution_name(name):
+            raise ValueError(f"invalid dependency name: {name!r}")
+        canonical_name = normalize_name(name)
+        if canonical_name in normalized:
+            raise ValueError(f"duplicate dependency name: {name}")
+        normalized.add(canonical_name)
+        if canonical_name in FORBIDDEN:
             raise ValueError(f"forbidden package in plan: {name}")
         if not _PROBE.valid_version(version):
             raise ValueError(f"invalid version pin: {name}=={version}")
@@ -129,7 +146,12 @@ def snapshot_torch(
 
 def assert_no_forbidden(specs: Sequence[str]) -> None:
     for spec in specs:
-        name = normalize_name(spec.split("==", 1)[0])
+        if type(spec) is not str or spec.count("==") != 1:
+            raise ValueError(f"invalid requirement: {spec!r}")
+        raw_name, version = spec.split("==", 1)
+        if not valid_distribution_name(raw_name) or not _PROBE.valid_version(version):
+            raise ValueError(f"invalid requirement: {spec!r}")
+        name = normalize_name(raw_name)
         if name in FORBIDDEN:
             raise ValueError(f"refusing to install forbidden package: {spec}")
 
@@ -171,6 +193,45 @@ def run_pip(
         raise RuntimeError(detail or "pip install failed")
 
 
+def run_pip_check(
+    *,
+    python: str = sys.executable,
+    dependencies: Mapping[str, str] = DEPENDENCIES,
+    runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> tuple[list[str], int]:
+    command = [python, "-m", "pip", "check"]
+    completed = runner(
+        command,
+        check=False,
+        text=True,
+        capture_output=True,
+        env={**os.environ, "PIP_NO_INPUT": "1"},
+    )
+    if completed.returncode == 0:
+        return command, 0
+    detail = "\n".join(
+        part.strip()
+        for part in (completed.stdout, completed.stderr)
+        if isinstance(part, str) and part.strip()
+    )
+    locked = {normalize_name(name) for name in dependencies}
+    external = 0
+    for line in detail.splitlines():
+        match = re.fullmatch(
+            r"([A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?)\s+\S+\s+"
+            r"(?:has requirement .+, but you have .+\.|"
+            r"requires .+, which is not installed\.|"
+            r"is not supported on this platform)",
+            line,
+        )
+        if match is None or normalize_name(match.group(1)) in locked:
+            raise RuntimeError("locked dependency check failed")
+        external += 1
+    if external == 0:
+        raise RuntimeError("pip check failed")
+    return command, external
+
+
 def empty_result(repo_sha: str | None, lock: str) -> dict[str, Any]:
     return {
         "schema_version": 1,
@@ -185,6 +246,8 @@ def empty_result(repo_sha: str | None, lock: str) -> dict[str, Any]:
         "torch_after": None,
         "torch_unchanged": False,
         "pip_command": [],
+        "pip_check_command": [],
+        "pip_check_external_conflicts": 0,
     }
 
 
@@ -221,30 +284,23 @@ def install_dependencies(
 
     install, skipped = packages_to_install(dependencies)
     result["skipped"] = skipped
-    if not install:
-        result["installed"] = []
-        result["torch_after"] = before
-        result["torch_unchanged"] = before is not None
-        result["pip_command"] = []
-        return result, 0
-
-    try:
-        command = build_pip_command(install, python=python)
-    except ValueError:
-        return fail(result, "FORBIDDEN_PACKAGE")
-    result["pip_command"] = command
     result["installed"] = install
-
+    if install:
+        try:
+            command = build_pip_command(install, python=python)
+        except ValueError:
+            return fail(result, "FORBIDDEN_PACKAGE")
+        result["pip_command"] = command
     if dry_run:
         result["torch_after"] = before
         result["torch_unchanged"] = before is not None
         result["reason_code"] = "DRY_RUN"
         return result, 0
-
-    try:
-        run_pip(command, runner=runner)
-    except RuntimeError:
-        return fail(result, "PIP_FAILED")
+    if install:
+        try:
+            run_pip(result["pip_command"], runner=runner)
+        except RuntimeError:
+            return fail(result, "PIP_FAILED")
 
     after = snapshot_torch(import_torch, fingerprints)
     result["torch_after"] = after
@@ -258,6 +314,15 @@ def install_dependencies(
     for name, expected in dependencies.items():
         if versions.get(name) != expected:
             return fail(result, "VERSION_MISMATCH")
+    try:
+        command, external = run_pip_check(
+            python=python, dependencies=dependencies, runner=runner
+        )
+        result["pip_check_command"] = command
+        result["pip_check_external_conflicts"] = external
+    except RuntimeError:
+        result["pip_check_command"] = [python, "-m", "pip", "check"]
+        return fail(result, "PIP_CHECK_FAILED")
     return result, 0
 
 

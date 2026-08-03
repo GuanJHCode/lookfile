@@ -40,7 +40,7 @@ def fake_probe_deps(
 ):
     cuda = SimpleNamespace(is_available=lambda: True, device_count=lambda: count)
     torch = SimpleNamespace(version=SimpleNamespace(hip=hip), cuda=cuda)
-    fingerprints = {"torch": "2.9.1", "torch_hip": hip, "torch_file_sha256": "a" * 64, "torch_metadata_sha256": "b" * 64, "torch_record_sha256": "c" * 64}  # fmt: skip
+    fingerprints = {"torch": "2.9.1", "torch_hip": hip, "torch_binary_sha256": "d" * 64, "torch_file_sha256": "a" * 64, "torch_metadata_sha256": "b" * 64, "torch_record_sha256": "c" * 64}  # fmt: skip
 
     def matching_dependencies(versions: dict[str, str]) -> bool:
         if dependencies:
@@ -81,6 +81,10 @@ def fake_torch_install(tmp_path: Path):
     root = tmp_path / "site-packages"
     files = {
         root / "torch/__init__.py": b"torch",
+        root / "torch/lib/libtorch.so": b"torch-binary",
+        root / "torch/lib/libtorch_cpu.so": b"cpu-binary",
+        root / "torch/lib/libtorch_hip.so": b"hip-binary",
+        root / "torch/lib/libtorch_python.so": b"python-binary",
         root / "torch-2.9.1.dist-info/METADATA": b"meta",
         root / "torch-2.9.1.dist-info/RECORD": b"record",
     }
@@ -88,8 +92,13 @@ def fake_torch_install(tmp_path: Path):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(content)
     torch = SimpleNamespace(__version__="2.9.1", __file__=str(root / "torch/__init__.py"), version=SimpleNamespace(hip=None))  # fmt: skip
-    distribution = SimpleNamespace(root=root, version="2.9.1", metadata={"Name": "torch"}, files=[Path("torch/__init__.py"), Path("torch-2.9.1.dist-info/METADATA"), Path("torch-2.9.1.dist-info/RECORD")], locate_file=lambda relative: root / relative)  # fmt: skip
+    distribution = SimpleNamespace(root=root, version="2.9.1", metadata={"Name": "torch"}, files=[Path(path.relative_to(root)) for path in files], locate_file=lambda relative: root / relative)  # fmt: skip
     return torch, distribution
+
+
+class _TorchVersionLike:
+    def __str__(self) -> str:
+        return "2.9.1+gitff65f5b"
 
 
 INVALID_ARGUMENTS = [["--phase", "post", "--json-out", "out.json"], ["--phase", "pre", "--json-out", "out.json", "--repo-sha", "bad"], ["--phase", "pre", "--json-out", "out.json", "--lock-sha", "bad"], ["--phase", "wrong", "--json-out", "out.json"], ["--phase", "pre", "--json-out", "/private/token", "--unknown", "secret"]]  # fmt: skip
@@ -227,6 +236,42 @@ def test_dependencies_match_real_metadata_exact_missing_and_mismatch(
         ),
     )
     assert not probe.dependencies_match(dict(base))
+
+
+def test_torch_fingerprints_accept_verified_rocm_local_build(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    torch, distribution = fake_torch_install(tmp_path)
+    torch.__version__ = _TorchVersionLike()
+    torch.version.hip = "7.2.53211-e1a6bc5663"
+    distribution.version = "2.9.1+gitff65f5b"
+    monkeypatch.setattr(
+        probe.importlib.metadata, "distribution", lambda _: distribution
+    )
+
+    fingerprints = probe.torch_fingerprints(torch)
+
+    assert fingerprints["torch"] == "2.9.1+gitff65f5b"
+    assert fingerprints["torch_hip"] == "7.2.53211-e1a6bc5663"
+    assert probe.valid_fingerprints(fingerprints, "7.2.53211-e1a6bc5663")
+    assert probe.hip_matches("7.2.53211-e1a6bc5663")
+
+
+def test_fingerprints_reject_unapproved_torch_build() -> None:
+    fingerprints = {
+        "torch": "2.9.1+unknown",
+        "torch_hip": "7.2.53211-e1a6bc5663",
+        "torch_binary_sha256": "d" * 64,
+        "torch_file_sha256": "a" * 64,
+        "torch_metadata_sha256": "b" * 64,
+        "torch_record_sha256": "c" * 64,
+    }
+
+    assert not probe.valid_fingerprints(fingerprints, fingerprints["torch_hip"])
+
+
+def test_hip_match_rejects_unapproved_build() -> None:
+    assert not probe.hip_matches("7.2.99999-unknown")
 
 
 def test_baseline_requires_exactly_one_trailing_lf(tmp_path: Path) -> None:
@@ -465,18 +510,16 @@ def test_torch_fingerprints_bind_one_canonical_distribution(
         probe.torch_fingerprints(torch)
 
 
-def test_torch_fingerprints_hash_three_bound_files(tmp_path, monkeypatch) -> None:
+def test_torch_fingerprints_hash_bound_python_metadata_and_binaries(tmp_path, monkeypatch) -> None:  # fmt: skip
     torch, distribution = fake_torch_install(tmp_path)
     monkeypatch.setattr(
         probe.importlib.metadata, "distribution", lambda _: distribution
     )
-    assert probe.torch_fingerprints(torch) == {
-        "torch": "2.9.1",
-        "torch_hip": "",
-        "torch_file_sha256": hashlib.sha256(b"torch").hexdigest(),
-        "torch_metadata_sha256": hashlib.sha256(b"meta").hexdigest(),
-        "torch_record_sha256": hashlib.sha256(b"record").hexdigest(),
-    }
+    fingerprints = probe.torch_fingerprints(torch)
+    expected = {"torch": "2.9.1", "torch_hip": "", "torch_binary_sha256": "c712ade6dc7964551b3192498325f364710cb3bae2528a6080d6e5559851fd82", "torch_file_sha256": hashlib.sha256(b"torch").hexdigest(), "torch_metadata_sha256": hashlib.sha256(b"meta").hexdigest(), "torch_record_sha256": hashlib.sha256(b"record").hexdigest()}  # fmt: skip
+    assert fingerprints == expected
+    (distribution.root / "torch/lib/libtorch.so").write_bytes(b"changed")
+    assert probe.torch_fingerprints(torch)["torch_binary_sha256"] != fingerprints["torch_binary_sha256"]  # fmt: skip
 
 
 @pytest.mark.parametrize("kind", ["symlink", "special", "fifo", "outside", "changed"])

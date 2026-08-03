@@ -20,21 +20,95 @@ from typing import Any, Callable
 
 
 SCHEMA_KEYS = frozenset(("schema_version", "status", "stage", "reason_code", "repo_sha", "lock_sha", "checks", "versions", "devices"))  # fmt: skip
-TORCH_KEYS = ("torch", "torch_hip", "torch_file_sha256", "torch_metadata_sha256", "torch_record_sha256")  # fmt: skip
+TORCH_KEYS = ("torch", "torch_hip", "torch_binary_sha256", "torch_file_sha256", "torch_metadata_sha256", "torch_record_sha256")  # fmt: skip
+REQUIRED_TORCH_BINARY_PATHS = frozenset((Path("torch/lib/libtorch_cpu.so"), Path("torch/lib/libtorch_hip.so"), Path("torch/lib/libtorch_python.so")))  # fmt: skip
 DEPENDENCIES = {
-    "diffusers": "0.39.0",
-    "transformers": "4.57.3",
+    "Brotli": "1.2.0",
+    "Jinja2": "3.1.6",
+    "MarkupSafe": "2.1.5",
+    "Pygments": "2.15.0",
+    "PyYAML": "6.0.3",
     "accelerate": "1.12.0",
-    "safetensors": "0.8.0",
+    "aiofiles": "23.2.1",
+    "annotated-doc": "0.0.4",
+    "annotated-types": "0.7.0",
+    "anyio": "4.12.1",
+    "certifi": "2026.2.25",
+    "charset-normalizer": "3.4.5",
+    "click": "8.3.0",
+    "contourpy": "1.3.3",
+    "cycler": "0.12.1",
+    "diffusers": "0.39.0",
+    "fastapi": "0.135.1",
+    "ffmpy": "1.0.0",
+    "filelock": "3.20.0",
+    "fonttools": "4.62.1",
+    "fsspec": "2025.9.0",
+    "gradio": "6.15.1",
+    "gradio-client": "2.5.0",
+    "groovy": "0.1.2",
+    "h11": "0.16.0",
+    "hf-xet": "1.4.2",
+    "hf-gradio": "0.4.1",
+    "httpcore": "1.0.9",
+    "httpx": "0.28.1",
+    "huggingface-hub": "0.36.2",
+    "idna": "3.11",
+    "importlib-metadata": "9.0.0",
+    "importlib-resources": "6.5.2",
+    "kiwisolver": "1.5.0",
+    "markdown-it-py": "4.0.0",
+    "matplotlib": "3.10.8",
+    "mdurl": "0.1.2",
+    "transformers": "4.57.3",
     "numpy": "1.26.4",
     "opencv-python-headless": "4.11.0.86",
-    "Pillow": "11.3.0",
+    "orjson": "3.11.9",
+    "packaging": "26.0",
+    "pandas": "2.2.3",
+    "Pillow": "12.3.0",
+    "psutil": "7.1.0",
     "pydantic": "2.11.10",
-    "PyYAML": "6.0.3",
+    "pydantic-core": "2.33.2",
+    "pydub": "0.25.1",
+    "pyparsing": "3.3.2",
+    "python-dateutil": "2.9.0.post0",
+    "python-multipart": "0.0.32",
+    "pytz": "2026.1.post1",
+    "regex": "2026.2.28",
+    "requests": "2.32.5",
+    "rich": "14.3.3",
+    "ruff": "0.16.1",
+    "safetensors": "0.8.0",
+    "safehttpx": "0.1.7",
+    "semantic-version": "2.10.0",
+    "shellingham": "1.5.4",
+    "six": "1.17.0",
+    "starlette": "1.3.1",
+    "tokenizers": "0.22.2",
+    "tomlkit": "0.12.0",
+    "tqdm": "4.67.3",
+    "typer": "0.24.1",
+    "typing-extensions": "4.15.0",
+    "typing-inspection": "0.4.2",
+    "tzdata": "2025.3",
+    "urllib3": "2.6.3",
+    "uvicorn": "0.42.0",
+    "websockets": "12.0",
+    "zipp": "4.1.0",
 }
-TORCH_VERSIONS = frozenset(("2.9.1", "2.8.0", "2.7.1"))
+TORCH_DISTRIBUTION_BY_BUILD = {
+    "2.9.1+gitff65f5b": "2.9.1+gitff65f5b",
+    "2.9.1": "2.9.1",
+    "2.8.0": "2.8.0",
+    "2.7.1": "2.7.1",
+}
+TORCH_VERSIONS = frozenset(TORCH_DISTRIBUTION_BY_BUILD)
+HIP_BUILDS = frozenset(("7.2.53211-e1a6bc5663", "7.2.1"))
 PRE_CHECKS = frozenset(("linux", "cpython_3_12", "rocm_7_2_1", "torch_version", "hip_7_2", "cuda_available", "device_evidence", "fp16"))  # fmt: skip
 MAX_EVIDENCE_BYTES, MAX_GCN_CHARS = 65536, 32
+MAX_TORCH_BINARY_COUNT, MAX_TORCH_BINARY_BYTES = 128, 1024 * 1024 * 1024
+MAX_TORCH_BINARY_TOTAL_BYTES = 2 * 1024 * 1024 * 1024
 SAFE_FLAGS = getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
 DIRECTORY_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | SAFE_FLAGS
 READ_FLAGS = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | SAFE_FLAGS
@@ -109,6 +183,27 @@ def sha256_file(
     return hashlib.sha256(trusted_file_bytes(path, limit, root=root)).hexdigest()
 
 
+def sha256_stream_file(path: Path, limit: int = MAX_TORCH_BINARY_BYTES, *, root: Path | None = None) -> tuple[int, str]:  # fmt: skip
+    fd = open_rooted_file(root or path.parent, path)
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode) or opened.st_uid not in (0, os.geteuid()) or opened.st_nlink != 1 or not 0 < opened.st_size <= limit:  # fmt: skip
+            raise ValueError("unsafe file")
+        digest = hashlib.sha256()
+        remaining = opened.st_size
+        while remaining:
+            chunk = os.read(fd, min(1024 * 1024, remaining))
+            if not chunk:
+                raise ValueError("unsafe file")
+            digest.update(chunk)
+            remaining -= len(chunk)
+        if os.read(fd, 1) or not same_identity(opened, os.fstat(fd)):
+            raise ValueError("changed file")
+        return opened.st_size, digest.hexdigest()
+    finally:
+        os.close(fd)
+
+
 def trusted_file_bytes(path: Path, limit: int, *, root: Path | None = None) -> bytes:
     fd = open_rooted_file(root or path.parent, path)
     try:
@@ -150,15 +245,36 @@ def distribution_file(distribution: Any, name: str) -> Path:
     return Path(distribution.locate_file(matches[0]))
 
 
+def torch_binary_fingerprint(
+    distribution: Any, root: Path, files: tuple[Path, ...]
+) -> str:
+    manifest: list[dict[str, object]] = []
+    binaries = tuple(sorted(path for path in files if path.parent == Path("torch/lib")))
+    if not REQUIRED_TORCH_BINARY_PATHS.issubset(binaries) or not 3 <= len(binaries) <= MAX_TORCH_BINARY_COUNT or any(files.count(path) != 1 for path in binaries):  # fmt: skip
+        raise ValueError("distribution binary set invalid")
+    total = 0
+    for relative in binaries:
+        target = Path(distribution.locate_file(relative))
+        size, digest = sha256_stream_file(target, root=root)
+        total += size
+        if total > MAX_TORCH_BINARY_TOTAL_BYTES:
+            raise ValueError("distribution binaries too large")
+        manifest.append({"path": relative.as_posix(), "sha256": digest, "size": size})
+    material = canonical_json(manifest).encode("ascii")
+    return hashlib.sha256(material).hexdigest()
+
+
 def torch_fingerprints(torch: Any) -> dict[str, str]:
     distribution = importlib.metadata.distribution("torch")
-    version = torch.__version__
+    try:
+        version = str(torch.__version__)
+    except Exception:
+        raise ValueError("distribution mismatch") from None
     name = distribution.metadata.get("Name")
     if (
-        type(version) is not str
-        or version not in TORCH_VERSIONS
+        version not in TORCH_DISTRIBUTION_BY_BUILD
         or type(distribution.version) is not str
-        or distribution.version != version
+        or distribution.version != TORCH_DISTRIBUTION_BY_BUILD[version]
         or type(name) is not str
         or name.lower().replace("_", "-") != "torch"
     ):
@@ -179,6 +295,7 @@ def torch_fingerprints(torch: Any) -> dict[str, str]:
     return {
         "torch": version,
         "torch_hip": str(torch.version.hip or ""),
+        "torch_binary_sha256": torch_binary_fingerprint(distribution, root, files),
         "torch_file_sha256": sha256_file(torch_file, root=root),
         "torch_metadata_sha256": sha256_file(metadata, root=root),
         "torch_record_sha256": sha256_file(record, root=root),
@@ -186,8 +303,7 @@ def torch_fingerprints(torch: Any) -> dict[str, str]:
 
 
 def hip_matches(version: object) -> bool:
-    parts = str(version or "").split(".")
-    return len(parts) >= 2 and parts[0:2] == ["7", "2"]
+    return str(version or "") in HIP_BUILDS
 
 
 def device_evidence(torch: Any) -> list[dict[str, Any]]:
@@ -318,9 +434,13 @@ def valid_gcn(value: object) -> bool:
 def valid_version(value: object) -> bool:
     if not valid_public_text(value):
         return False
-    parts = value.split(".")
-    return 2 <= len(parts) <= 4 and all(
-        part.isascii() and part.isdecimal() for part in parts
+    return (
+        re.fullmatch(
+            r"(?:0|[1-9][0-9]*)(?:\.(?:0|[1-9][0-9]*)){1,3}"
+            r"(?:\.(?:post|rc|dev)[0-9]+)?",
+            value,
+        )
+        is not None
     )
 
 
@@ -329,7 +449,9 @@ def valid_fingerprints(value: object, torch_hip: object) -> bool:
         return False
     if value.get("torch") not in TORCH_VERSIONS:
         return False
-    if not valid_version(value.get("torch_hip")) or value["torch_hip"] != torch_hip:
+    if not valid_public_text(value.get("torch_hip")) or value["torch_hip"] != str(
+        torch_hip or ""
+    ):
         return False
     return all(
         isinstance(value[key], str)

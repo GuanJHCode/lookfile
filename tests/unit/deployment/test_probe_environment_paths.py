@@ -47,6 +47,7 @@ def baseline_value(hash_char: str = "a") -> dict:
             "rocm": "7.2.1",
             "torch": "2.9.1",
             "torch_hip": "7.2.1",
+            "torch_binary_sha256": "d" * 64,
             "torch_file_sha256": hash_char * 64,
             "torch_metadata_sha256": "b" * 64,
             "torch_record_sha256": "c" * 64,
