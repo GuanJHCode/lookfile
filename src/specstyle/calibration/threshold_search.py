@@ -33,13 +33,13 @@ class ThresholdDecision:
     calibration_fpr: float
     validation_tpr: float
     validation_fpr: float
-    status: str  # DRAFT | VALIDATED | REJECTED
+    status: str  # DRAFT | VALIDATION_PASSED | REJECTED
     decision_hash: Sha256
 
     def __post_init__(self) -> None:
         if self.operator != "gte":
             raise DomainError("unsupported operator")
-        if self.status not in ("DRAFT", "VALIDATED", "REJECTED"):
+        if self.status not in ("DRAFT", "VALIDATION_PASSED", "REJECTED"):
             raise DomainError("invalid threshold status")
 
 
@@ -127,7 +127,7 @@ def freeze_threshold(
     elif val_tpr < min_tpr or val_fpr > max_fpr:
         status = "REJECTED"
     else:
-        status = "VALIDATED"
+        status = "VALIDATION_PASSED"
     material = (
         f"{metric_id}:gte:{threshold:.8f}:{cal_tpr:.6f}:{cal_fpr:.6f}:"
         f"{val_tpr:.6f}:{val_fpr:.6f}:{status}"
@@ -151,6 +151,6 @@ def holdout_evaluate(
     """Final test look — does not change decision status."""
     if type(decision) is not ThresholdDecision:
         raise DomainError("invalid decision")
-    if decision.status != "VALIDATED":
-        raise DomainError("only VALIDATED thresholds may view test")
+    if decision.status != "VALIDATION_PASSED":
+        raise DomainError("only VALIDATION_PASSED thresholds may view test")
     return binary_rates(test, decision.threshold, decision.operator)

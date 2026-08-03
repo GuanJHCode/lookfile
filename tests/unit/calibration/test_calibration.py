@@ -69,7 +69,8 @@ def test_l2_calibration_selects_and_freezes() -> None:
         return 0.9 if s.label_positive else 0.1
 
     result = run_l2_calibration(tuple(samples), score, max_fpr=0.2, min_tpr=0.7)
-    assert result.decision.status in ("VALIDATED", "REJECTED", "DRAFT")
+    assert result.decision.status in ("VALIDATION_PASSED", "REJECTED", "DRAFT")
+    assert result.decision.status != "VALIDATED"
     assert result.test_held is True
     assert result.manifest.manifest_hash
 
@@ -87,7 +88,7 @@ def test_threshold_selection_prefers_feasible() -> None:
     assert thr > 0.5
 
 
-def test_holdout_requires_validated() -> None:
+def test_holdout_requires_validation_passed() -> None:
     from specstyle.calibration.threshold_search import ThresholdDecision
 
     dec = ThresholdDecision(
@@ -101,7 +102,7 @@ def test_holdout_requires_validated() -> None:
         "REJECTED",
         Sha256("c" * 64),
     )
-    with pytest.raises(DomainError, match="VALIDATED"):
+    with pytest.raises(DomainError, match="VALIDATION_PASSED"):
         holdout_evaluate(dec, (ScoredPair("t", 0.6, True),))
 
 
@@ -117,4 +118,5 @@ def test_l3_calibration_components() -> None:
     result = run_l3_calibration(samples, score, score, score)
     assert result.geometry.component == "geometry"
     assert result.features.decision.metric_id.startswith("l3_")
-    assert result.composite.decision.status in ("VALIDATED", "REJECTED")
+    assert result.composite.decision.status in ("VALIDATION_PASSED", "REJECTED")
+    assert result.composite.decision.status != "VALIDATED"
