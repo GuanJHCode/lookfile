@@ -21,12 +21,14 @@ def _publication(run_id: str) -> PreviewEvidencePublication:
         Sha256("a" * 64),
         Sha256("d" * 64),
         Sha256("c" * 64),
-        "specstyle.preview.evidence.v2",
+        "specstyle.preview.evidence.v3",
         0,
         "specstyle.seed.v1",
         1,
         (512, 512),
         "ENGINEERING_ONLY",
+        "float16",
+        "float32",
     )
 
 

@@ -194,7 +194,7 @@ def _valid_binding_material(binding: PreviewExecutionBinding, material: object) 
     compiled = material["compiled_request"]
     return (
         _canonical_json(material) == binding.material_json
-        and material["schema_version"] == "specstyle.preview.execution.v2"
+        and material["schema_version"] == "specstyle.preview.execution.v3"
         and _valid_compiled_material(compiled)
         and material["compiled_request_fingerprint"]
         == binding.compiled_request_fingerprint.value
@@ -361,7 +361,7 @@ def bind_preview_execution(loaded: object, request: object) -> PreviewExecutionB
     }
     compiled_fingerprint = _fingerprint(_canonical_json(compiled_material))
     material = {
-        "schema_version": "specstyle.preview.execution.v2",
+        "schema_version": "specstyle.preview.execution.v3",
         "compiled_request_fingerprint": compiled_fingerprint.value,
         "compiled_request": compiled_material,
         "models": json.loads(loaded._model_bindings_json),
@@ -372,6 +372,7 @@ def bind_preview_execution(loaded: object, request: object) -> PreviewExecutionB
             "diffusers_version": loaded._runtime[2],
             "peft_version": loaded._peft_version,
             "dtype": loaded._runtime[3],
+            "vae_dtype": loaded._vae_dtype,
         },
         "scheduler": {
             "identity": loaded._scheduler_identity,

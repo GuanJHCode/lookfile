@@ -86,7 +86,7 @@ def test_preview_evidence_atomically_publishes_private_pair_then_display(
     ]
     record = json.loads((evidence / "record.json").read_text(encoding="utf-8"))
     display_bytes = (display / published.display_name).read_bytes()
-    assert record["schema_version"] == "specstyle.preview.evidence.v2"
+    assert record["schema_version"] == "specstyle.preview.evidence.v3"
     assert record["run_id"] == "preview-run-1"
     assert record["evidence_class"] == "ENGINEERING_ONLY"
     assert record["generation"] == {
@@ -101,6 +101,7 @@ def test_preview_evidence_atomically_publishes_private_pair_then_display(
     assert record["artifact"]["execution_fingerprint"] == (
         artifact.execution_fingerprint.value
     )
+    assert record["runtime"] == {"dtype": "float16", "vae_dtype": "float32"}
     assert record["planes"] == {
         "verification": "NOT_RUN",
         "repair": "NOT_RUN",
@@ -108,7 +109,9 @@ def test_preview_evidence_atomically_publishes_private_pair_then_display(
     }
     assert "APPROVED" not in (evidence / "record.json").read_text()
     assert published.content_sha256 == hash_bytes(display_bytes)
-    assert published.schema_version == "specstyle.preview.evidence.v2"
+    assert published.schema_version == "specstyle.preview.evidence.v3"
+    assert published.runtime_dtype == "float16"
+    assert published.vae_dtype == "float32"
     assert published.variation_index == 0
     assert published.seed_algorithm == "specstyle.seed.v1"
     assert published.resolution == (512, 512)
@@ -157,7 +160,7 @@ def test_preview_evidence_rejects_cross_run_artifact_republication(
         os.close(private_fd)
 
 
-def test_stored_v2_publication_is_reverified_before_wall_use(
+def test_stored_v3_publication_is_reverified_before_wall_use(
     tmp_path: Path,
 ) -> None:
     from specstyle.workflow.preview_evidence import (
@@ -185,7 +188,7 @@ def test_stored_v2_publication_is_reverified_before_wall_use(
 
 
 @pytest.mark.parametrize("corruption", ("extra_file", "noncanonical_record"))
-def test_stored_v2_publication_rejects_record_structure_corruption(
+def test_stored_v3_publication_rejects_record_structure_corruption(
     tmp_path: Path, corruption: str
 ) -> None:
     from specstyle.workflow.preview_evidence import (
@@ -212,7 +215,7 @@ def test_stored_v2_publication_rejects_record_structure_corruption(
         os.close(private_fd)
 
 
-def test_stored_v2_publication_rejects_compiled_fingerprint_tamper(
+def test_stored_v3_publication_rejects_compiled_fingerprint_tamper(
     tmp_path: Path,
 ) -> None:
     from specstyle.exporting.qa_report import canonical_json_bytes
@@ -237,7 +240,30 @@ def test_stored_v2_publication_rejects_compiled_fingerprint_tamper(
         os.close(private_fd)
 
 
-def test_stored_v2_publication_rejects_invalid_call(tmp_path: Path) -> None:
+def test_stored_v3_publication_rejects_vae_dtype_tamper(tmp_path: Path) -> None:
+    from specstyle.exporting.qa_report import canonical_json_bytes
+    from specstyle.workflow.preview_evidence import (
+        publish_preview_evidence,
+        verify_preview_evidence_publication,
+    )
+
+    run_id = "preview-vae-dtype"
+    artifact = _artifact(tmp_path, run_id)
+    private_fd, display_fd, private, _display = _roots(tmp_path)
+    try:
+        publication = publish_preview_evidence(private_fd, display_fd, run_id, artifact)
+        record_path = private / run_id / "record.json"
+        record = json.loads(record_path.read_text())
+        record["runtime"]["vae_dtype"] = "float16"
+        record_path.write_bytes(canonical_json_bytes(record))
+        with pytest.raises(DomainError, match="record"):
+            verify_preview_evidence_publication(private_fd, publication)
+    finally:
+        os.close(display_fd)
+        os.close(private_fd)
+
+
+def test_stored_v3_publication_rejects_invalid_call(tmp_path: Path) -> None:
     from specstyle.workflow.preview_evidence import verify_preview_evidence_publication
 
     private_fd, display_fd, _private, _display = _roots(tmp_path)
@@ -322,6 +348,34 @@ def test_reconcile_keeps_legacy_v1_preview_evidence(tmp_path: Path) -> None:
         record["schema_version"] = "specstyle.preview.evidence.v1"
         record.pop("evidence_class")
         record.pop("generation")
+        record.pop("runtime")
+        record_path.write_bytes(canonical_json_bytes(record))
+
+        removed = reconcile_preview_display(private_fd, display_fd)
+    finally:
+        os.close(display_fd)
+        os.close(private_fd)
+    assert removed == ()
+    assert (display / published.display_name).is_file()
+
+
+def test_reconcile_keeps_legacy_v2_preview_evidence(tmp_path: Path) -> None:
+    from specstyle.exporting.qa_report import canonical_json_bytes
+    from specstyle.workflow.preview_evidence import (
+        publish_preview_evidence,
+        reconcile_preview_display,
+    )
+
+    artifact = _artifact(tmp_path, "preview-legacy-v2")
+    private_fd, display_fd, private, display = _roots(tmp_path)
+    try:
+        published = publish_preview_evidence(
+            private_fd, display_fd, "preview-legacy-v2", artifact
+        )
+        record_path = private / published.evidence_name / "record.json"
+        record = json.loads(record_path.read_text())
+        record["schema_version"] = "specstyle.preview.evidence.v2"
+        record.pop("runtime")
         record_path.write_bytes(canonical_json_bytes(record))
 
         removed = reconcile_preview_display(private_fd, display_fd)

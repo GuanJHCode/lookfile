@@ -34,12 +34,14 @@ def _publication(run_id: str, variation_index: int, content: bytes):
         Sha256(digest),
         Sha256("f" * 64),
         Sha256(f"{variation_index + 1:064x}"),
-        "specstyle.preview.evidence.v2",
+        "specstyle.preview.evidence.v3",
         variation_index,
         "specstyle.seed.v1",
         100 + variation_index,
         (512, 512),
         "ENGINEERING_ONLY",
+        "float16",
+        "float32",
     )
 
 

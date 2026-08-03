@@ -65,8 +65,10 @@ class PreviewWallEvidenceItem:
         if completed:
             publication = self.publication
             if (
-                publication.schema_version != "specstyle.preview.evidence.v2"
+                publication.schema_version != "specstyle.preview.evidence.v3"
                 or publication.evidence_class != "ENGINEERING_ONLY"
+                or publication.runtime_dtype != "float16"
+                or publication.vae_dtype != "float32"
                 or publication.evidence_name != self.run_id
                 or publication.variation_index != self.variation_index
             ):
@@ -99,6 +101,9 @@ def _item_primitive(item: PreviewWallEvidenceItem) -> dict[str, object]:
                 item.publication.compiled_request_fingerprint.value
             ),
             "execution_fingerprint": item.publication.execution_fingerprint.value,
+            "evidence_schema_version": item.publication.schema_version,
+            "runtime_dtype": item.publication.runtime_dtype,
+            "vae_dtype": item.publication.vae_dtype,
             "seed_algorithm": item.publication.seed_algorithm,
             "seed": item.publication.seed,
             "resolution": list(item.publication.resolution),
@@ -165,7 +170,7 @@ def _manifest(
         raise DomainError("invalid preview wall metrics")
     return canonical_json_bytes(
         {
-            "schema_version": "specstyle.preview.wall-evidence.v1",
+            "schema_version": "specstyle.preview.wall-evidence.v2",
             "wall_id": wall_id,
             "profile": "preview",
             "evidence_class": "ENGINEERING_ONLY",

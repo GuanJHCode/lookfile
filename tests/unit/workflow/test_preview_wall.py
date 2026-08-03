@@ -23,12 +23,14 @@ def _publication(
         Sha256(content),
         Sha256("c" * 64),
         Sha256("b" * 64),
-        "specstyle.preview.evidence.v2",
+        "specstyle.preview.evidence.v3",
         variation_index,
         "specstyle.seed.v1",
         1000 + variation_index,
         (512, 512),
         "ENGINEERING_ONLY",
+        "float16",
+        "float32",
     )
 
 

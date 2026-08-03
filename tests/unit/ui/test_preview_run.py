@@ -51,12 +51,14 @@ def _publication(
         Sha256(digest),
         Sha256("d" * 64),
         Sha256("c" * 64),
-        "specstyle.preview.evidence.v2",
+        "specstyle.preview.evidence.v3",
         0,
         "specstyle.seed.v1",
         1,
         (512, 512),
         "ENGINEERING_ONLY",
+        "float16",
+        "float32",
     )
 
 

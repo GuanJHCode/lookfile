@@ -73,6 +73,8 @@ class PreviewEvidencePublication:
     seed: int
     resolution: tuple[int, int]
     evidence_class: str
+    runtime_dtype: str
+    vae_dtype: str
 
     def __post_init__(self) -> None:
         if (
@@ -84,7 +86,7 @@ class PreviewEvidencePublication:
             or type(self.content_sha256) is not Sha256
             or type(self.compiled_request_fingerprint) is not Sha256
             or type(self.execution_fingerprint) is not Sha256
-            or self.schema_version != "specstyle.preview.evidence.v2"
+            or self.schema_version != "specstyle.preview.evidence.v3"
             or type(self.variation_index) is not int
             or not 0 <= self.variation_index < 2**31
             or self.seed_algorithm != "specstyle.seed.v1"
@@ -94,6 +96,8 @@ class PreviewEvidencePublication:
             or len(self.resolution) != 2
             or any(type(item) is not int or item <= 0 for item in self.resolution)
             or self.evidence_class != "ENGINEERING_ONLY"
+            or self.runtime_dtype != "float16"
+            or self.vae_dtype != "float32"
         ):
             raise _domain()
 
@@ -170,14 +174,16 @@ def _record(
     display_name: str,
     artifact: PreviewGeneratedArtifact,
     generation: dict[str, object],
+    runtime: dict[str, str],
 ) -> bytes:
     return canonical_json_bytes(
         {
-            "schema_version": "specstyle.preview.evidence.v2",
+            "schema_version": "specstyle.preview.evidence.v3",
             "run_id": run_id,
             "profile": "preview",
             "evidence_class": "ENGINEERING_ONLY",
             "generation": generation,
+            "runtime": runtime,
             "artifact": {
                 "artifact_id": artifact.artifact_id.value,
                 "file": "artifact.png",
@@ -297,7 +303,8 @@ def publish_preview_evidence(
         display_fd, display_dev, display_identity = _duplicate_root(display_root_fd)
         if private_identity == display_identity:
             raise _domain()
-        record = _record(run_id, display_name, artifact, generation)
+        runtime = _evidence_runtime(material)
+        record = _record(run_id, display_name, artifact, generation, runtime)
         _publish_private(private_fd, private_dev, run_id, artifact, record)
         _publish_display(display_fd, display_dev, display_name, artifact)
         return PreviewEvidencePublication(
@@ -307,12 +314,14 @@ def publish_preview_evidence(
             artifact.content_sha256,
             artifact.binding.compiled_request_fingerprint,
             artifact.execution_fingerprint,
-            "specstyle.preview.evidence.v2",
+            "specstyle.preview.evidence.v3",
             generation["variation_index"],
             generation["seed"]["algorithm"],
             generation["seed"]["value"],
             tuple(generation["resolution"]),
             "ENGINEERING_ONLY",
+            runtime["dtype"],
+            runtime["vae_dtype"],
         )
     finally:
         close_owned(display_fd, sys.exception())
@@ -356,6 +365,7 @@ def _match_publication_record(
         "profile",
         "evidence_class",
         "generation",
+        "runtime",
         "artifact",
         "planes",
     }
@@ -368,7 +378,7 @@ def _match_publication_record(
         or raw.get("evidence_class") != publication.evidence_class
         or raw.get("planes")
         != {"verification": "NOT_RUN", "repair": "NOT_RUN", "export": "NOT_RUN"}
-        or not _valid_v2(raw)
+        or not _valid_v3(raw)
         or type(artifact) is not dict
         or set(artifact)
         != {
@@ -382,6 +392,7 @@ def _match_publication_record(
     ):
         raise _domain("invalid preview evidence record")
     generation = raw["generation"]
+    runtime = raw["runtime"]
     expected_generation = {
         "variation_index": publication.variation_index,
         "seed": {
@@ -392,6 +403,11 @@ def _match_publication_record(
     }
     if (
         generation != expected_generation
+        or runtime
+        != {
+            "dtype": publication.runtime_dtype,
+            "vae_dtype": publication.vae_dtype,
+        }
         or artifact["artifact_id"] != publication.artifact_id.value
         or artifact["file"] != "artifact.png"
         or artifact["display_file"] != publication.display_name
@@ -439,12 +455,14 @@ def _valid_record(root_fd: int, root_dev: int, name: str) -> tuple[str, Sha256] 
             not in {
                 "specstyle.preview.evidence.v1",
                 "specstyle.preview.evidence.v2",
+                "specstyle.preview.evidence.v3",
             }
             or raw.get("run_id") != name
             or raw.get("profile") != "preview"
             or raw.get("planes")
             != {"verification": "NOT_RUN", "repair": "NOT_RUN", "export": "NOT_RUN"}
             or (version == "specstyle.preview.evidence.v2" and not _valid_v2(raw))
+            or (version == "specstyle.preview.evidence.v3" and not _valid_v3(raw))
         ):
             return None
         artifact = raw.get("artifact")
@@ -487,6 +505,23 @@ def _valid_v2(raw: dict[str, object]) -> bool:
         and len(resolution) == 2
         and all(type(item) is int and item > 0 for item in resolution)
     )
+
+
+def _valid_v3(raw: dict[str, object]) -> bool:
+    return _valid_v2(raw) and raw.get("runtime") == {
+        "dtype": "float16",
+        "vae_dtype": "float32",
+    }
+
+
+def _evidence_runtime(material: dict[str, object]) -> dict[str, str]:
+    runtime = material.get("runtime")
+    if type(runtime) is not dict or (
+        runtime.get("dtype"),
+        runtime.get("vae_dtype"),
+    ) != ("float16", "float32"):
+        raise _domain("invalid preview execution runtime")
+    return {"dtype": "float16", "vae_dtype": "float32"}
 
 
 def _remove_display_file(root_fd: int, root_dev: int, name: str) -> bool:

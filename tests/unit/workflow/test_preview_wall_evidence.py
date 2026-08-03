@@ -19,12 +19,14 @@ def _publication(run_id: str, variation_index: int, digest: str):
         Sha256(digest),
         Sha256("f" * 64),
         Sha256(f"{variation_index + 1:064x}"),
-        "specstyle.preview.evidence.v2",
+        "specstyle.preview.evidence.v3",
         variation_index,
         "specstyle.seed.v1",
         100 + variation_index,
         (512, 512),
         "ENGINEERING_ONLY",
+        "float16",
+        "float32",
     )
 
 
@@ -141,7 +143,7 @@ def test_wall_rejects_publication_for_different_variation() -> None:
         )
 
 
-def test_wall_rejects_publication_without_private_v2_evidence(tmp_path: Path) -> None:
+def test_wall_rejects_publication_without_private_v3_evidence(tmp_path: Path) -> None:
     from specstyle.workflow.preview_wall_evidence import publish_preview_wall_evidence
 
     wall_id = "preview-wall-" + "5" * 32
@@ -159,7 +161,7 @@ def test_wall_rejects_publication_without_private_v2_evidence(tmp_path: Path) ->
         os.close(root_fd)
 
 
-def test_wall_accepts_publication_backed_by_private_v2_evidence(tmp_path: Path) -> None:
+def test_wall_accepts_publication_backed_by_private_v3_evidence(tmp_path: Path) -> None:
     from specstyle.workflow.preview_evidence import publish_preview_evidence
     from specstyle.workflow.preview_wall_evidence import (
         PreviewWallEvidenceItem,
@@ -192,3 +194,12 @@ def test_wall_accepts_publication_backed_by_private_v2_evidence(tmp_path: Path) 
         os.close(display_fd)
         os.close(root_fd)
     assert publication.evidence_name == wall_id
+    manifest = json.loads(
+        (_root_path / publication.evidence_name / "manifest.json").read_text()
+    )
+    assert manifest["schema_version"] == "specstyle.preview.wall-evidence.v2"
+    assert manifest["items"][0]["artifact"]["evidence_schema_version"] == (
+        "specstyle.preview.evidence.v3"
+    )
+    assert manifest["items"][0]["artifact"]["runtime_dtype"] == "float16"
+    assert manifest["items"][0]["artifact"]["vae_dtype"] == "float32"

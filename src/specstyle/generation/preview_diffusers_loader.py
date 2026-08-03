@@ -36,6 +36,8 @@ _SCHEDULER_IDENTITY = "diffusers.LCMScheduler"
 _LORA_FUSE_SCALE = 1.0
 _LORA_ADAPTER_NAME = "specstyle_lcm"
 _PEFT_VERSION = "0.18.1"
+_RUNTIME_DTYPE = "float16"
+_VAE_DTYPE = "float32"
 _PIPELINE_COMPONENTS = (
     "unet",
     "controlnet",
@@ -91,6 +93,7 @@ class LoadedPreviewPipeline:
     _scheduler_identity: str = field(repr=False, compare=False)
     _scheduler_config_json: str = field(repr=False, compare=False)
     _lora_fuse_scale: float = field(repr=False, compare=False)
+    _vae_dtype: str = field(repr=False, compare=False)
     _integrity: _PipelineIntegrity | None = field(repr=False, compare=False)
     _torch: Any = field(repr=False, compare=False)
     _closed: bool = field(repr=False, compare=False)
@@ -144,12 +147,13 @@ def _validate_loaded_preview_pipeline(value: object, *, require_open: bool) -> N
         or type(getattr(value, "_runtime", None)) is not tuple
         or len(value._runtime) != 4
         or any(type(item) is not str for item in value._runtime)
-        or value._runtime[3] != "float16"
+        or value._runtime[3] != _RUNTIME_DTYPE
         or getattr(value, "_peft_version", None) != _PEFT_VERSION
         or type(getattr(value, "_model_bindings_json", None)) is not str
         or getattr(value, "_scheduler_identity", None) != _SCHEDULER_IDENTITY
         or type(getattr(value, "_scheduler_config_json", None)) is not str
         or getattr(value, "_lora_fuse_scale", None) != _LORA_FUSE_SCALE
+        or getattr(value, "_vae_dtype", None) != _VAE_DTYPE
         or type(getattr(value, "_closed", None)) is not bool
         or (
             not getattr(value, "_closed", True)
@@ -163,6 +167,7 @@ def _validate_loaded_preview_pipeline(value: object, *, require_open: bool) -> N
         value._pipeline is not value._pipeline_identity
         or value._pipeline.scheduler is not value._scheduler_identity_object
         or type(value._pipeline.scheduler) is not value._scheduler_type
+        or getattr(value._pipeline.vae, "dtype", None) is not value._torch.float32
         or _canonical_scheduler_config(value._pipeline.scheduler.config)
         != value._scheduler_config_json
         or not _pipeline_integrity_matches(value._pipeline, value._integrity)
@@ -434,13 +439,14 @@ def _issue_loaded_preview(
             environment.rocm_version.value,
             environment.pytorch_version.value,
             environment.diffusers_version.value,
-            "float16",
+            _RUNTIME_DTYPE,
         ),
         "_peft_version": _PEFT_VERSION,
         "_model_bindings_json": model_bindings_json,
         "_scheduler_identity": _SCHEDULER_IDENTITY,
         "_scheduler_config_json": scheduler_config_json,
         "_lora_fuse_scale": _LORA_FUSE_SCALE,
+        "_vae_dtype": _VAE_DTYPE,
         "_integrity": integrity,
         "_torch": torch,
         "_closed": False,
@@ -481,6 +487,7 @@ def _build_preview_pipeline(
         raise InfrastructureError("preview pipeline loading failed")
     state.pipeline.scheduler = scheduler
     state.pipeline.to("cuda:0", torch.float16)
+    _normalize_vae_dtype(state.pipeline, torch)
     state.pipeline.load_ip_adapter(
         components["ip_adapter"].borrow_loader_path(),
         **_ip_adapter_kwargs(components["ip_adapter"].manifest.entrypoint),
@@ -493,6 +500,19 @@ def _build_preview_pipeline(
     )
     integrity = _capture_pipeline_integrity(state.pipeline)
     return scheduler, _canonical_scheduler_config(scheduler.config), integrity
+
+
+def _normalize_vae_dtype(pipeline: Any, torch: Any) -> None:
+    vae = getattr(pipeline, "vae", None)
+    convert = getattr(vae, "to", None)
+    if not callable(convert):
+        raise InfrastructureError("preview VAE normalization failed")
+    try:
+        converted = convert(dtype=torch.float32)
+    except Exception as exc:
+        raise InfrastructureError("preview VAE normalization failed") from exc
+    if converted is not vae or getattr(vae, "dtype", None) is not torch.float32:
+        raise InfrastructureError("preview VAE normalization failed")
 
 
 def load_preview_pipeline(
