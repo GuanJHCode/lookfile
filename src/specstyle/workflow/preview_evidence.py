@@ -532,9 +532,10 @@ def _evidence_runtime(material: dict[str, object]) -> dict[str, str]:
         "vae_compute_dtype": "float32",
         "vae_precision_policy": "diffusers_force_upcast_roundtrip_v1",
     }
-    if type(runtime) is not dict or {
-        key: runtime.get(key) for key in expected
-    } != expected:
+    if (
+        type(runtime) is not dict
+        or {key: runtime.get(key) for key in expected} != expected
+    ):
         raise _domain("invalid preview execution runtime")
     return expected
 
