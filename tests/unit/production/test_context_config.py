@@ -51,6 +51,7 @@ def test_public_context_config_surface_is_frozen() -> None:
         "ProductionContextConfig",
         "load_production_context_config",
         "make_production_compiler_context_factory",
+        "require_model_pipeline_support",
     )
     assert tuple(
         inspect.signature(module.load_production_context_config).parameters
@@ -79,6 +80,53 @@ def test_public_context_config_surface_is_frozen() -> None:
     issued = object.__new__(module.ProductionContextConfig)
     with pytest.raises(FrozenInstanceError):
         issued._seal = object()
+
+
+def test_requires_explicit_pipeline_support_for_every_requested_model_role(
+    tmp_path: Path,
+) -> None:
+    module = importlib.import_module("specstyle.production.context_config")
+    config_root, evidence_root = _write_roots(tmp_path)
+    context = _load(config_root, evidence_root)
+
+    with pytest.raises(DomainError, match="model pipeline support"):
+        module.require_model_pipeline_support(
+            context, "lcm", ("base", "ip_adapter", "controlnet")
+        )
+
+    document = _read_document(config_root)
+    for support in document["model_support"]:
+        support["supported_pipelines"] = ["sdxl_turbo", "lcm", "sdxl_base"]
+    _write_document(config_root, document)
+    context = _load(config_root, evidence_root)
+
+    assert (
+        module.require_model_pipeline_support(
+            context, "lcm", ("base", "ip_adapter", "controlnet")
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    ("pipeline", "roles"),
+    (
+        ("unknown", ("base",)),
+        ("lcm", ()),
+        ("lcm", ("base", "base")),
+        ("lcm", ("unknown",)),
+        ("lcm", ["base"]),
+    ),
+)
+def test_pipeline_support_helper_rejects_invalid_queries(
+    tmp_path: Path, pipeline: object, roles: object
+) -> None:
+    module = importlib.import_module("specstyle.production.context_config")
+    config_root, evidence_root = _write_roots(tmp_path)
+    context = _load(config_root, evidence_root)
+
+    with pytest.raises(DomainError, match="model pipeline support"):
+        module.require_model_pipeline_support(context, pipeline, roles)
 
 
 def test_context_config_import_graph_excludes_workflow() -> None:

@@ -26,6 +26,7 @@ from specstyle.observability.environment import capture_environment, hash_enviro
 from specstyle.production.context_config import (
     load_production_context_config,
     make_production_compiler_context_factory,
+    require_model_pipeline_support,
 )
 from specstyle.production.preview_supply_config import load_preview_supply_config
 from specstyle.production.supply_config import load_production_supply_config
@@ -290,6 +291,12 @@ def _open_preflight(owned: tuple[int, ...]) -> _PreviewPreflight:
     context = _call_unavailable(
         "PRODUCTION_CONFIG_INVALID",
         lambda: load_production_context_config(owned[0], owned[1]),
+    )
+    _call_unavailable(
+        "PREVIEW_LCM_CAPABILITY_MISSING",
+        lambda: require_model_pipeline_support(
+            context, "lcm", ("base", "ip_adapter", "controlnet")
+        ),
     )
     production_config = _call_unavailable(
         "PRODUCTION_CONFIG_INVALID", lambda: load_production_supply_config(owned[0])

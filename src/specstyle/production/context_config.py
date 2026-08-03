@@ -54,6 +54,7 @@ __all__ = (
     "ProductionContextConfig",
     "load_production_context_config",
     "make_production_compiler_context_factory",
+    "require_model_pipeline_support",
 )
 
 _SCHEMA_V1 = "specstyle.production.context.v1"
@@ -231,6 +232,26 @@ class ProductionContextConfig:
         if len(self.output_profiles) != 1:
             raise DomainError("production context has multiple output profiles")
         return self.output_profiles[0]
+
+
+def require_model_pipeline_support(
+    config: ProductionContextConfig, pipeline: str, roles: tuple[str, ...], /
+) -> None:
+    """Require an explicit compiler capability for every requested model role."""
+    if (
+        type(config) is not ProductionContextConfig
+        or getattr(config, "_seal", None) is not _CONFIG_SEAL
+        or type(pipeline) is not str
+        or pipeline not in _PIPELINES
+        or type(roles) is not tuple
+        or not roles
+        or len(set(roles)) != len(roles)
+        or any(type(role) is not str or role not in _MODEL_ROLES for role in roles)
+    ):
+        raise DomainError("invalid model pipeline support query")
+    supported = {item.role: item.supported_pipelines for item in config.model_support}
+    if any(pipeline not in supported.get(role, ()) for role in roles):
+        raise DomainError("required model pipeline support unavailable")
 
 
 def _exact(value: object, keys: set[str], label: str) -> dict[str, Any]:

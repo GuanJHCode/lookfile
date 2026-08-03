@@ -9,7 +9,10 @@ import os
 import stat
 
 from specstyle.errors import DomainError, InfrastructureError
-from specstyle.production.context_config import load_production_context_config
+from specstyle.production.context_config import (
+    load_production_context_config,
+    require_model_pipeline_support,
+)
 from specstyle.production.preview_supply_config import load_preview_supply_config
 from specstyle.production.supply_config import load_production_supply_config
 from specstyle.ui.app import UiServices
@@ -54,7 +57,15 @@ def probe_preview_readiness(paths: PreviewUiRuntimePaths) -> PreviewReadinessUiV
             paths.preview_config_root,
         ):
             descriptors.append(_open_directory(path))
-        load_production_context_config(descriptors[0], descriptors[1])
+        context = load_production_context_config(descriptors[0], descriptors[1])
+        try:
+            require_model_pipeline_support(
+                context, "lcm", ("base", "ip_adapter", "controlnet")
+            )
+        except DomainError:
+            return PreviewReadinessUiView(
+                "UNAVAILABLE", "PREVIEW_LCM_CAPABILITY_MISSING"
+            )
         load_production_supply_config(descriptors[0])
         load_preview_supply_config(descriptors[2])
         return PreviewReadinessUiView("CONFIGURED", "PREVIEW_CONFIG_READY")

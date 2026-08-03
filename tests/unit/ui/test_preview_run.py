@@ -256,22 +256,53 @@ def test_preview_readiness_borrows_and_closes_all_config_descriptors(
     paths = _paths(tmp_path)
     borrowed: list[int] = []
 
+    context = object()
+
     def capture(*descriptors: int) -> object:
         borrowed.extend(descriptors)
         assert all(os.fstat(fd).st_ino > 0 for fd in descriptors)
-        return object()
+        return context
 
     monkeypatch.setattr(module, "load_production_context_config", capture)
     monkeypatch.setattr(module, "load_production_supply_config", capture)
     monkeypatch.setattr(module, "load_preview_supply_config", capture)
+    support_queries: list[tuple[object, str, tuple[str, ...]]] = []
+    monkeypatch.setattr(
+        module,
+        "require_model_pipeline_support",
+        lambda *query: support_queries.append(query),
+    )
 
     view = module.probe_preview_readiness(paths)
 
     assert view.status == "CONFIGURED"
+    assert support_queries == [(context, "lcm", ("base", "ip_adapter", "controlnet"))]
     assert len(borrowed) == 4
     for descriptor in set(borrowed):
         with pytest.raises(OSError):
             os.fstat(descriptor)
+
+
+def test_preview_readiness_reports_missing_lcm_capability_without_running(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import specstyle.ui.preview_run as module
+    from specstyle.errors import DomainError
+
+    paths = _paths(tmp_path)
+    monkeypatch.setattr(module, "load_production_context_config", lambda *_: object())
+    monkeypatch.setattr(module, "load_production_supply_config", lambda *_: object())
+    monkeypatch.setattr(module, "load_preview_supply_config", lambda *_: object())
+    monkeypatch.setattr(
+        module,
+        "require_model_pipeline_support",
+        lambda *_: (_ for _ in ()).throw(DomainError("missing lcm")),
+    )
+
+    view = module.probe_preview_readiness(paths)
+
+    assert view.status == "UNAVAILABLE"
+    assert view.message == "PREVIEW_LCM_CAPABILITY_MISSING"
 
 
 def test_unavailable_preview_binding_preserves_production_service() -> None:

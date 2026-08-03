@@ -265,6 +265,7 @@ def test_invalid_preview_config_isolated_as_unavailable(
     monkeypatch.setattr(
         module, "load_production_context_config", lambda *_args: object()
     )
+    monkeypatch.setattr(module, "require_model_pipeline_support", lambda *_args: None)
     monkeypatch.setattr(
         module, "load_production_supply_config", lambda *_args: object()
     )
@@ -276,6 +277,30 @@ def test_invalid_preview_config_isolated_as_unavailable(
     result = module.run_preview_one(fds, module.reserve_preview_run_one())
     assert result.status is module.PreviewRunStatus.UNAVAILABLE
     assert result.reason_code == "PREVIEW_CONFIG_INVALID"
+    assert result.publication is None
+    for descriptor in descriptors:
+        os.close(descriptor)
+
+
+def test_missing_lcm_context_capability_isolated_as_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import specstyle.workflow.preview_run_one as module
+
+    fds, descriptors = _fds(tmp_path)
+    monkeypatch.setattr(
+        module, "load_production_context_config", lambda *_args: object()
+    )
+    monkeypatch.setattr(
+        module,
+        "require_model_pipeline_support",
+        lambda *_args: (_ for _ in ()).throw(DomainError("missing lcm")),
+    )
+
+    result = module.run_preview_one(fds, module.reserve_preview_run_one())
+
+    assert result.status is module.PreviewRunStatus.UNAVAILABLE
+    assert result.reason_code == "PREVIEW_LCM_CAPABILITY_MISSING"
     assert result.publication is None
     for descriptor in descriptors:
         os.close(descriptor)
