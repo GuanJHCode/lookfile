@@ -159,6 +159,41 @@ bootstrap intentionally fails closed when any file, approval, hash, permission,
 or evidence object is absent. Do not reuse the engineering smoke threshold
 markers as calibration evidence.
 
+## Prepare held-out calibration evidence
+
+The offline calibration entry point consumes canonical, precomputed JSON
+observations. It does not read source images, run a model, create approval
+receipts, modify `context.json`, or automatically select the Production
+evidence root. Operators must keep `--out` in a private review directory.
+Test observations remain sealed during `prepare` and require a separately
+approved `reveal-test` action.
+
+```bash
+PYTHONPATH="$PWD/src" python -m specstyle.calibration.evidence prepare \
+  --study-plan /approved-input/study_plan.json \
+  --annotation-protocol /approved-input/annotation_protocol.json \
+  --sample-manifest /approved-input/sample_manifest.json \
+  --calibration-observations /approved-input/calibration_observations.json \
+  --validation-observations /approved-input/validation_observations.json \
+  --test-commitment /approved-input/test_commitment.json \
+  --label-approval-receipt /approved-input/label_approval_receipt.json \
+  --out /private-output/prepared_evidence.json
+
+PYTHONPATH="$PWD/src" python -m specstyle.calibration.evidence reveal-test \
+  --prepared-evidence /private-output/prepared_evidence.json \
+  --test-observations /approved-input/sealed_test_observations.json \
+  --reveal-authorization-receipt /approved-input/reveal_receipt.json \
+  --out /private-output/test_reveal.json
+```
+
+Malformed, non-canonical, cross-split, or hash-inconsistent evidence is
+rejected. Synthetic or unapproved labels produce a persistent `BLOCKED`
+report. Numeric validation success is named `VALIDATION_PASSED`; a successful
+test reveal is still only `TEST_PASSED_PENDING_PRODUCTION_APPROVAL`. Neither
+status is a Production `VALIDATED` threshold. The current repository includes
+no approved human label set, reveal authorization, or Production threshold
+approval, so the competition calibration claim remains blocked.
+
 The `config/` and `evidence/` directories, the four JSON files, and every
 evidence object must be owned by the service process's effective user. The
 runtime root and `models/` may be owned by root or that service user. None of
