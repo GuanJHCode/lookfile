@@ -16,6 +16,7 @@ from pathlib import Path
 import shutil
 import stat
 import tempfile
+import threading
 
 from specstyle.errors import DomainError, InfrastructureError
 from specstyle.ui.app import UiServices
@@ -54,9 +55,9 @@ class ProductionUiRuntimePaths:
                 raise DomainError(f"{field} unavailable")
             object.__setattr__(self, field, value)
         identities = tuple(
-            (value.stat().st_dev, value.stat().st_ino) for value in values[:7]
+            (value.stat().st_dev, value.stat().st_ino) for value in values
         )
-        if len(set(identities)) != 7:
+        if len(set(identities)) != len(values):
             raise DomainError("production runtime roots must be distinct")
 
 
@@ -75,6 +76,7 @@ def bind_production_run_one_services(
 ) -> UiServices:
     if type(base) is not UiServices or type(paths) is not ProductionUiRuntimePaths:
         raise DomainError("invalid production ui services")
+    active_run = threading.Lock()
 
     def run(
         source: object,
@@ -87,8 +89,25 @@ def bind_production_run_one_services(
         attribution: str | None,
         consent: str,
     ) -> ProductionRunUiView:
-        return _run(paths, reserve, open_run_one, source, style, spec, positive,
-                    negative, source_url, license_, attribution, consent)
+        if not active_run.acquire(blocking=False):
+            return _busy()
+        try:
+            return _run(
+                paths,
+                reserve,
+                open_run_one,
+                source,
+                style,
+                spec,
+                positive,
+                negative,
+                source_url,
+                license_,
+                attribution,
+                consent,
+            )
+        finally:
+            active_run.release()
 
     return UiServices(
         base.compile_spec,
@@ -119,8 +138,18 @@ def _run(
     job_id = ""
     staged: _StagedInputs | None = None
     try:
-        staged = _stage_inputs(paths, source, style, spec, positive, negative,
-                               source_url, license_, attribution, consent)
+        staged = _stage_inputs(
+            paths,
+            source,
+            style,
+            spec,
+            positive,
+            negative,
+            source_url,
+            license_,
+            attribution,
+            consent,
+        )
         reservation = reserve()
         job_id = getattr(getattr(reservation, "job_id", None), "value", "")
         return _execute(paths, staged, reservation, open_run_one)
@@ -165,8 +194,17 @@ def _stage_inputs(
         source_dst = _copy_upload(source_path, staged / "source.bin")
         style_dst = _copy_upload(style_path, staged / "style.bin")
         spec_dst = _copy_upload(spec_path, staged / "spec.json")
-        metadata = _metadata(source_dst, style_dst, spec_dst, positive, negative,
-                             source_url, license_, attribution, consent)
+        metadata = _metadata(
+            source_dst,
+            style_dst,
+            spec_dst,
+            positive,
+            negative,
+            source_url,
+            license_,
+            attribution,
+            consent,
+        )
         metadata_dst = _write_private(staged / "metadata.json", metadata)
         return _StagedInputs(staged, source_dst, style_dst, spec_dst, metadata_dst)
     except BaseException:
@@ -378,6 +416,20 @@ def _failure(job_id: str, message: str) -> ProductionRunUiView:
         job_id,
         "JOB_FAILED",
         message,
+        "production",
+        "",
+        None,
+        (),
+        (),
+        "no qa",
+    )
+
+
+def _busy() -> ProductionRunUiView:
+    return ProductionRunUiView(
+        "",
+        "BUSY",
+        "production run busy",
         "production",
         "",
         None,

@@ -4,6 +4,7 @@ import json
 import hashlib
 import os
 import stat
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -53,6 +54,16 @@ def _file(path: Path, content: bytes) -> str:
     return str(path)
 
 
+def _uploads(tmp_path: Path) -> tuple[str, str, str]:
+    source = _file(tmp_path / "source.png", b"source-image")
+    style = _file(tmp_path / "style.png", b"style-image")
+    spec = _file(
+        tmp_path / "style.json",
+        json.dumps(raw_spec().model_dump(mode="json"), separators=(",", ":")).encode(),
+    )
+    return source, style, spec
+
+
 def _qa_report() -> VerificationReport:
     aid = ArtifactId("artifact-1")
     policy = GatePolicy("reject", "reject", "reject")
@@ -84,9 +95,9 @@ def test_production_ui_service_runs_one_job_and_returns_export_evidence(
             "assets": raw_spec().assets.model_copy(
                 update={
                     "style_references": (
-                        raw_spec().assets.style_references[0].model_copy(
-                            update={"asset_sha256": Sha256("c" * 64).value}
-                        ),
+                        raw_spec()
+                        .assets.style_references[0]
+                        .model_copy(update={"asset_sha256": Sha256("c" * 64).value}),
                     )
                 }
             )
@@ -94,10 +105,12 @@ def test_production_ui_service_runs_one_job_and_returns_export_evidence(
     )
     source_path = _NamedString(_file(tmp_path / "source.png", source_bytes))
     style_path = _NamedString(_file(tmp_path / "style.png", style_bytes))
-    spec_path = _NamedString(_file(
-        tmp_path / "style.json",
-        json.dumps(spec.model_dump(mode="json"), separators=(",", ":")).encode(),
-    ))
+    spec_path = _NamedString(
+        _file(
+            tmp_path / "style.json",
+            json.dumps(spec.model_dump(mode="json"), separators=(",", ":")).encode(),
+        )
+    )
     approved = roots.export_root / "bundle-run-one-ui" / "approved" / "xhs_grid"
     rejected = roots.export_root / "bundle-run-one-ui" / "rejected"
     approved.mkdir(parents=True)
@@ -187,12 +200,8 @@ def test_production_ui_service_runs_one_job_and_returns_export_evidence(
     assert view.status == "COMPLETED"
     assert view.profile_label == "production"
     assert view.bundle_name == "bundle-run-one-ui"
-    assert view.approved_images == (
-        str(approved / "artifact-approved.png"),
-    )
-    assert view.rejected_images == (
-        str(rejected / "artifact-rejected.png"),
-    )
+    assert view.approved_images == (str(approved / "artifact-approved.png"),)
+    assert view.rejected_images == (str(rejected / "artifact-rejected.png"),)
     assert "UNVERIFIABLE" in view.qa_table
     assert "\tpass" not in view.qa_table
     assert calls["job_id"] == "run-one-ui"
@@ -301,3 +310,104 @@ def test_production_ui_service_cleans_staging_after_open_failure(
     assert view.status == "JOB_FAILED"
     assert view.message == "open failed"
     assert list(roots.staging_root.iterdir()) == []
+
+
+def test_production_runtime_paths_reject_staging_alias(tmp_path: Path) -> None:
+    from specstyle.errors import DomainError
+    from specstyle.ui.production_run import ProductionUiRuntimePaths
+
+    roots = _roots(tmp_path)
+    values = {name: getattr(roots, name) for name in roots.__slots__}
+    values["staging_root"] = roots.config_root
+
+    with pytest.raises(DomainError, match="production runtime roots must be distinct"):
+        ProductionUiRuntimePaths(**values)
+
+
+def test_production_ui_service_allows_only_one_pipeline_lifecycle(
+    tmp_path: Path,
+) -> None:
+    from specstyle.ui.production_run import bind_production_run_one_services
+
+    roots = _roots(tmp_path)
+    uploads = _uploads(tmp_path)
+    first_running = threading.Event()
+    release_first = threading.Event()
+    reservations: list[str] = []
+
+    class _Execution:
+        def __init__(self, sequence: int) -> None:
+            self.sequence = sequence
+
+        def run(self):
+            if self.sequence == 1:
+                first_running.set()
+                assert release_first.wait(timeout=2)
+            return SimpleNamespace(
+                job_result=SimpleNamespace(report=None),
+                export_result=SimpleNamespace(
+                    bundle=SimpleNamespace(
+                        bundle_name=f"bundle-run-one-{self.sequence}",
+                        bundle_sha256=Sha256("d" * 64),
+                        files=(),
+                    ),
+                    job_state=SimpleNamespace(
+                        job=SimpleNamespace(status=SimpleNamespace(value="COMPLETED"))
+                    ),
+                ),
+            )
+
+        def close(self) -> None:
+            pass
+
+    def reserve():
+        value = f"run-one-{len(reservations) + 1}"
+        reservations.append(value)
+        return SimpleNamespace(job_id=JobId(value))
+
+    def opener(_fds, _reservation):
+        return _Execution(len(reservations))
+
+    service = bind_production_run_one_services(
+        UiServices(lambda _text: pytest.fail("compile not used")),
+        roots,
+        reserve=reserve,
+        open_run_one=opener,
+    )
+    results = []
+
+    def run_first() -> None:
+        results.append(
+            service.run_production_job(
+                *uploads,
+                "positive",
+                "",
+                None,
+                None,
+                None,
+                "not_applicable",
+            )
+        )
+
+    thread = threading.Thread(target=run_first)
+    thread.start()
+    assert first_running.wait(timeout=2)
+
+    busy = service.run_production_job(
+        *uploads,
+        "positive",
+        "",
+        None,
+        None,
+        None,
+        "not_applicable",
+    )
+    release_first.set()
+    thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    assert busy.status == "BUSY"
+    assert busy.message == "production run busy"
+    assert reservations == ["run-one-1"]
+    assert len(results) == 1
+    assert results[0].status == "COMPLETED"
