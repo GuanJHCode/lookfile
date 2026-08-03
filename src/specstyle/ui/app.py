@@ -437,7 +437,13 @@ def create_app(services: UiServices) -> Any:
                 label="Engineering wall seeds",
             )
             preview_wall_status = gr.Textbox(label="Engineering wall status")
-            preview_wall_gallery = gr.Gallery(label="Engineering wall output")
+            preview_wall_gallery = gr.Gallery(
+                label="Engineering wall output",
+                columns=4,
+                rows=1,
+                height=360,
+                object_fit="contain",
+            )
             preview_wall_evidence = gr.Textbox(
                 label="Engineering-only evidence", lines=10
             )

@@ -65,7 +65,15 @@ def test_preview_wall_controls_are_engineering_only(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     buttons = []
-    monkeypatch.setitem(sys.modules, "gradio", _fake_gradio(buttons))
+    gradio = _fake_gradio(buttons)
+    galleries: list[dict[str, object]] = []
+
+    def gallery(**kwargs: object) -> object:
+        galleries.append(kwargs)
+        return object()
+
+    gradio.Gallery = gallery
+    monkeypatch.setitem(sys.modules, "gradio", gradio)
     calls: list[tuple[object, ...]] = []
 
     def run(*args: object) -> PreviewWallUiView:
@@ -102,3 +110,13 @@ def test_preview_wall_controls_are_engineering_only(
     assert "verification=NOT_RUN" in evidence
     assert "quality\tNOT_EVALUATED" in evidence
     assert calls == [("source", "style", "spec", "positive", "negative", 2)]
+    wall_gallery = next(
+        item for item in galleries if item["label"] == "Engineering wall output"
+    )
+    assert wall_gallery == {
+        "label": "Engineering wall output",
+        "columns": 4,
+        "rows": 1,
+        "height": 360,
+        "object_fit": "contain",
+    }
