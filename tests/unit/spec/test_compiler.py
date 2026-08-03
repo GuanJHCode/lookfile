@@ -767,3 +767,18 @@ def test_synthetic_fixture_has_a_fixed_canonical_hash_golden_vector() -> None:
     assert compile_style_spec(raw_spec(), context()).compiled_spec_hash.value == (
         "c21f061f246a258eb1ffc9043343f4bcc886ea775fdc2302c7d2cfe03538141a"
     )
+
+
+def test_production_approval_digest_changes_compiled_hash() -> None:
+    baseline_context = context()
+    profile = baseline_context.threshold_profiles[0]
+    approved_profile = replace(profile, production_approval_sha256=_sha("a"))
+    approved_context = replace(
+        baseline_context,
+        threshold_profiles=(approved_profile, *baseline_context.threshold_profiles[1:]),
+    )
+
+    assert (
+        compile_style_spec(raw_spec(), approved_context).compiled_spec_hash
+        != compile_style_spec(raw_spec(), baseline_context).compiled_spec_hash
+    )

@@ -305,7 +305,7 @@ def _v2_all_outputs_context_document(evidence: dict[str, str]) -> dict[str, Any]
     return document
 
 
-def _write_roots(tmp_path: Path, *, status: str = "VALIDATED") -> tuple[Path, Path]:
+def _write_roots(tmp_path: Path, *, status: str = "DRAFT") -> tuple[Path, Path]:
     config_root, evidence_root = tmp_path / "config", tmp_path / "evidence"
     config_root.mkdir(mode=0o700)
     evidence_root.mkdir(mode=0o700)
@@ -477,7 +477,7 @@ def test_loads_verified_context_without_retaining_paths_or_evidence_bytes(
         RuleScope.BATCH,
         ("background_sequence",),
     )
-    assert loaded.l2_threshold_profile.status == "VALIDATED"
+    assert loaded.l2_threshold_profile.status == "DRAFT"
     assert loaded.source_preprocess.background == (255, 255, 255)
     assert loaded.canny.low_threshold == 100
     contracts = importlib.import_module("specstyle.generation.canny_contracts")
@@ -835,13 +835,201 @@ def test_rejects_l1_rules_that_do_not_match_public_production_bindings(
         _load(config_root, evidence_root)
 
 
-@pytest.mark.parametrize("status", ("DRAFT", "CALIBRATED", "VALIDATED"))
+@pytest.mark.parametrize("status", ("DRAFT", "CALIBRATED"))
 def test_accepts_nonrevoked_l2_threshold_statuses(tmp_path: Path, status: str) -> None:
     config_root, evidence_root = _write_roots(tmp_path, status=status)
 
     loaded = _load(config_root, evidence_root)
 
     assert loaded.l2_threshold_profile.status == status
+
+
+@pytest.mark.parametrize("schema", ("v1", "v2"))
+def test_legacy_context_cannot_claim_validated_threshold(
+    tmp_path: Path, schema: str
+) -> None:
+    config_root, evidence_root = _write_roots(tmp_path, status="VALIDATED")
+    if schema == "v2":
+        evidence = _read_document(config_root)["l2_threshold_profile"]["evidence"]
+        _write_document(config_root, _v2_xhs_context_document(evidence))
+        document = _read_document(config_root)
+        document["l2_threshold_profile"]["status"] = "VALIDATED"
+        _write_document(config_root, document)
+
+    with pytest.raises(DomainError, match="requires production context v3"):
+        _load(config_root, evidence_root)
+
+
+def _write_v3_validated_roots(tmp_path: Path) -> tuple[Path, Path, str]:
+    from tests.unit.calibration.test_production_evidence import _materials
+
+    documents, prepared, reveal, approval, _expectation = _materials()
+    approval_raw = json.loads(approval)
+    contents = {
+        "calibration_dataset_sha256": prepared,
+        "validation_dataset_sha256": reveal,
+        "annotation_protocol_sha256": documents["protocol"],
+        "production_approval_sha256": approval,
+    }
+    evidence = {
+        key: hashlib.sha256(value).hexdigest() for key, value in contents.items()
+    }
+    config_root, evidence_root = tmp_path / "config", tmp_path / "evidence"
+    config_root.mkdir(mode=0o700)
+    evidence_root.mkdir(mode=0o700)
+    for key, content in contents.items():
+        digest = evidence[key]
+        directory = evidence_root / "sha256" / digest[:2]
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        (evidence_root / "sha256").chmod(0o700)
+        path = directory / digest
+        path.write_bytes(content)
+        path.chmod(0o400)
+    document = _v2_xhs_context_document(evidence)
+    document["schema_version"] = "specstyle.production.context.v3"
+    document["strength_mapping"]["preset_id"] = "editorial-clean"
+    threshold = document["l2_threshold_profile"]
+    threshold["status"] = "VALIDATED"
+    threshold["style_pack_id"] = "editorial-clean"
+    threshold["pin"] = approval_raw["threshold_profile_pin"]
+    metric = threshold.pop("metric")
+    metric["value"] = 0.9
+    metric["implementation_pin"] = approval_raw["metric"]["implementation_pin"]
+    threshold["metrics"] = [metric]
+    threshold["evidence"] = evidence
+    document["output_profiles"][0]["pin"] = approval_raw["output_profile_pin"]
+    _write_document(config_root, document)
+    return config_root, evidence_root, evidence["production_approval_sha256"]
+
+
+def test_v3_validated_context_requires_four_cross_bound_evidence_objects(
+    tmp_path: Path,
+) -> None:
+    config_root, evidence_root, approval_sha256 = _write_v3_validated_roots(tmp_path)
+
+    loaded = _load(config_root, evidence_root)
+
+    assert loaded.schema_version == "specstyle.production.context.v3"
+    assert loaded.l2_threshold_profile.production_binding is not None
+    assert (
+        loaded.l2_threshold_profile.production_binding.production_approval_sha256.value
+        == approval_sha256
+    )
+
+
+@pytest.mark.parametrize("status", ("DRAFT", "CALIBRATED"))
+def test_v3_nonvalidated_context_requires_null_production_approval(
+    tmp_path: Path, status: str
+) -> None:
+    config_root, evidence_root = _write_roots(tmp_path, status=status)
+    evidence = _read_document(config_root)["l2_threshold_profile"]["evidence"]
+    document = _v2_xhs_context_document(evidence)
+    threshold = document["l2_threshold_profile"]
+    document["schema_version"] = "specstyle.production.context.v3"
+    threshold["status"] = status
+    metric = threshold.pop("metric")
+    metric["implementation_pin"] = _pin("metric-implementation", "9")
+    threshold["metrics"] = [metric]
+    threshold["evidence"]["production_approval_sha256"] = None
+    _write_document(config_root, document)
+
+    loaded = _load(config_root, evidence_root)
+
+    assert loaded.l2_threshold_profile.status == status
+    assert loaded.l2_threshold_profile.production_binding is None
+
+
+def test_v3_validated_context_rejects_multiple_metrics(tmp_path: Path) -> None:
+    config_root, evidence_root, _approval = _write_v3_validated_roots(tmp_path)
+    document = _read_document(config_root)
+    document["l2_threshold_profile"]["metrics"].append(
+        {
+            "metric_id": "batch_style_consistency",
+            "operator": "<=",
+            "value": 0.1,
+            "implementation_pin": _pin("batch-metric", "8"),
+        }
+    )
+    _write_document(config_root, document)
+
+    with pytest.raises(DomainError, match="v3 threshold requires one metric"):
+        _load(config_root, evidence_root)
+
+
+def _v3_matching_runtime(
+    config: object,
+) -> tuple[EnvironmentSnapshot, PipelineGraph, str]:
+    binding = config.l2_threshold_profile.production_binding
+    assert binding is not None
+    graph = _factory_graph()
+    graph = PipelineGraph(
+        "production",
+        graph.base,
+        ModelDescriptor(
+            binding.verifier_pin.id,
+            "ip_adapter",
+            binding.verifier_pin.revision,
+            binding.verifier_pin.sha256,
+            "MIT",
+            "APPROVED",
+            "sdxl",
+        ),
+        graph.controlnet,
+        None,
+        "models",
+    )
+    return _factory_environment(), graph, binding.preprocessor_pin.revision
+
+
+@pytest.mark.parametrize("drift", ("encoder", "preprocessor"))
+def test_v3_validated_context_rejects_runtime_evidence_drift(
+    tmp_path: Path, drift: str
+) -> None:
+    config_root, evidence_root, _approval = _write_v3_validated_roots(tmp_path)
+    config = _load(config_root, evidence_root)
+    environment, graph, preprocessing_version = _v3_matching_runtime(config)
+    if drift == "encoder":
+        graph = _factory_graph()
+    else:
+        preprocessing_version = "other"
+
+    make_factory = importlib.import_module(
+        "specstyle.production.context_config"
+    ).make_production_compiler_context_factory
+    if drift == "encoder":
+        with pytest.raises(DomainError, match="runtime evidence binding"):
+            make_factory(config, environment, graph)
+        return
+    factory = make_factory(config, environment, graph)
+    with pytest.raises(DomainError, match="runtime evidence binding"):
+        factory(preprocessing_version)
+
+
+def test_v3_approval_digest_survives_compile_and_qa_export(tmp_path: Path) -> None:
+    from specstyle.exporting.qa_report import threshold_primitive
+
+    config_root, evidence_root, approval_sha256 = _write_v3_validated_roots(tmp_path)
+    config = _load(config_root, evidence_root)
+    environment, graph, preprocessing_version = _v3_matching_runtime(config)
+    context = importlib.import_module(
+        "specstyle.production.context_config"
+    ).make_production_compiler_context_factory(config, environment, graph)(
+        preprocessing_version
+    )
+
+    assert context.threshold_profiles[0].production_approval_sha256 == Sha256(
+        approval_sha256
+    )
+    compiled = compile_style_spec(
+        _raw_for_factory(context, environment, graph, preprocessing_version), context
+    )
+    binding = next(
+        rule.threshold_binding
+        for rule in compiled.verification_plans[0].rules
+        if rule.threshold_binding is not None
+    )
+    assert binding.production_approval_sha256 == Sha256(approval_sha256)
+    assert threshold_primitive(binding)["production_approval_sha256"] == approval_sha256
 
 
 def _evidence_path(
@@ -889,6 +1077,16 @@ def test_rejects_symlink_in_evidence_directory_chain(
 def test_rejects_evidence_file_mode(tmp_path: Path, mode: int) -> None:
     config_root, evidence_root = _write_roots(tmp_path)
     _evidence_path(config_root, evidence_root).chmod(mode)
+
+    with pytest.raises(InfrastructureError):
+        _load(config_root, evidence_root)
+
+
+def test_rejects_untrusted_production_approval_file_mode(tmp_path: Path) -> None:
+    config_root, evidence_root, _approval = _write_v3_validated_roots(tmp_path)
+    _evidence_path(config_root, evidence_root, key="production_approval_sha256").chmod(
+        0o644
+    )
 
     with pytest.raises(InfrastructureError):
         _load(config_root, evidence_root)
@@ -2248,6 +2446,7 @@ def _raw_for_factory(
         },
     }
     raw["verification"]["ruleset_version"] = context.rule_catalogs[0].ruleset_version
+    raw["style"]["preset_id"] = context.strength_mappings[0].preset_id.value
     raw["verification"]["l2"] = {
         "encoder_id": graph.ip_adapter.model_id,
         "encoder_revision": graph.ip_adapter.revision,
@@ -2466,13 +2665,38 @@ def test_threshold_status_controls_l2_execution_without_encoder_call(
     from specstyle.verification.production import _metric_without_execution
 
     module = importlib.import_module("specstyle.production.context_config")
-    config_root, evidence_root = _write_roots(tmp_path, status=status)
+    if status == "VALIDATED":
+        config_root, evidence_root, _approval = _write_v3_validated_roots(tmp_path)
+    else:
+        config_root, evidence_root = _write_roots(tmp_path, status=status)
+    config = _load(config_root, evidence_root)
     environment, graph = _factory_environment(), _factory_graph()
+    preprocessing_version = "clip-preprocess-v1"
+    if status == "VALIDATED":
+        binding = config.l2_threshold_profile.production_binding
+        assert binding is not None
+        graph = PipelineGraph(
+            "production",
+            graph.base,
+            ModelDescriptor(
+                binding.verifier_pin.id,
+                "ip_adapter",
+                binding.verifier_pin.revision,
+                binding.verifier_pin.sha256,
+                "MIT",
+                "APPROVED",
+                "sdxl",
+            ),
+            graph.controlnet,
+            None,
+            "models",
+        )
+        preprocessing_version = binding.preprocessor_pin.revision
     context = module.make_production_compiler_context_factory(
-        _load(config_root, evidence_root), environment, graph
-    )("clip-preprocess-v1")
+        config, environment, graph
+    )(preprocessing_version)
     compiled = compile_style_spec(
-        _raw_for_factory(context, environment, graph, "clip-preprocess-v1"), context
+        _raw_for_factory(context, environment, graph, preprocessing_version), context
     )
     rule = next(
         item

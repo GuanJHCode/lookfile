@@ -9,6 +9,12 @@ import os
 import stat
 from typing import Any
 
+from specstyle.calibration.production_evidence import (
+    ProductionThresholdExpectation,
+    ValidatedEvidenceBinding,
+    require_runtime_evidence_binding,
+    validate_production_threshold_evidence,
+)
 from specstyle.domain.enums import RuleLevel, RuleScope
 from specstyle.domain.identifiers import Identifier, RuleId, Sha256
 from specstyle.errors import DomainError, InfrastructureError
@@ -52,6 +58,7 @@ __all__ = (
 
 _SCHEMA_V1 = "specstyle.production.context.v1"
 _SCHEMA_V2 = "specstyle.production.context.v2"
+_SCHEMA_V3 = "specstyle.production.context.v3"
 _CONFIG_BYTES = 1024 * 1024
 _EVIDENCE_BYTES = 16 * 1024 * 1024
 _EVIDENCE_TOTAL_BYTES = 48 * 1024 * 1024
@@ -98,11 +105,13 @@ _THRESHOLD_KEYS = {
 }
 _THRESHOLD_METRICS_KEYS = (_THRESHOLD_KEYS - {"metric"}) | {"metrics"}
 _METRIC_KEYS = {"metric_id", "operator", "value"}
+_METRIC_V3_KEYS = _METRIC_KEYS | {"implementation_pin"}
 _EVIDENCE_KEYS = {
     "calibration_dataset_sha256",
     "validation_dataset_sha256",
     "annotation_protocol_sha256",
 }
+_EVIDENCE_V3_KEYS = _EVIDENCE_KEYS | {"production_approval_sha256"}
 _SOURCE_KEYS = {"processor_pin", "resize_mode", "background"}
 _CANNY_KEYS = {"low_threshold", "high_threshold", "aperture_size", "l2_gradient"}
 _MODEL_ROLES = ("base", "ip_adapter", "controlnet")
@@ -133,6 +142,7 @@ class _ThresholdEvidence:
     calibration_dataset_sha256: Sha256
     validation_dataset_sha256: Sha256
     annotation_protocol_sha256: Sha256
+    production_approval_sha256: Sha256 | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,7 +152,11 @@ class _L2ThresholdProfile:
     status: str
     style_pack_id: Identifier
     metrics: tuple[ThresholdMetricCapability, ...]
+    metric_implementation_pin: ResourcePin | None
     evidence: _ThresholdEvidence
+    production_binding: ValidatedEvidenceBinding | None = field(
+        default=None, repr=False, compare=False
+    )
 
     def __post_init__(self) -> None:
         metrics = self.metrics
@@ -289,7 +303,7 @@ def _catalog(value: object, schema_version: str) -> RuleCatalogCapability:
     raw = _exact(value, _CATALOG_KEYS, "rule catalog")
     if type(raw["l1_rules"]) is not list:
         raise DomainError("invalid production context rule catalog")
-    v2 = schema_version == _SCHEMA_V2
+    v2 = schema_version in {_SCHEMA_V2, _SCHEMA_V3}
     l1 = tuple(
         _rule(
             item,
@@ -345,23 +359,42 @@ def _mapping(value: object) -> StrengthMappingCapability:
 
 
 def _threshold(value: object, schema_version: str) -> _L2ThresholdProfile:
-    if type(value) is not dict or set(value) not in (
-        _THRESHOLD_KEYS,
-        _THRESHOLD_METRICS_KEYS if schema_version == _SCHEMA_V2 else set(),
-    ):
+    allowed = (
+        (_THRESHOLD_KEYS,)
+        if schema_version == _SCHEMA_V1
+        else (_THRESHOLD_KEYS, _THRESHOLD_METRICS_KEYS)
+        if schema_version == _SCHEMA_V2
+        else (_THRESHOLD_METRICS_KEYS,)
+    )
+    if type(value) is not dict or set(value) not in allowed:
         raise DomainError("invalid production context threshold")
     raw = value
     metric_values = raw.get("metrics", [raw.get("metric")])
     if type(metric_values) is not list or not metric_values:
         raise DomainError("invalid production context threshold metrics")
+    metric_keys = _METRIC_V3_KEYS if schema_version == _SCHEMA_V3 else _METRIC_KEYS
     metrics = tuple(
-        _exact(item, _METRIC_KEYS, "threshold metric") for item in metric_values
+        _exact(item, metric_keys, "threshold metric") for item in metric_values
     )
-    evidence = _exact(raw["evidence"], _EVIDENCE_KEYS, "threshold evidence")
+    evidence_keys = (
+        _EVIDENCE_V3_KEYS if schema_version == _SCHEMA_V3 else _EVIDENCE_KEYS
+    )
+    evidence = _exact(raw["evidence"], evidence_keys, "threshold evidence")
+    status = raw["status"]
+    if status == "VALIDATED" and schema_version != _SCHEMA_V3:
+        raise DomainError("VALIDATED threshold requires production context v3")
+    approval_value = evidence.get("production_approval_sha256")
+    if schema_version == _SCHEMA_V3 and (
+        (status == "VALIDATED" and type(approval_value) is not str)
+        or (status != "VALIDATED" and approval_value is not None)
+    ):
+        raise DomainError("invalid production threshold approval")
+    if schema_version == _SCHEMA_V3 and (len(metrics) != 1 or len(metric_values) != 1):
+        raise DomainError("v3 threshold requires one metric")
     return _L2ThresholdProfile(
         _pin(raw["pin"]),
         raw["logical_name"],
-        raw["status"],
+        status,
         Identifier(raw["style_pack_id"]),
         tuple(
             ThresholdMetricCapability(
@@ -371,10 +404,14 @@ def _threshold(value: object, schema_version: str) -> _L2ThresholdProfile:
             )
             for metric in metrics
         ),
+        None
+        if schema_version != _SCHEMA_V3
+        else _pin(metrics[0]["implementation_pin"]),
         _ThresholdEvidence(
             Sha256(evidence["calibration_dataset_sha256"]),
             Sha256(evidence["validation_dataset_sha256"]),
             Sha256(evidence["annotation_protocol_sha256"]),
+            None if approval_value is None else Sha256(approval_value),
         ),
     )
 
@@ -480,7 +517,7 @@ def _open_evidence_file(
     return owned.acquire(open_file, "evidence file")
 
 
-def _read_evidence_file(file_fd: int, digest: Sha256) -> int:
+def _read_evidence_file(file_fd: int, digest: Sha256) -> bytes:
     before = _evidence_stat(file_fd, digest.value)
     if (
         not stat.S_ISREG(before.st_mode)
@@ -493,6 +530,7 @@ def _read_evidence_file(file_fd: int, digest: Sha256) -> int:
         raise InfrastructureError("production context evidence size refused")
     calculated = hashlib.sha256()
     bytes_read = 0
+    chunks: list[bytes] = []
     while bytes_read <= before.st_size:
         request = min(_READ_BYTES, before.st_size - bytes_read + 1)
         try:
@@ -504,6 +542,7 @@ def _read_evidence_file(file_fd: int, digest: Sha256) -> int:
         if not chunk:
             break
         calculated.update(chunk)
+        chunks.append(chunk)
         bytes_read += len(chunk)
     after = _evidence_stat(file_fd, digest.value)
     if bytes_read != before.st_size or _evidence_identity(before) != _evidence_identity(
@@ -512,12 +551,12 @@ def _read_evidence_file(file_fd: int, digest: Sha256) -> int:
         raise InfrastructureError("production context evidence file changed")
     if calculated.hexdigest() != digest.value:
         raise InfrastructureError("production context evidence digest mismatch")
-    return bytes_read
+    return b"".join(chunks)
 
 
 def _read_evidence(
     root_fd: object, digest: Sha256, owned: _OwnedFileDescriptors
-) -> int:
+) -> bytes:
     if type(root_fd) is not int or root_fd < 0:
         raise DomainError("invalid production evidence root fd")
     sha_fd = _open_evidence_directory(root_fd, "sha256", owned)
@@ -571,6 +610,45 @@ def _issue(document: dict[str, Any]) -> ProductionContextConfig:
     return issued
 
 
+def _bind_validated_evidence(
+    config: ProductionContextConfig, evidence_objects: tuple[bytes, ...]
+) -> None:
+    threshold = config.l2_threshold_profile
+    if threshold.status != "VALIDATED":
+        if len(evidence_objects) != 3 or threshold.production_binding is not None:
+            raise DomainError("invalid nonvalidated production threshold evidence")
+        return
+    if (
+        config.schema_version != _SCHEMA_V3
+        or len(config.output_profiles) != 1
+        or len(threshold.metrics) != 1
+        or type(threshold.metric_implementation_pin) is not ResourcePin
+        or len(evidence_objects) != 4
+    ):
+        raise DomainError("invalid validated production threshold evidence")
+    output = config.output_profiles[0]
+    metric = threshold.metrics[0]
+    expectation = ProductionThresholdExpectation(
+        Identifier(threshold.style_pack_id.value),
+        "product_instance",
+        output.profile,
+        _copy_pin(output.pin),
+        _copy_pin(threshold.pin),
+        Identifier(metric.metric_id.value),
+        _copy_pin(threshold.metric_implementation_pin),
+        metric.operator,
+        metric.value,
+    )
+    binding = validate_production_threshold_evidence(
+        evidence_objects[0],
+        evidence_objects[1],
+        evidence_objects[2],
+        evidence_objects[3],
+        expectation,
+    )
+    object.__setattr__(threshold, "production_binding", binding)
+
+
 def load_production_context_config(
     config_root_fd: int, evidence_root_fd: int, /
 ) -> ProductionContextConfig:
@@ -603,7 +681,7 @@ def load_production_context_config(
             if type(document) is not dict:
                 raise DomainError("invalid production context document")
             schema_version = document.get("schema_version")
-            if schema_version not in (_SCHEMA_V1, _SCHEMA_V2):
+            if schema_version not in (_SCHEMA_V1, _SCHEMA_V2, _SCHEMA_V3):
                 raise DomainError("invalid production context schema")
             document = _exact(
                 document,
@@ -615,17 +693,27 @@ def load_production_context_config(
             raise
         except (KeyError, TypeError, ValueError, AttributeError, IndexError) as exc:
             raise DomainError("invalid production context config") from exc
-        evidence_total = 0
-        for digest in (
+        evidence_digests = [
             issued.l2_threshold_profile.evidence.calibration_dataset_sha256,
             issued.l2_threshold_profile.evidence.validation_dataset_sha256,
             issued.l2_threshold_profile.evidence.annotation_protocol_sha256,
-        ):
-            evidence_total += _read_evidence(owned_evidence_root_fd, digest, owned)
+        ]
+        approval_digest = (
+            issued.l2_threshold_profile.evidence.production_approval_sha256
+        )
+        if approval_digest is not None:
+            evidence_digests.append(approval_digest)
+        evidence_objects: list[bytes] = []
+        evidence_total = 0
+        for digest in evidence_digests:
+            content = _read_evidence(owned_evidence_root_fd, digest, owned)
+            evidence_objects.append(content)
+            evidence_total += len(content)
             if evidence_total > _EVIDENCE_TOTAL_BYTES:
                 raise InfrastructureError(
                     "production context evidence total size refused"
                 )
+        _bind_validated_evidence(issued, tuple(evidence_objects))
         return issued
 
 
@@ -696,6 +784,9 @@ def _copy_threshold(
         Sha256(value.evidence.calibration_dataset_sha256.value),
         Sha256(value.evidence.validation_dataset_sha256.value),
         Sha256(value.evidence.annotation_protocol_sha256.value),
+        None
+        if value.evidence.production_approval_sha256 is None
+        else Sha256(value.evidence.production_approval_sha256.value),
     )
 
 
@@ -762,6 +853,17 @@ def _validate_factory_inputs(
         or tuple(item.role for item in config.model_support) != _MODEL_ROLES
     ):
         raise DomainError("invalid production pipeline graph")
+    binding = config.l2_threshold_profile.production_binding
+    if config.l2_threshold_profile.status == "VALIDATED":
+        if (
+            binding is None
+            or graph.ip_adapter.model_id != binding.verifier_pin.id
+            or graph.ip_adapter.revision != binding.verifier_pin.revision
+            or graph.ip_adapter.expected_sha256 != binding.verifier_pin.sha256
+        ):
+            raise DomainError("production runtime evidence binding mismatch")
+    elif binding is not None:
+        raise DomainError("invalid nonvalidated production evidence binding")
     return _available_runtime(environment)
 
 
@@ -793,6 +895,13 @@ def _context(
         )
     )
     encoder_pin = model_capabilities[1].pin
+    binding = config.l2_threshold_profile.production_binding
+    if config.l2_threshold_profile.status == "VALIDATED":
+        if binding is None:
+            raise DomainError("validated production evidence binding missing")
+        require_runtime_evidence_binding(binding, encoder_pin, preprocessing_version)
+    elif binding is not None:
+        raise DomainError("invalid nonvalidated production evidence binding")
     return CompilerContext(
         _copy_pin(config.compiler_pin),
         (RuntimeCapability(runtime_pin, "rocm", *versions, "float16"),),

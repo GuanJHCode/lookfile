@@ -313,6 +313,7 @@ class ThresholdProfileCapability:
     calibration_dataset_sha256: Sha256
     validation_dataset_sha256: Sha256
     annotation_protocol_sha256: Sha256
+    production_approval_sha256: Sha256 | None = None
 
     def __post_init__(self) -> None:
         if type(self.pin) is not ResourcePin:
@@ -349,6 +350,11 @@ class ThresholdProfileCapability:
             )
         ):
             raise DomainError("threshold dataset hashes must be Sha256")
+        if (
+            self.production_approval_sha256 is not None
+            and type(self.production_approval_sha256) is not Sha256
+        ):
+            raise DomainError("threshold approval hash must be Sha256")
 
 
 @dataclass(frozen=True, slots=True)
@@ -559,6 +565,7 @@ class CompiledThresholdBinding:
     calibration_dataset_sha256: Sha256
     validation_dataset_sha256: Sha256
     annotation_protocol_sha256: Sha256
+    production_approval_sha256: Sha256 | None = None
 
     def __post_init__(self) -> None:
         if type(self.profile_pin) is not ResourcePin:
@@ -581,6 +588,11 @@ class CompiledThresholdBinding:
             )
         ):
             raise DomainError("threshold dataset hashes must be Sha256")
+        if (
+            self.production_approval_sha256 is not None
+            and type(self.production_approval_sha256) is not Sha256
+        ):
+            raise DomainError("threshold approval hash must be Sha256")
 
 
 @dataclass(frozen=True, slots=True)
@@ -865,6 +877,11 @@ def _primitive(value: object) -> object:
                 type(value) is OutputRenderContract
                 and item.name == "native_resolution"
                 and value.native_resolution is None
+            )
+            and not (
+                type(value) is CompiledThresholdBinding
+                and item.name == "production_approval_sha256"
+                and value.production_approval_sha256 is None
             )
         }
     if isinstance(value, tuple):

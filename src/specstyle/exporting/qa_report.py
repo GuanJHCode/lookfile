@@ -773,6 +773,11 @@ def threshold_primitive(
         "metric_id": value.metric_id.value,
         "operator": value.operator,
         "profile_pin": pin_primitive(value.profile_pin),
+        "production_approval_sha256": (
+            None
+            if value.production_approval_sha256 is None
+            else value.production_approval_sha256.value
+        ),
         "status": value.status,
         "validation_dataset_sha256": value.validation_dataset_sha256.value,
         "value": _finite(value.value),

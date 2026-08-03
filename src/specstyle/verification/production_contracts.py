@@ -282,6 +282,7 @@ def _profile_matches_binding(
         and profile.calibration_dataset_sha256 == binding.calibration_dataset_sha256
         and profile.validation_dataset_sha256 == binding.validation_dataset_sha256
         and profile.annotation_protocol_sha256 == binding.annotation_protocol_sha256
+        and profile.production_approval_sha256 == binding.production_approval_sha256
     )
 
 

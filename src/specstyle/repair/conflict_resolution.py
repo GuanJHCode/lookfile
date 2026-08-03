@@ -96,6 +96,9 @@ def _binding(value: object) -> _Binding | None:
             _sha256(value.calibration_dataset_sha256, "invalid verification plan"),
             _sha256(value.validation_dataset_sha256, "invalid verification plan"),
             _sha256(value.annotation_protocol_sha256, "invalid verification plan"),
+            None
+            if value.production_approval_sha256 is None
+            else _sha256(value.production_approval_sha256, "invalid verification plan"),
         ),
     )
 

@@ -523,6 +523,7 @@ def _binding(
         profile.calibration_dataset_sha256,
         profile.validation_dataset_sha256,
         profile.annotation_protocol_sha256,
+        profile.production_approval_sha256,
     )
 
 
