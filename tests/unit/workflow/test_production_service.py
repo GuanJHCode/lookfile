@@ -151,6 +151,7 @@ def test_production_service_exposes_one_public_runtime_surface() -> None:
         "ProductionRuntime",
         "ProductionRuntimeReadiness",
         "ProductionRuntimeFailureKind",
+        "load_production_compiler_context",
         "open_production_runtime",
     )
     assert module._ProductionGenerationRuntime is module.ProductionRuntime
@@ -300,6 +301,7 @@ def test_prepare_export_builds_one_approved_xhs_item_without_expanding_public_ap
         "ProductionRuntime",
         "ProductionRuntimeReadiness",
         "ProductionRuntimeFailureKind",
+        "load_production_compiler_context",
         "open_production_runtime",
     )
     assert command.job_id == generation_request.job_id

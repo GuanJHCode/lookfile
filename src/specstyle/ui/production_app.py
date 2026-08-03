@@ -1,0 +1,221 @@
+"""Authenticated production Gradio composition rooted in the AMD runtime."""
+
+from __future__ import annotations
+
+import argparse
+from collections.abc import Mapping, Sequence
+import os
+from pathlib import Path
+import stat
+from typing import Any
+
+from specstyle.errors import DomainError, InfrastructureError
+from specstyle.ui.app import UiServices, build_default_services, launch_app
+from specstyle.ui.production_run import (
+    ProductionUiRuntimePaths,
+    bind_production_run_one_services,
+)
+from specstyle.workflow.production_bootstrap import (
+    load_production_ui_compiler_context,
+)
+
+__all__ = (
+    "build_production_ui_services",
+    "launch_production_ui",
+    "main",
+    "production_runtime_paths",
+)
+
+_DEFAULT_ROOT = Path("/workspace/persistence/lookfile-runtime")
+_PUBLIC_HOST = "0.0.0.0"
+_LOCAL_HOST = "127.0.0.1"
+
+
+def _trusted_directory(path: Path, label: str) -> None:
+    try:
+        info = os.lstat(path)
+    except OSError:
+        raise DomainError(f"production {label} directory unavailable") from None
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or info.st_uid not in (0, os.geteuid())
+        or stat.S_IMODE(info.st_mode) & 0o022
+    ):
+        raise DomainError(f"production {label} directory untrusted")
+
+
+def _private_directory(path: Path) -> Path:
+    try:
+        os.mkdir(path, 0o700)
+    except FileExistsError:
+        pass
+    except OSError:
+        raise InfrastructureError("production UI directory unavailable") from None
+    try:
+        info = os.lstat(path)
+    except OSError:
+        raise InfrastructureError("production UI directory unavailable") from None
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or info.st_uid != os.geteuid()
+        or stat.S_IMODE(info.st_mode) != 0o700
+    ):
+        raise DomainError("production UI directory untrusted")
+    return path
+
+
+def _mutable_parent(path: Path) -> Path:
+    if not path.exists():
+        return _private_directory(path)
+    _trusted_directory(path, "mutable root")
+    return path
+
+
+def production_runtime_paths(runtime_root: Path, /) -> ProductionUiRuntimePaths:
+    root = Path(runtime_root)
+    _trusted_directory(root, "runtime root")
+    config, evidence, models = (
+        root / name for name in ("config", "evidence", "models")
+    )
+    for path, label in (
+        (config, "config"),
+        (evidence, "evidence"),
+        (models, "models"),
+    ):
+        _trusted_directory(path, label)
+    jobs = _mutable_parent(root / "jobs")
+    product = _private_directory(jobs / "ui-production")
+    state, artifacts, styles, export = (
+        _private_directory(product / name)
+        for name in ("state", "artifacts", "styles", "export")
+    )
+    temporary = _mutable_parent(root / "tmp")
+    staging = _private_directory(temporary / "ui-production")
+    return ProductionUiRuntimePaths(
+        config, evidence, models, state, artifacts, styles, export, staging
+    )
+
+
+def _open_directory(path: Path) -> int:
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    try:
+        return os.open(path, flags)
+    except OSError:
+        raise InfrastructureError("production bootstrap unavailable") from None
+
+
+def _close_descriptors(descriptors: list[int], primary: BaseException | None) -> None:
+    failure: OSError | None = None
+    for descriptor in reversed(descriptors):
+        try:
+            os.close(descriptor)
+        except OSError as error:
+            failure = failure or error
+    if failure is not None and primary is not None:
+        primary.add_note("production bootstrap descriptor cleanup failed")
+    elif failure is not None:
+        raise InfrastructureError("production bootstrap cleanup failed") from None
+
+
+def build_production_ui_services(paths: ProductionUiRuntimePaths, /) -> UiServices:
+    if type(paths) is not ProductionUiRuntimePaths:
+        raise DomainError("invalid production UI paths")
+    descriptors: list[int] = []
+    primary: BaseException | None = None
+    try:
+        for path in (paths.config_root, paths.evidence_root, paths.model_root):
+            descriptors.append(_open_directory(path))
+        context = load_production_ui_compiler_context(*descriptors)
+        base = build_default_services(context)
+        return bind_production_run_one_services(base, paths)
+    except BaseException as error:
+        primary = error
+        raise
+    finally:
+        _close_descriptors(descriptors, primary)
+
+
+def _credential(value: object, label: str, minimum: int) -> str:
+    if (
+        type(value) is not str
+        or not minimum <= len(value) <= 256
+        or value != value.strip()
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+    ):
+        raise DomainError(f"production UI {label} invalid")
+    return value
+
+
+def _authentication(host: str, environ: Mapping[str, str]) -> tuple[str, str] | None:
+    username = environ.get("SPECSTYLE_UI_USERNAME")
+    password = environ.get("SPECSTYLE_UI_PASSWORD")
+    if username is None and password is None and host == _LOCAL_HOST:
+        return None
+    if username is None or password is None:
+        raise DomainError("production UI authentication required")
+    return _credential(username, "username", 3), _credential(password, "password", 16)
+
+
+def launch_production_ui(
+    runtime_root: Path,
+    /,
+    *,
+    host: str = _LOCAL_HOST,
+    port: int = 7860,
+    environ: Mapping[str, str] | None = None,
+) -> Any:
+    if host not in {_LOCAL_HOST, _PUBLIC_HOST}:
+        raise DomainError("invalid production UI host")
+    if type(port) is not int or isinstance(port, bool) or not 1 <= port <= 65535:
+        raise DomainError("invalid production UI port")
+    auth = _authentication(host, os.environ if environ is None else environ)
+    paths = production_runtime_paths(runtime_root)
+    services = build_production_ui_services(paths)
+    blocked = [
+        str(path)
+        for path in (
+            paths.config_root,
+            paths.evidence_root,
+            paths.model_root,
+            paths.state_root,
+            paths.artifact_root,
+            paths.style_asset_root,
+            paths.staging_root,
+        )
+    ]
+    return launch_app(
+        services,
+        server_name=host,
+        server_port=port,
+        share=False,
+        auth=auth,
+        allowed_paths=[str(paths.export_root)],
+        blocked_paths=blocked,
+        max_file_size="32mb",
+        show_error=False,
+        inbrowser=False,
+        quiet=True,
+        enable_monitoring=False,
+    )
+
+
+def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Launch the SpecStyle production UI")
+    parser.add_argument("--runtime-root", type=Path, default=_DEFAULT_ROOT)
+    parser.add_argument(
+        "--host", choices=(_LOCAL_HOST, _PUBLIC_HOST), default=_LOCAL_HOST
+    )
+    parser.add_argument("--port", type=int, default=7860)
+    return parser.parse_args(argv)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    arguments = _parse_args(argv)
+    launch_production_ui(
+        arguments.runtime_root,
+        host=arguments.host,
+        port=arguments.port,
+    )
+    return 0

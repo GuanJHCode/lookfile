@@ -106,6 +106,7 @@ __all__ = (
     "ProductionRuntime",
     "ProductionRuntimeReadiness",
     "ProductionRuntimeFailureKind",
+    "load_production_compiler_context",
     "open_production_runtime",
 )
 
@@ -1631,6 +1632,40 @@ def _load_runtime_context(
         _cleanup_failed_open(loaded, None, None, None)
         raise
     return loaded, context
+
+
+def load_production_compiler_context(
+    supply: VerifiedPipelineSupply,
+    pipeline_graph: PipelineGraph,
+    environment: EnvironmentSnapshot,
+    compiler_context_factory: Callable[[str], CompilerContext],
+    /,
+    *,
+    torch_module: Any | None = None,
+    diffusers_module: Any | None = None,
+) -> CompilerContext:
+    """Derive a detached compiler context while borrowing verified supply."""
+    _reject_context_factory_reentry()
+    if not callable(compiler_context_factory):
+        raise DomainError("invalid production runtime dependency")
+    load_pipeline = _bind_pipeline_loader(
+        supply, pipeline_graph, environment, torch_module, diffusers_module
+    )
+    with _GPU_LEASE:
+        loaded = load_pipeline()
+        primary: BaseException | None = None
+        try:
+            return _compiler_context_for_loaded(compiler_context_factory, loaded)
+        except BaseException as error:
+            primary = error
+            raise
+        finally:
+            try:
+                loaded.close()
+            except Exception:
+                if primary is None:
+                    raise
+                primary.add_note("production compiler context pipeline cleanup failed")
 
 
 def open_production_runtime(
