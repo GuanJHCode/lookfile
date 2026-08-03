@@ -40,6 +40,7 @@ from specstyle.observability.hashing import hash_bytes
 from specstyle.spec.compiled_models import (
     CompilerContext,
     ResourcePin,
+    ThresholdMetricCapability,
 )
 from specstyle.workflow.job_models import EventType, JobStatus
 from specstyle.workflow.job_store import JobStore
@@ -99,7 +100,7 @@ def _compiler_inputs(
     ).model_dump(mode="json")
     raw["profiles"]["production"]["resolution"] = list(native_resolution)
     raw["outputs"]["profiles"] = [output_profile]
-    if output_profile == "talking_head_cover":
+    if output_profile in {"talking_head_cover", "background_sequence"}:
         raw["verification"]["l3"] = None
     raw["repair"] = {
         "policy_version": "1.0",
@@ -112,16 +113,41 @@ def _compiler_inputs(
         rules = tuple(
             replace(
                 rule,
-                supported_output_profiles=("xhs_grid", "talking_head_cover"),
+                supported_output_profiles=(
+                    "xhs_grid",
+                    "talking_head_cover",
+                    "background_sequence",
+                ),
             )
             if rule.kind in {"L1_TECHNICAL", "L2_STYLE_FIDELITY"}
+            else replace(
+                rule,
+                metric_id=Identifier("batch_style_consistency"),
+            )
+            if rule.kind == "L2_BATCH_CONSISTENCY"
             else rule
             for rule in catalog.rules
         )
+        profiles = compiler_context.threshold_profiles
+        if output_profile == "background_sequence":
+            item_profile = profiles[0]
+            profiles = (
+                replace(
+                    item_profile,
+                    metrics=(
+                        *item_profile.metrics,
+                        ThresholdMetricCapability(
+                            Identifier("batch_style_consistency"), "<=", 0.25
+                        ),
+                    ),
+                ),
+                *profiles[1:],
+            )
         compiler_context = replace(
             compiler_context,
             output_profile_capabilities=production_output_profile_capabilities(),
             rule_catalogs=(replace(catalog, rules=rules),),
+            threshold_profiles=profiles,
         )
     if applicable_batch:
         compiler_context = _add_applicable_batch_rule(compiler_context)
@@ -275,6 +301,7 @@ def _open_runtime(
         (False, "xhs_grid", (1024, 1024), (1024, 1024)),
         (True, "xhs_grid", (1024, 1024), (1080, 1080)),
         (True, "talking_head_cover", (768, 768), (1080, 1440)),
+        (True, "background_sequence", (768, 768), (1920, 1080)),
     ),
 )
 def test_real_initial_attempt_reaches_terminal_with_exact_durable_audit_history(
@@ -378,7 +405,7 @@ def test_real_initial_attempt_reaches_terminal_with_exact_durable_audit_history(
             for item in result.report.results
             if item.status is RuleStatus.UNVERIFIABLE
         )
-        if output_profile == "talking_head_cover":
+        if output_profile in {"talking_head_cover", "background_sequence"}:
             assert result.verification_plan.l3_status == "NOT_APPLICABLE"
             assert result.verification_plan.l3_reason == "NO_L3_CONFIG"
             batch = next(
@@ -386,7 +413,12 @@ def test_real_initial_attempt_reaches_terminal_with_exact_durable_audit_history(
                 for rule in result.verification_plan.rules
                 if rule.definition.scope is RuleScope.BATCH
             )
-            assert batch.definition.applicability.value == "NOT_APPLICABLE"
+            expected = (
+                "APPLICABLE"
+                if output_profile == "background_sequence"
+                else "NOT_APPLICABLE"
+            )
+            assert batch.definition.applicability.value == expected
         assert (
             result.terminal.artifact_decision.artifact_status is ArtifactStatus.APPROVED
         )
@@ -428,6 +460,13 @@ def test_real_initial_attempt_reaches_terminal_with_exact_durable_audit_history(
             (JobStatus.SPEC_COMPILED, JobStatus.GENERATING),
             (JobStatus.GENERATING, JobStatus.VERIFYING),
             (JobStatus.VERIFYING, JobStatus.APPROVED),
+        )
+        indexed = tuple(
+            event.payload for event in events if hasattr(event.payload, "cohort_index")
+        )
+        assert indexed
+        assert all(
+            (payload.cohort_index, payload.item_index) == (0, 0) for payload in indexed
         )
     finally:
         runtime.close()

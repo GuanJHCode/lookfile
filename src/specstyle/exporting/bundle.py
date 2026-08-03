@@ -1147,10 +1147,11 @@ def _resolution_by_path(manifest_bytes: bytes) -> dict[str, tuple[int, int]]:
     for cohort in cohorts:
         if type(cohort) is not dict:
             _hash_mismatch()
+        profile = cohort.get("output_profile")
         items = cohort.get("items")
-        if type(items) is not list:
+        if type(profile) is not str or type(items) is not list:
             _hash_mismatch()
-        for item in items:
+        for index, item in enumerate(items):
             if type(item) is not dict:
                 _hash_mismatch()
             final = item.get("final_artifact")
@@ -1161,8 +1162,40 @@ def _resolution_by_path(manifest_bytes: bytes) -> dict[str, tuple[int, int]]:
             graph = initial.get("graph")
             if type(path) is not str or type(graph) is not dict:
                 _hash_mismatch()
+            _validate_readback_sequence(profile, items, item, graph, path, index)
+            if path in result:
+                _hash_mismatch()
             result[path] = _final_graph_resolution(graph)
     return result
+
+
+def _validate_readback_sequence(
+    profile: str,
+    items: list[object],
+    item: dict[str, object],
+    graph: dict[str, object],
+    path: str,
+    index: int,
+) -> None:
+    if graph.get("output_profile") != profile:
+        _hash_mismatch()
+    sequence = item.get("sequence_index")
+    contract = graph.get("render_contract")
+    semantics = contract.get("sequence_semantics") if type(contract) is dict else None
+    if profile == "background_sequence":
+        if (
+            type(sequence) is not int
+            or isinstance(sequence, bool)
+            or sequence != index
+            or not path.rsplit("/", 1)[-1].startswith(f"{sequence:06d}_")
+        ):
+            _hash_mismatch()
+        if semantics == "single_item_sequence_index_zero" and (
+            len(items) != 1 or sequence != 0
+        ):
+            _hash_mismatch()
+    elif sequence is not None or semantics == "single_item_sequence_index_zero":
+        _hash_mismatch()
 
 
 def _final_graph_resolution(graph: dict[str, object]) -> tuple[int, int]:
@@ -1199,7 +1232,8 @@ def _final_graph_resolution(graph: dict[str, object]) -> tuple[int, int]:
         or contract["fit"] not in ("contain_pad", "contain_pad_center", "cover_center")
         or contract["overlay"] != "disabled"
         or contract["resampling"] != "lanczos"
-        or contract["sequence_semantics"] != "single_static"
+        or contract["sequence_semantics"]
+        not in {"single_static", "single_item_sequence_index_zero"}
     ):
         _hash_mismatch()
     return (final[0], final[1])

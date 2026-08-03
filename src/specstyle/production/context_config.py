@@ -96,6 +96,7 @@ _THRESHOLD_KEYS = {
     "metric",
     "evidence",
 }
+_THRESHOLD_METRICS_KEYS = (_THRESHOLD_KEYS - {"metric"}) | {"metrics"}
 _METRIC_KEYS = {"metric_id", "operator", "value"}
 _EVIDENCE_KEYS = {
     "calibration_dataset_sha256",
@@ -107,6 +108,7 @@ _CANNY_KEYS = {"low_threshold", "high_threshold", "aperture_size", "l2_gradient"
 _MODEL_ROLES = ("base", "ip_adapter", "controlnet")
 _PIPELINES = ("sdxl_turbo", "lcm", "sdxl_base")
 _L2_METRIC = "reference_style_statistics_similarity"
+_L2_BATCH_METRIC = "batch_style_consistency"
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,11 +141,15 @@ class _L2ThresholdProfile:
     logical_name: str
     status: str
     style_pack_id: Identifier
-    metric: ThresholdMetricCapability
+    metrics: tuple[ThresholdMetricCapability, ...]
     evidence: _ThresholdEvidence
 
     def __post_init__(self) -> None:
-        metric = self.metric
+        metrics = self.metrics
+        expected = (
+            (_L2_METRIC, ">=", -1.0, 1.0),
+            (_L2_BATCH_METRIC, "<=", 0.0, float("inf")),
+        )
         if (
             type(self.logical_name) is not str
             or not 1 <= len(self.logical_name) <= 2048
@@ -153,11 +159,24 @@ class _L2ThresholdProfile:
                 for character in self.logical_name
             )
             or self.status not in {"DRAFT", "CALIBRATED", "VALIDATED"}
-            or metric.metric_id != Identifier(_L2_METRIC)
-            or metric.operator != ">="
-            or not -1.0 <= metric.value <= 1.0
+            or type(metrics) is not tuple
+            or not metrics
+            or tuple(metric.metric_id.value for metric in metrics)
+            != tuple(item[0] for item in expected[: len(metrics)])
+            or any(
+                metric.operator != operator or not lower <= metric.value <= upper
+                for metric, (_, operator, lower, upper) in zip(
+                    metrics, expected[: len(metrics)], strict=True
+                )
+            )
         ):
             raise DomainError("invalid production L2 threshold profile")
+
+    @property
+    def metric(self) -> ThresholdMetricCapability:
+        if len(self.metrics) != 1:
+            raise DomainError("production L2 threshold has multiple metrics")
+        return self.metrics[0]
 
 
 @dataclass(frozen=True, slots=True)
@@ -298,6 +317,8 @@ def _catalog(value: object, schema_version: str) -> RuleCatalogCapability:
         scope=RuleScope.BATCH,
         outputs=None if v2 else ("background_sequence",),
     )
+    if batch.metric_id != Identifier(_L2_BATCH_METRIC):
+        raise DomainError("invalid production L2 batch metric")
     return RuleCatalogCapability(
         raw["ruleset_version"], _pin(raw["pin"]), l1 + (item, batch)
     )
@@ -323,19 +344,32 @@ def _mapping(value: object) -> StrengthMappingCapability:
     )
 
 
-def _threshold(value: object) -> _L2ThresholdProfile:
-    raw = _exact(value, _THRESHOLD_KEYS, "threshold")
-    metric = _exact(raw["metric"], _METRIC_KEYS, "threshold metric")
+def _threshold(value: object, schema_version: str) -> _L2ThresholdProfile:
+    if type(value) is not dict or set(value) not in (
+        _THRESHOLD_KEYS,
+        _THRESHOLD_METRICS_KEYS if schema_version == _SCHEMA_V2 else set(),
+    ):
+        raise DomainError("invalid production context threshold")
+    raw = value
+    metric_values = raw.get("metrics", [raw.get("metric")])
+    if type(metric_values) is not list or not metric_values:
+        raise DomainError("invalid production context threshold metrics")
+    metrics = tuple(
+        _exact(item, _METRIC_KEYS, "threshold metric") for item in metric_values
+    )
     evidence = _exact(raw["evidence"], _EVIDENCE_KEYS, "threshold evidence")
     return _L2ThresholdProfile(
         _pin(raw["pin"]),
         raw["logical_name"],
         raw["status"],
         Identifier(raw["style_pack_id"]),
-        ThresholdMetricCapability(
-            Identifier(metric["metric_id"]),
-            metric["operator"],
-            metric["value"],
+        tuple(
+            ThresholdMetricCapability(
+                Identifier(metric["metric_id"]),
+                metric["operator"],
+                metric["value"],
+            )
+            for metric in metrics
         ),
         _ThresholdEvidence(
             Sha256(evidence["calibration_dataset_sha256"]),
@@ -493,12 +527,12 @@ def _read_evidence(
 
 
 def _issue(document: dict[str, Any]) -> ProductionContextConfig:
-    threshold = _threshold(document["l2_threshold_profile"])
+    schema_version = document["schema_version"]
+    threshold = _threshold(document["l2_threshold_profile"], schema_version)
     mapping = _mapping(document["strength_mapping"])
     if threshold.style_pack_id != mapping.preset_id:
         raise DomainError("invalid production threshold style pack")
     issued = object.__new__(ProductionContextConfig)
-    schema_version = document["schema_version"]
     outputs = (
         (parse_legacy_output_profile(document["output_profile"]),)
         if schema_version == _SCHEMA_V1
@@ -506,12 +540,20 @@ def _issue(document: dict[str, Any]) -> ProductionContextConfig:
     )
     catalog = _catalog(document["rule_catalog"], schema_version)
     profiles = {item.profile for item in outputs}
+    expected_metrics = tuple(
+        rule.metric_id
+        for rule in catalog.rules
+        if rule.level is RuleLevel.L2
+        and profiles.intersection(rule.supported_output_profiles)
+    )
     if any(
         rule.level is RuleLevel.L1
         and not profiles.issubset(rule.supported_output_profiles)
         for rule in catalog.rules
     ):
         raise DomainError("production output lacks required L1 coverage")
+    if tuple(metric.metric_id for metric in threshold.metrics) != expected_metrics:
+        raise DomainError("production output lacks L2 threshold coverage")
     values = (
         ("schema_version", document["schema_version"]),
         ("compiler_pin", _pin(document["compiler_pin"])),
@@ -643,12 +685,13 @@ def _copy_threshold(
         "product_instance",
         _copy_pin(encoder_pin),
         None,
-        (
+        tuple(
             ThresholdMetricCapability(
-                Identifier(value.metric.metric_id.value),
-                str(value.metric.operator),
-                value.metric.value,
-            ),
+                Identifier(metric.metric_id.value),
+                str(metric.operator),
+                metric.value,
+            )
+            for metric in value.metrics
         ),
         Sha256(value.evidence.calibration_dataset_sha256.value),
         Sha256(value.evidence.validation_dataset_sha256.value),

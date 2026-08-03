@@ -144,6 +144,7 @@ def test_pinned_talking_cover_renderer_centers_without_crop_or_stretch() -> None
     assert tuple(item.profile for item in capabilities) == (
         "xhs_grid",
         "talking_head_cover",
+        "background_sequence",
     )
     capability = capabilities[1]
     assert capability.pin.id == "specstyle-output-renderer-talking-head-cover"
@@ -176,6 +177,48 @@ def test_pinned_talking_cover_renderer_centers_without_crop_or_stretch() -> None
         module.render_production_output(wrong_size.getvalue(), capability)
     with pytest.raises(TypeError):
         module.render_production_output(source.getvalue(), capability, "title")
+
+
+def test_pinned_background_sequence_renderer_is_single_index_zero_frame() -> None:
+    from io import BytesIO
+
+    from PIL import Image
+
+    module = importlib.import_module("specstyle.generation.output_profiles")
+    contracts = importlib.import_module("specstyle.generation.output_profile_contracts")
+    capability = next(
+        item
+        for item in contracts.production_output_profile_capabilities()
+        if item.profile == "background_sequence"
+    )
+    assert capability.pin.id == "specstyle-output-renderer-background-sequence"
+    assert capability.pin.revision == "v1"
+    assert capability.pin.sha256.value == (
+        "ac043a1b1070143cb50ae4837aa4d01178e2b7b0a9028c997fb7abde68952a2b"
+    )
+    contract = capability.render_contract
+    assert contract.native_resolution == (768, 768)
+    assert contract.final_resolution == (1920, 1080)
+    assert contract.fit == "contain_pad_center"
+    assert contract.sequence_semantics == "single_item_sequence_index_zero"
+    source = BytesIO()
+    Image.new("RGB", (768, 768), (15, 90, 170)).save(source, format="PNG")
+
+    first = module.render_production_output(source.getvalue(), capability)
+    second = module.render_production_output(source.getvalue(), capability)
+
+    assert first == second
+    with Image.open(BytesIO(first)) as rendered:
+        assert rendered.mode == "RGB"
+        assert rendered.size == (1920, 1080)
+        assert rendered.info == {}
+        assert rendered.getpixel((419, 0)) == (255, 255, 255)
+        assert rendered.getpixel((420, 0)) == (15, 90, 170)
+        assert rendered.getpixel((1499, 1079)) == (15, 90, 170)
+        assert rendered.getpixel((1500, 1079)) == (255, 255, 255)
+
+    with pytest.raises(TypeError):
+        module.render_production_output(source.getvalue(), capability, 0)
 
 
 def test_production_renderer_rejects_a_forged_capability_pin() -> None:

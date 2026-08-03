@@ -28,6 +28,7 @@ from specstyle.spec.compiled_models import (
     CompiledExecutionGraph,
     CompiledStyleSpec,
     CompiledVerificationPlan,
+    OutputProfile,
 )
 from specstyle.verification.rule_models import VerificationReport
 from specstyle.workflow.job_models import (
@@ -449,6 +450,10 @@ def _history_attempt_ids(history: RepairHistory) -> tuple[str, ...]:
     return tuple(item.attempt_id.value for item in requests)
 
 
+def _sequence_index(profile: OutputProfile) -> int | None:
+    return 0 if profile == "background_sequence" else None
+
+
 def _validate_job_state(value: _ValidatedResult) -> None:
     state, current = value.job_state, value.request
     job, decision = state.job, value.terminal.artifact_decision
@@ -491,7 +496,7 @@ def _prepare_production_export_command(
             type(item) is not AssetCredit for item in asset_credits
         ):
             _invalid()
-        sequence = 0 if value.request.output_profile == "background_sequence" else None
+        sequence = _sequence_index(value.request.output_profile)
         export_request = ExportRequest(
             (
                 ExportCohort(

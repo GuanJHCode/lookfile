@@ -7,13 +7,29 @@ from dataclasses import replace
 
 import pytest
 
+from specstyle.domain.artifacts import ArtifactRef, AssetRef
 from specstyle.domain.enums import RuleScope
-from specstyle.domain.identifiers import Identifier, RuleId, Sha256
+from specstyle.domain.identifiers import (
+    ArtifactId,
+    AssetId,
+    AttemptId,
+    Identifier,
+    RuleId,
+    Sha256,
+)
 from specstyle.errors import DomainError
-from specstyle.generation.requests import GenerationRequest
+from specstyle.generation.output_profile_contracts import (
+    production_output_profile_capabilities,
+)
+from specstyle.generation.preprocess import PreprocessPlan, preprocess_image
+from specstyle.generation.protocols import GeneratedArtifact
+from specstyle.generation.requests import GenerationRequest, PreparedControlInput
+from specstyle.observability.hashing import hash_bytes
+from specstyle.spec.compiled_models import ThresholdMetricCapability
 from specstyle.spec.compiler import compile_style_spec
 from tests.unit.verification._production_fixtures import (
     _ProductionCase,
+    _png,
     production_case as production_case,
 )
 
@@ -70,6 +86,84 @@ def _create(
         case.artifact_resolver,
         case.style_resolver,
     )
+
+
+def _background_case(
+    case: _ProductionCase, status: str
+) -> tuple[object, GenerationRequest, object, GeneratedArtifact]:
+    context = case.compiler_context
+    catalog = context.rule_catalogs[0]
+    rules = tuple(
+        replace(
+            rule,
+            supported_output_profiles=("background_sequence",),
+            metric_id=(
+                Identifier("batch_style_consistency")
+                if rule.scope is RuleScope.BATCH
+                else rule.metric_id
+            ),
+        )
+        if rule.level.value in {"L1", "L2"}
+        else rule
+        for rule in catalog.rules
+    )
+    l2_profile = context.threshold_profiles[0]
+    batch_rule = next(rule for rule in rules if rule.scope is RuleScope.BATCH)
+    batch_metric = ThresholdMetricCapability(batch_rule.metric_id, "<=", 0.25)
+    context = replace(
+        context,
+        output_profile_capabilities=production_output_profile_capabilities(),
+        rule_catalogs=(replace(catalog, rules=rules),),
+        threshold_profiles=(
+            replace(
+                l2_profile,
+                status=status,
+                metrics=(*l2_profile.metrics, batch_metric),
+            ),
+            *context.threshold_profiles[1:],
+        ),
+    )
+    source_type = type(case.request.compiled_spec.source_spec)
+    primitive = case.request.compiled_spec.source_spec.model_dump(mode="python")
+    primitive["outputs"]["profiles"] = ("background_sequence",)
+    primitive["profiles"]["production"]["resolution"] = (768, 768)
+    primitive["verification"]["l3"] = None
+    compiled = compile_style_spec(source_type.model_validate(primitive), context)
+    original = case.request
+    source_bytes = original.source.content
+    source_ref = AssetRef(AssetId("background-source"), hash_bytes(source_bytes))
+    source = preprocess_image(
+        source_bytes,
+        source_ref,
+        PreprocessPlan(
+            (768, 768),
+            "contain_pad",
+            (0, 0, 0),
+            original.source.snapshot.plan.processor_pin,
+        ),
+    )
+    request = GenerationRequest(
+        original.job_id,
+        AttemptId("attempt-background_sequence-0"),
+        None,
+        compiled,
+        "production",
+        "background_sequence",
+        source,
+        original.style_references,
+        original.prompt,
+        PreparedControlInput("canny", source),
+        original.variation_index,
+        original.environment_hash,
+    )
+    content = _png((10, 200, 10), size=(1920, 1080))
+    artifact = GeneratedArtifact(
+        ArtifactRef(ArtifactId("background-artifact"), hash_bytes(content)),
+        content,
+        request.request_hash,
+        request.generation_fingerprint,
+    )
+    return context, request, compiled.verification_plans[0], artifact
 
 
 @pytest.mark.parametrize("mapping_change", ("missing", "extra"))
@@ -188,30 +282,43 @@ def test_create_rejects_nonadvisory_l3_semantics_when_rule_is_not_applicable(
     assert production_case.evidence_calls == {}
 
 
-def test_create_rejects_applicable_batch_rule(
+def test_draft_background_batch_rule_is_unverifiable_without_metric_execution(
     production_case: _ProductionCase,
 ) -> None:
     production = importlib.import_module("specstyle.verification.production")
-    context = production_case.compiler_context
-    catalog = context.rule_catalogs[0]
-    rules = tuple(
-        replace(rule, supported_output_profiles=("xhs_grid",))
-        if rule.scope is RuleScope.BATCH
-        else rule
-        for rule in catalog.rules
+    context, request, plan, artifact = _background_case(production_case, "DRAFT")
+    production_case.artifact_resolver.value = artifact
+    verifier = _create(
+        production_case,
+        production,
+        context=context,
+        request=request,
+        plan=plan,
     )
-    l2_profile = context.threshold_profiles[0]
-    batch_rule = next(rule for rule in rules if rule.scope is RuleScope.BATCH)
-    batch_metric = replace(l2_profile.metrics[0], metric_id=batch_rule.metric_id)
-    context = replace(
-        context,
-        rule_catalogs=(replace(catalog, rules=rules),),
-        threshold_profiles=(
-            replace(l2_profile, metrics=(*l2_profile.metrics, batch_metric)),
-            *context.threshold_profiles[1:],
-        ),
+
+    results = verifier.verify((artifact.ref,), plan.applicable_rule_definitions)
+
+    l2_results = tuple(result for result in results if result.rule_id.value[:2] == "l2")
+    assert tuple(result.rule_id.value for result in l2_results) == (
+        "l2_batch",
+        "l2_style",
     )
-    request, plan = _request_for_context(production_case, context)
+    assert all(result.status.value == "UNVERIFIABLE" for result in l2_results)
+    assert all(result.score is None for result in l2_results)
+    assert all(
+        result.affected_artifact_ids == (artifact.ref.artifact_id,)
+        for result in l2_results
+    )
+    assert production_case.style_resolver.calls == []
+    assert production_case.evidence_calls == {}
+
+
+@pytest.mark.parametrize("status", ("CALIBRATED", "VALIDATED"))
+def test_create_rejects_non_draft_background_batch_rule(
+    production_case: _ProductionCase, status: str
+) -> None:
+    production = importlib.import_module("specstyle.verification.production")
+    context, request, plan, _ = _background_case(production_case, status)
 
     with pytest.raises(DomainError, match="^invalid production verifier dependency$"):
         _create(

@@ -100,6 +100,29 @@ def _talking_head_cover() -> OutputProfileCapability:
     )
 
 
+def _background_sequence() -> OutputProfileCapability:
+    contract = OutputRenderContract(
+        (1920, 1080),
+        "contain_pad_center",
+        "lanczos",
+        (255, 255, 255),
+        "disabled",
+        "single_item_sequence_index_zero",
+        (768, 768),
+    )
+    return OutputProfileCapability(
+        ResourcePin(
+            "specstyle-output-renderer-background-sequence",
+            "v1",
+            _digest("background_sequence", contract),
+        ),
+        "background_sequence",
+        ("product_instance",),
+        ("preview", "production"),
+        contract,
+    )
+
+
 def production_output_profile_capabilities() -> tuple[OutputProfileCapability, ...]:
     """Return detached capabilities implemented by this code revision."""
-    return (_xhs_grid(), _talking_head_cover())
+    return (_xhs_grid(), _talking_head_cover(), _background_sequence())

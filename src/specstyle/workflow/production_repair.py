@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from specstyle.domain.enums import RuleScope, StaticApplicability
+from specstyle.domain.enums import RuleLevel, RuleScope, StaticApplicability
 from specstyle.domain.identifiers import AttemptId, DecisionId, JobId
 from specstyle.errors import DomainError
 from specstyle.generation.protocols import GeneratedArtifact
@@ -48,11 +48,33 @@ def _validate_repair_contract(
         repair.stop_after_no_improvement,
     ) != ("1.0", 1, 1):
         raise DomainError("production repair contract is unsupported")
+    batch = tuple(
+        rule
+        for plan in compiled.verification_plans
+        if plan.output_profile == profile
+        for rule in plan.rules
+        if (
+            rule.definition.scope is RuleScope.BATCH
+            and rule.definition.applicability is StaticApplicability.APPLICABLE
+        )
+    )
+    if batch and (
+        len(batch) != 1
+        or profile != "background_sequence"
+        or batch[0].definition.level is not RuleLevel.L2
+        or batch[0].definition.required
+        or batch[0].metric_id is None
+        or batch[0].metric_id.value != "batch_style_consistency"
+        or batch[0].threshold_binding is None
+        or batch[0].threshold_binding.status != "DRAFT"
+        or batch[0].threshold_binding.operator != "<="
+    ):
+        raise DomainError("applicable batch verification is unsupported")
     if any(
         rule.definition.scope is RuleScope.BATCH
         and rule.definition.applicability is StaticApplicability.APPLICABLE
         for plan in compiled.verification_plans
-        if plan.output_profile == profile
+        if plan.output_profile != profile
         for rule in plan.rules
     ):
         raise DomainError("applicable batch verification is unsupported")

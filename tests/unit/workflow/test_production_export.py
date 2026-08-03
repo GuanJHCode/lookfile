@@ -586,6 +586,8 @@ def test_prepare_export_supports_every_profile_and_terminal_route(
             ArtifactStatus.REJECTED: "rejected/",
         }[status]
     )
+    if profile == "background_sequence":
+        assert routed[0].rsplit("/", 1)[-1].startswith("000000_")
 
 
 @pytest.mark.parametrize(

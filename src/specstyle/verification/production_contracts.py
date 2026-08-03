@@ -16,11 +16,13 @@ from specstyle.errors import DomainError
 from specstyle.generation.image_evidence import _ProcessorProvenance
 from specstyle.generation.requests import GenerationRequest
 from specstyle.spec.compiled_models import (
+    CompiledThresholdBinding,
     CompiledExecutionGraph,
     CompiledRule,
     CompiledStyleSpec,
     CompiledVerificationPlan,
     CompilerContext,
+    EncoderCapability,
     L3PluginCapability,
     ResourcePin,
     RuleCapability,
@@ -34,6 +36,7 @@ from specstyle.verification.l1.production_bindings import (
 __all__ = ()
 
 _L2_METRIC = Identifier("reference_style_statistics_similarity")
+_L2_BATCH_METRIC = Identifier("batch_style_consistency")
 _L3_METRIC = Identifier("subject_semantic_similarity")
 
 
@@ -348,13 +351,11 @@ def _validate_l1_bindings(
             raise _ProductionContractViolation
 
 
-def _validate_l2_binding(
+def _l2_binding_materials(
     context: CompilerContext,
     binding: _LoadedVerificationBinding,
-    compiled: CompiledStyleSpec,
     rule: CompiledRule,
-    capability: RuleCapability,
-) -> None:
+) -> tuple[EncoderCapability, ThresholdProfileCapability, CompiledThresholdBinding]:
     encoder = _one(
         context.encoder_capabilities, lambda item: item.pin == binding.evidence_pin
     )
@@ -364,15 +365,23 @@ def _validate_l2_binding(
         if rule.threshold_binding is not None
         and profile.pin == rule.threshold_binding.profile_pin
     )
-    if len(profiles) != 1:
+    metric = rule.threshold_binding
+    if len(profiles) != 1 or metric is None:
         raise _ProductionContractViolation
-    profile, metric = profiles[0], rule.threshold_binding
-    valid = (
-        capability.kind == "L2_STYLE_FIDELITY"
-        and capability.level is RuleLevel.L2
-        and capability.scope is RuleScope.ITEM
+    return encoder, profiles[0], metric
+
+
+def _valid_l2_common(
+    binding: _LoadedVerificationBinding,
+    compiled: CompiledStyleSpec,
+    rule: CompiledRule,
+    capability: RuleCapability,
+    encoder: EncoderCapability,
+    profile: ThresholdProfileCapability,
+) -> bool:
+    return (
+        capability.level is RuleLevel.L2
         and capability.threshold_source == "l2"
-        and capability.metric_id == _L2_METRIC == rule.metric_id
         and capability.verifier_pin == rule.verifier_pin
         and profile.source == "l2"
         and profile.style_pack_id == Identifier(compiled.source_spec.style.preset_id)
@@ -390,8 +399,59 @@ def _validate_l2_binding(
         and compiled.l2_encoder.preprocessing_version == encoder.preprocessing_version
         and _profile_matches_binding(profile, rule)
     )
-    if metric is None or metric.operator != ">=" or not -1.0 <= metric.value <= 1.0:
-        valid = False
+
+
+def _valid_l2_item(
+    rule: CompiledRule,
+    capability: RuleCapability,
+    metric: CompiledThresholdBinding,
+) -> bool:
+    return (
+        capability.kind == "L2_STYLE_FIDELITY"
+        and capability.scope is RuleScope.ITEM
+        and capability.metric_id == _L2_METRIC == rule.metric_id
+        and metric is not None
+        and metric.operator == ">="
+        and -1.0 <= metric.value <= 1.0
+    )
+
+
+def _valid_l2_batch(
+    compiled: CompiledStyleSpec,
+    rule: CompiledRule,
+    capability: RuleCapability,
+    profile: ThresholdProfileCapability,
+    metric: CompiledThresholdBinding,
+) -> bool:
+    return (
+        capability.kind == "L2_BATCH_CONSISTENCY"
+        and capability.scope is RuleScope.BATCH
+        and capability.requirement == "always_advisory"
+        and not capability.affected_by_actions
+        and capability.metric_id == _L2_BATCH_METRIC == rule.metric_id
+        and not rule.definition.required
+        and compiled.source_spec.outputs.profiles == ("background_sequence",)
+        and profile.status == "DRAFT"
+        and metric is not None
+        and metric.operator == "<="
+        and metric.value >= 0.0
+    )
+
+
+def _validate_l2_binding(
+    context: CompilerContext,
+    binding: _LoadedVerificationBinding,
+    compiled: CompiledStyleSpec,
+    rule: CompiledRule,
+    capability: RuleCapability,
+) -> None:
+    encoder, profile, metric = _l2_binding_materials(context, binding, rule)
+    valid = _valid_l2_common(
+        binding, compiled, rule, capability, encoder, profile
+    ) and (
+        _valid_l2_item(rule, capability, metric)
+        or _valid_l2_batch(compiled, rule, capability, profile, metric)
+    )
     if not valid:
         raise _ProductionContractViolation
 
@@ -485,6 +545,22 @@ def _validate_rule_bindings(
                 _validate_l3_binding(context, compiled, plan, rule, plugin)
 
 
+def _has_unsupported_applicable_scope(
+    plan: CompiledVerificationPlan, output_profile: str
+) -> bool:
+    return any(
+        rule.definition.scope is not RuleScope.ITEM
+        and not (
+            output_profile == "background_sequence"
+            and rule.definition.level is RuleLevel.L2
+            and rule.definition.scope is RuleScope.BATCH
+            and not rule.definition.required
+        )
+        for rule in plan.rules
+        if rule.definition.applicability is StaticApplicability.APPLICABLE
+    )
+
+
 def _validate_production_binding(
     binding: _LoadedVerificationBinding,
     compiled: CompiledStyleSpec,
@@ -521,11 +597,7 @@ def _validate_production_binding(
         or len(matching) != 1
         or len(canonical) != 1
         or plan is not matching[0]
-        or any(
-            rule.definition.scope is not RuleScope.ITEM
-            for rule in plan.rules
-            if rule.definition.applicability is StaticApplicability.APPLICABLE
-        )
+        or _has_unsupported_applicable_scope(plan, output_profile)
     ):
         raise _ProductionContractViolation
     _validate_loaded_binding(binding, graph, environment_hash)

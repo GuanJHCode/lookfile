@@ -266,6 +266,45 @@ def _v2_talking_context_document(evidence: dict[str, str]) -> dict[str, Any]:
     return document
 
 
+def _v2_all_outputs_context_document(evidence: dict[str, str]) -> dict[str, Any]:
+    document = _v2_talking_context_document(evidence)
+    document["output_profiles"].append(
+        {
+            "profile": "background_sequence",
+            "pin": {
+                "id": "specstyle-output-renderer-background-sequence",
+                "revision": "v1",
+                "sha256": (
+                    "ac043a1b1070143cb50ae4837aa4d01178e2b7b0a9028c997fb7abde68952a2b"
+                ),
+            },
+            "native_resolution": [768, 768],
+            "final_resolution": [1920, 1080],
+            "fit": "contain_pad_center",
+            "resampling": "lanczos",
+            "background": [255, 255, 255],
+            "overlay": "disabled",
+            "sequence_semantics": "single_item_sequence_index_zero",
+        }
+    )
+    profiles = ["xhs_grid", "talking_head_cover", "background_sequence"]
+    catalog = document["rule_catalog"]
+    for rule in catalog["l1_rules"]:
+        rule["supported_output_profiles"] = profiles
+    catalog["l2_item_rule"]["supported_output_profiles"] = profiles
+    threshold = document["l2_threshold_profile"]
+    item_metric = threshold.pop("metric")
+    threshold["metrics"] = [
+        item_metric,
+        {
+            "metric_id": "batch_style_consistency",
+            "operator": "<=",
+            "value": 0.25,
+        },
+    ]
+    return document
+
+
 def _write_roots(tmp_path: Path, *, status: str = "VALIDATED") -> tuple[Path, Path]:
     config_root, evidence_root = tmp_path / "config", tmp_path / "evidence"
     config_root.mkdir(mode=0o700)
@@ -550,6 +589,60 @@ def test_v2_rejects_drift_in_talking_renderer_contract(
     evidence = document["l2_threshold_profile"]["evidence"]
     document = _v2_talking_context_document(evidence)
     document["output_profiles"][1][field] = value
+    _write_document(config_root, document)
+
+    with pytest.raises(DomainError):
+        _load(config_root, evidence_root)
+
+
+def test_loads_v2_all_profiles_with_item_and_batch_l2_metrics(tmp_path: Path) -> None:
+    config_root, evidence_root = _write_roots(tmp_path)
+    document = _read_document(config_root)
+    evidence = document["l2_threshold_profile"]["evidence"]
+    _write_document(config_root, _v2_all_outputs_context_document(evidence))
+
+    loaded = _load(config_root, evidence_root)
+
+    assert tuple(item.profile for item in loaded.output_profiles) == (
+        "xhs_grid",
+        "talking_head_cover",
+        "background_sequence",
+    )
+    capability = loaded.output_profiles[2]
+    assert capability.pin.sha256 == Sha256(
+        "ac043a1b1070143cb50ae4837aa4d01178e2b7b0a9028c997fb7abde68952a2b"
+    )
+    assert capability.render_contract.native_resolution == (768, 768)
+    assert capability.render_contract.final_resolution == (1920, 1080)
+    assert capability.render_contract.sequence_semantics == (
+        "single_item_sequence_index_zero"
+    )
+    assert tuple(
+        (metric.metric_id.value, metric.operator, metric.value)
+        for metric in loaded.l2_threshold_profile.metrics
+    ) == (
+        ("reference_style_statistics_similarity", ">=", 0.5),
+        ("batch_style_consistency", "<=", 0.25),
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("missing_batch_metric", "batch_operator", "sequence_semantics"),
+)
+def test_v2_rejects_incomplete_background_contract(
+    tmp_path: Path, mutation: str
+) -> None:
+    config_root, evidence_root = _write_roots(tmp_path)
+    document = _read_document(config_root)
+    evidence = document["l2_threshold_profile"]["evidence"]
+    document = _v2_all_outputs_context_document(evidence)
+    if mutation == "missing_batch_metric":
+        document["l2_threshold_profile"]["metrics"].pop()
+    elif mutation == "batch_operator":
+        document["l2_threshold_profile"]["metrics"][1]["operator"] = ">="
+    else:
+        document["output_profiles"][2]["sequence_semantics"] = "single_static"
     _write_document(config_root, document)
 
     with pytest.raises(DomainError):
@@ -2292,6 +2385,48 @@ def test_v2_rejects_talking_production_resolution_outside_the_pinned_contract(
 
     with pytest.raises(DomainError, match="^graph native output resolution mismatch$"):
         compile_style_spec(StyleSpecV1.model_validate(primitive), context)
+
+
+def test_v2_compiles_background_as_single_draft_sequence_item(tmp_path: Path) -> None:
+    module = importlib.import_module("specstyle.production.context_config")
+    config_root, evidence_root = _write_roots(tmp_path)
+    document = _read_document(config_root)
+    evidence = document["l2_threshold_profile"]["evidence"]
+    _write_document(config_root, _v2_all_outputs_context_document(evidence))
+    environment, graph = _factory_environment(), _factory_graph()
+    preprocessing_version = "clip-preprocess-v1"
+    context = module.make_production_compiler_context_factory(
+        _load(config_root, evidence_root), environment, graph
+    )(preprocessing_version)
+    raw = _raw_for_factory(context, environment, graph, preprocessing_version)
+    primitive = raw.model_dump(mode="python")
+    primitive["outputs"]["profiles"] = ("background_sequence",)
+    primitive["profiles"]["production"]["resolution"] = (768, 768)
+    primitive["verification"]["l3"] = None
+
+    compiled = compile_style_spec(StyleSpecV1.model_validate(primitive), context)
+    production_graph = compiled.production_graphs[0]
+    plan = compiled.verification_plans[0]
+
+    assert production_graph.output_profile == "background_sequence"
+    assert production_graph.resolution == (768, 768)
+    assert production_graph.final_output_resolution == (1920, 1080)
+    assert production_graph.render_contract.sequence_semantics == (
+        "single_item_sequence_index_zero"
+    )
+    l1 = tuple(rule for rule in plan.rules if rule.definition.level is RuleLevel.L1)
+    assert len(l1) == 4
+    assert all(rule.definition.applicability.value == "APPLICABLE" for rule in l1)
+    l2 = tuple(rule for rule in plan.rules if rule.definition.level is RuleLevel.L2)
+    assert {rule.definition.scope for rule in l2} == {
+        RuleScope.ITEM,
+        RuleScope.BATCH,
+    }
+    assert all(rule.definition.applicability.value == "APPLICABLE" for rule in l2)
+    assert all(rule.definition.required is False for rule in l2)
+    assert all(rule.threshold_binding.status == "DRAFT" for rule in l2)
+    assert plan.l3_status == "NOT_APPLICABLE"
+    assert plan.l3_reason == "NO_L3_CONFIG"
 
 
 @pytest.mark.parametrize("mismatch", ("runtime", "model", "threshold"))

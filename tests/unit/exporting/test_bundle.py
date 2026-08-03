@@ -435,6 +435,98 @@ def test_talking_readback_binds_native_and_final_resolutions() -> None:
         bundle_module._final_graph_resolution(primitive)
 
 
+def test_background_readback_accepts_pinned_single_index_zero_contract() -> None:
+    from specstyle.exporting import bundle as bundle_module
+    from specstyle.exporting.qa_report import graph_primitive
+
+    legacy = _production_request().graph
+    capability = production_output_profile_capabilities()[2]
+    background = replace(
+        legacy,
+        output_profile="background_sequence",
+        output_profile_pin=capability.pin,
+        resolution=(768, 768),
+        render_contract=capability.render_contract,
+    )
+    manifest = {
+        "cohorts": [
+            {
+                "output_profile": "background_sequence",
+                "items": [
+                    {
+                        "sequence_index": 0,
+                        "final_artifact": {
+                            "relative_path": (
+                                "approved/background_sequence/000000_artifact.png"
+                            )
+                        },
+                        "initial_attempt": {"graph": graph_primitive(background)},
+                    }
+                ],
+            }
+        ]
+    }
+
+    assert bundle_module._resolution_by_path(
+        json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
+    ) == {"approved/background_sequence/000000_artifact.png": (1920, 1080)}
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("none", "one", "bool", "leaf", "profile", "second_item"),
+)
+def test_background_readback_rejects_sequence_contract_drift(mutation: str) -> None:
+    from specstyle.exporting import bundle as bundle_module
+    from specstyle.exporting.qa_report import graph_primitive
+
+    legacy = _production_request().graph
+    capability = production_output_profile_capabilities()[2]
+    background = replace(
+        legacy,
+        output_profile="background_sequence",
+        output_profile_pin=capability.pin,
+        resolution=(768, 768),
+        render_contract=capability.render_contract,
+    )
+    item = {
+        "sequence_index": 0,
+        "final_artifact": {
+            "relative_path": "approved/background_sequence/000000_artifact.png"
+        },
+        "initial_attempt": {"graph": graph_primitive(background)},
+    }
+    cohort = {"output_profile": "background_sequence", "items": [item]}
+    if mutation == "none":
+        item["sequence_index"] = None
+    elif mutation == "one":
+        item["sequence_index"] = 1
+    elif mutation == "bool":
+        item["sequence_index"] = True
+    elif mutation == "leaf":
+        item["final_artifact"]["relative_path"] = (
+            "approved/background_sequence/000001_artifact.png"
+        )
+    elif mutation == "profile":
+        cohort["output_profile"] = "xhs_grid"
+    else:
+        cohort["items"].append(
+            {
+                **item,
+                "sequence_index": 1,
+                "final_artifact": {
+                    "relative_path": ("approved/background_sequence/000001_other.png")
+                },
+            }
+        )
+
+    manifest = json.dumps(
+        {"cohorts": [cohort]}, sort_keys=True, separators=(",", ":")
+    ).encode()
+    with pytest.raises(DomainError, match="^export hash mismatch$"):
+        bundle_module._resolution_by_path(manifest)
+
+
 # --------------------------------------------------------------------------- #
 # Forbidden APIs
 # --------------------------------------------------------------------------- #

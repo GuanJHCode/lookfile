@@ -220,7 +220,7 @@ class OutputRenderContract:
     resampling: Literal["lanczos"]
     background: tuple[int, int, int]
     overlay: Literal["disabled"]
-    sequence_semantics: Literal["single_static"]
+    sequence_semantics: Literal["single_static", "single_item_sequence_index_zero"]
     native_resolution: tuple[int, int] | None = None
 
     def __post_init__(self) -> None:
@@ -251,7 +251,7 @@ class OutputRenderContract:
         _choice(self.overlay, {"disabled"}, "output overlay")
         _choice(
             self.sequence_semantics,
-            {"single_static"},
+            {"single_static", "single_item_sequence_index_zero"},
             "output sequence semantics",
         )
 
