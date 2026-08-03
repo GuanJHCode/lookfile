@@ -280,6 +280,26 @@ def test_builder_emits_literal_golden_edge_pixels_as_clean_rgb_png(
         image.close()
 
 
+def test_builder_accepts_preview_canny_graph(
+    production_graph: CompiledExecutionGraph,
+) -> None:
+    preview_graph = replace(
+        production_graph,
+        generation_profile="preview",
+        pipeline="lcm",
+        steps=4,
+        guidance_scale=0.0,
+        scheduler=None,
+    )
+
+    result = CannyControlInputBuilder(CannyProcessorConfig(100, 200, 3, False)).build(
+        _source(), preview_graph
+    )
+
+    assert result.kind == "canny"
+    assert (result.image.width, result.image.height) == preview_graph.resolution
+
+
 def test_builder_calls_exact_opencv_pipeline_parameters(
     production_graph: CompiledExecutionGraph, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -497,7 +517,6 @@ def test_builder_rejects_wrong_source_graph_profile_controlnet_or_resolution(
 ) -> None:
     builder = CannyControlInputBuilder(CannyProcessorConfig(100, 200, 3, False))
     source = _source()
-    preview = replace(production_graph, generation_profile="preview", scheduler=None)
     depth = replace(
         production_graph,
         controlnet=replace(production_graph.controlnet, controlnet_type="depth"),
@@ -506,7 +525,6 @@ def test_builder_rejects_wrong_source_graph_profile_controlnet_or_resolution(
     for wrong_source, wrong_graph in (
         (object(), production_graph),
         (source, object()),
-        (source, preview),
         (source, depth),
         (source, wrong_size),
     ):
