@@ -24,6 +24,7 @@ from specstyle.ui.presenters import (
 from specstyle.ui.view_models import (
     ExportView,
     JobStatusView,
+    ProductionBatchUiView,
     ProductionRunUiView,
     QaRuleView,
     RepairStepView,
@@ -48,6 +49,21 @@ class UiServices:
     run_production_job: Callable[
         [object, object, object, str, str, str | None, str | None, str | None, str],
         ProductionRunUiView,
+    ] | None = None
+    run_production_batch: Callable[
+        [
+            object,
+            object,
+            object,
+            str,
+            str,
+            str | None,
+            str | None,
+            str | None,
+            str,
+            int,
+        ],
+        ProductionBatchUiView,
     ] | None = None
 
 
@@ -127,6 +143,7 @@ def bind_job_result_services(
         get_export_summary=export,
         run_replay=replay,
         run_production_job=base.run_production_job,
+        run_production_batch=base.run_production_batch,
     )
 
 
@@ -215,6 +232,47 @@ def create_app(services: UiServices) -> Any:
             view.qa_table,
         )
 
+    def on_run_production_batch(
+        source_file: object,
+        style_file: object,
+        spec_file: object,
+        positive_prompt: str,
+        negative_prompt: str,
+        source_url: str,
+        license_: str,
+        attribution: str,
+        consent: str,
+        batch_count: float,
+    ) -> tuple[str, list[str], list[str], str]:
+        if services.run_production_batch is None:
+            return "production batch unavailable", [], [], "no evidence"
+        count: object = batch_count
+        if type(batch_count) is float and batch_count.is_integer():
+            count = int(batch_count)
+        view = services.run_production_batch(
+            source_file,
+            style_file,
+            spec_file,
+            positive_prompt or "",
+            negative_prompt or "",
+            source_url or None,
+            license_ or None,
+            attribution or None,
+            consent,
+            count,  # type: ignore[arg-type]
+        )
+        status = (
+            f"{view.status}\tprofile={view.profile_label}\t"
+            f"diversity_evidence={'YES' if view.diversity_evidence else 'NO'}\t"
+            f"final_seed_collision={view.final_seed_collision}\t{view.message}"
+        )
+        return (
+            status,
+            list(view.approved_images),
+            list(view.rejected_images),
+            view.evidence_tsv,
+        )
+
     with gr.Blocks(title="SpecStyle") as demo:
         gr.Markdown("# SpecStyle StyleOps")
         with gr.Tab("Spec (UI-001)"):
@@ -256,6 +314,38 @@ def create_app(services: UiServices) -> Any:
                 ],
                 outputs=[run_status, approved_gallery, rejected_gallery, run_qa],
             )
+            batch_count = gr.Slider(
+                minimum=2,
+                maximum=4,
+                step=1,
+                value=4,
+                label="Batch seeds",
+            )
+            batch_status = gr.Textbox(label="Batch status")
+            batch_approved = gr.Gallery(label="Approved batch wall")
+            batch_rejected = gr.Gallery(label="Rejected batch wall")
+            batch_evidence = gr.Textbox(label="Batch evidence TSV", lines=8)
+            gr.Button("Run batch").click(
+                on_run_production_batch,
+                inputs=[
+                    source_file,
+                    style_file,
+                    production_spec,
+                    positive_prompt,
+                    negative_prompt,
+                    source_url,
+                    license_,
+                    attribution,
+                    consent,
+                    batch_count,
+                ],
+                outputs=[
+                    batch_status,
+                    batch_approved,
+                    batch_rejected,
+                    batch_evidence,
+                ],
+            )
             status_out = gr.Textbox(label="Job status (preview|production labeled)")
             gr.Button("Refresh status").click(on_status, outputs=[status_out])
             gr.Button("Cancel job").click(on_cancel, outputs=[status_out])
@@ -285,6 +375,7 @@ __all__ = [
     "launch_app",
     "ExportView",
     "JobStatusView",
+    "ProductionBatchUiView",
     "ProductionRunUiView",
     "QaRuleView",
     "RepairStepView",

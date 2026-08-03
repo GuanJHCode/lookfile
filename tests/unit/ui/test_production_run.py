@@ -15,6 +15,7 @@ from specstyle.domain.enums import RuleLevel, RuleScope, RuleStatus, StaticAppli
 from specstyle.domain.identifiers import ArtifactId, JobId, RuleId, Sha256
 from specstyle.exporting.bundle import ExportedFile
 from specstyle.ui.app import UiServices
+from specstyle.workflow.run_one import ProductionRunOneCleanupError
 from specstyle.verification.rule_models import (
     GatePolicy,
     RuleDefinition,
@@ -54,12 +55,24 @@ def _file(path: Path, content: bytes) -> str:
     return str(path)
 
 
+def _production_spec():
+    return raw_spec().model_copy(
+        update={
+            "repair": raw_spec().repair.model_copy(
+                update={"policy_version": "1.0"}
+            )
+        }
+    )
+
+
 def _uploads(tmp_path: Path) -> tuple[str, str, str]:
     source = _file(tmp_path / "source.png", b"source-image")
     style = _file(tmp_path / "style.png", b"style-image")
     spec = _file(
         tmp_path / "style.json",
-        json.dumps(raw_spec().model_dump(mode="json"), separators=(",", ":")).encode(),
+        json.dumps(
+            _production_spec().model_dump(mode="json"), separators=(",", ":")
+        ).encode(),
     )
     return source, style, spec
 
@@ -82,6 +95,96 @@ def _qa_report() -> VerificationReport:
     )
 
 
+def _batch_result(
+    job_id: str,
+    variation_index: int,
+    initial_seed: int,
+    final_seed: int,
+    *,
+    final_variation_index: int | None = None,
+    rejected: bool = False,
+):
+    final_variation = (
+        variation_index
+        if final_variation_index is None
+        else final_variation_index
+    )
+    route = "rejected" if rejected else "approved/xhs_grid"
+    filename = f"artifact-{job_id}.png"
+    request = SimpleNamespace(
+        variation_index=final_variation,
+        seed=SimpleNamespace(variation_index=final_variation, seed=final_seed),
+    )
+    initial_request = SimpleNamespace(
+        variation_index=variation_index,
+        seed=SimpleNamespace(variation_index=variation_index, seed=initial_seed),
+    )
+    return SimpleNamespace(
+        job_result=SimpleNamespace(
+            report=None,
+            request=request,
+            history=SimpleNamespace(
+                initial_attempt=SimpleNamespace(request=initial_request)
+            ),
+        ),
+        export_result=SimpleNamespace(
+            bundle=SimpleNamespace(
+                bundle_name=f"bundle-{job_id}",
+                bundle_sha256=Sha256("d" * 64),
+                files=(
+                    ExportedFile(f"{route}/{filename}", Sha256("e" * 64), 3),
+                ),
+            ),
+            job_state=SimpleNamespace(
+                job=SimpleNamespace(
+                    job_id=JobId(job_id),
+                    status=SimpleNamespace(value="COMPLETED"),
+                )
+            ),
+        ),
+    )
+
+
+class _BatchExecution:
+    def __init__(
+        self,
+        result: object | None = None,
+        *,
+        error: BaseException | None = None,
+        cleanup_error: bool = False,
+    ) -> None:
+        self._result = result
+        self._error = error
+        self._cleanup_error = cleanup_error
+
+    def run(self):
+        if self._error is not None:
+            raise self._error
+        return self._result
+
+    def close(self) -> None:
+        if self._cleanup_error:
+            raise ProductionRunOneCleanupError(self._result)  # type: ignore[arg-type]
+
+
+def _batch_args(tmp_path: Path, *, spec: object | None = None) -> tuple[object, ...]:
+    uploads = _uploads(tmp_path)
+    if spec is not None:
+        _file(
+            Path(uploads[2]),
+            json.dumps(spec.model_dump(mode="json"), separators=(",", ":")).encode(),
+        )
+    return (
+        *uploads,
+        "positive",
+        "",
+        None,
+        None,
+        None,
+        "not_applicable",
+    )
+
+
 def test_production_ui_service_runs_one_job_and_returns_export_evidence(
     tmp_path: Path,
 ) -> None:
@@ -90,12 +193,12 @@ def test_production_ui_service_runs_one_job_and_returns_export_evidence(
     roots = _roots(tmp_path)
     source_bytes = b"source-image"
     style_bytes = b"style-image"
-    spec = raw_spec().model_copy(
+    spec = _production_spec().model_copy(
         update={
-            "assets": raw_spec().assets.model_copy(
+            "assets": _production_spec().assets.model_copy(
                 update={
                     "style_references": (
-                        raw_spec()
+                        _production_spec()
                         .assets.style_references[0]
                         .model_copy(update={"asset_sha256": Sha256("c" * 64).value}),
                     )
@@ -282,7 +385,9 @@ def test_production_ui_service_cleans_staging_after_open_failure(
     style_path = _file(tmp_path / "style.png", b"style-image")
     spec_path = _file(
         tmp_path / "style.json",
-        json.dumps(raw_spec().model_dump(mode="json"), separators=(",", ":")).encode(),
+        json.dumps(
+            _production_spec().model_dump(mode="json"), separators=(",", ":")
+        ).encode(),
     )
 
     def opener(_fds, _reservation):
@@ -411,3 +516,250 @@ def test_production_ui_service_allows_only_one_pipeline_lifecycle(
     assert reservations == ["run-one-1"]
     assert len(results) == 1
     assert results[0].status == "COMPLETED"
+
+
+def test_production_batch_runs_four_disjoint_variation_ranges_and_emits_tsv(
+    tmp_path: Path,
+) -> None:
+    from specstyle.ui.production_run import bind_production_run_one_services
+
+    roots = _roots(tmp_path)
+    variations: list[int] = []
+
+    def reserve(variation_index: int):
+        variations.append(variation_index)
+        return SimpleNamespace(
+            job_id=JobId(f"run-one-{len(variations)}"),
+            variation_index=variation_index,
+        )
+
+    def opener(_fds, reservation):
+        index = len(variations)
+        variation = reservation.variation_index
+        return _BatchExecution(
+            _batch_result(
+                reservation.job_id.value,
+                variation,
+                1000 + index,
+                2000 + index,
+            )
+        )
+
+    service = bind_production_run_one_services(
+        UiServices(lambda _text: pytest.fail("compile not used")),
+        roots,
+        reserve=reserve,
+        open_run_one=opener,
+    )
+
+    view = service.run_production_batch(*_batch_args(tmp_path), 4)
+
+    assert variations == [0, 2, 4, 6]
+    assert view.status == "COMPLETED"
+    assert view.profile_label == "production"
+    assert view.final_seed_collision is False
+    assert view.diversity_evidence is True
+    assert tuple(item.item_index for item in view.items) == (0, 1, 2, 3)
+    assert tuple(item.requested_variation_index for item in view.items) == (0, 2, 4, 6)
+    assert tuple(item.initial_seed for item in view.items) == (1001, 1002, 1003, 1004)
+    assert tuple(item.final_seed for item in view.items) == (2001, 2002, 2003, 2004)
+    assert all(item.final_variation_index == item.requested_variation_index for item in view.items)
+    assert len(view.approved_images) == 4
+    assert view.rejected_images == ()
+    assert view.evidence_tsv.splitlines()[0].startswith("item_index\trequested_variation")
+    assert "VALID_DIVERSITY_EVIDENCE" in view.evidence_tsv
+    assert list(roots.staging_root.iterdir()) == []
+
+
+@pytest.mark.parametrize("count", (True, 1, 5, 2.0))
+def test_production_batch_rejects_noncontract_count_without_staging_or_reserve(
+    tmp_path: Path, count: object
+) -> None:
+    from specstyle.ui.production_run import bind_production_run_one_services
+
+    roots = _roots(tmp_path)
+    reservations: list[int] = []
+    service = bind_production_run_one_services(
+        UiServices(lambda _text: pytest.fail("compile not used")),
+        roots,
+        reserve=lambda variation: reservations.append(variation),
+        open_run_one=lambda *_args: pytest.fail("open not expected"),
+    )
+
+    view = service.run_production_batch(*_batch_args(tmp_path), count)
+
+    assert view.status == "JOB_FAILED"
+    assert view.message == "batch count must be an exact int from 2 to 4"
+    assert reservations == []
+    assert list(roots.staging_root.iterdir()) == []
+
+
+def test_production_batch_validates_full_spec_contract_before_first_reserve(
+    tmp_path: Path,
+) -> None:
+    from specstyle.ui.production_run import bind_production_run_one_services
+
+    roots = _roots(tmp_path)
+    raw = _production_spec().model_copy(
+        update={
+            "repair": _production_spec().repair.model_copy(update={"max_rounds": 2})
+        }
+    )
+    reservations: list[int] = []
+    service = bind_production_run_one_services(
+        UiServices(lambda _text: pytest.fail("compile not used")),
+        roots,
+        reserve=lambda variation: reservations.append(variation),
+        open_run_one=lambda *_args: pytest.fail("open not expected"),
+    )
+
+    view = service.run_production_batch(*_batch_args(tmp_path, spec=raw), 2)
+
+    assert view.status == "JOB_FAILED"
+    assert view.message == "invalid production job input"
+    assert reservations == []
+    assert list(roots.staging_root.iterdir()) == []
+
+
+def test_production_batch_keeps_completed_cleanup_result_and_continues_failures(
+    tmp_path: Path,
+) -> None:
+    from specstyle.errors import InfrastructureError
+    from specstyle.ui.production_run import bind_production_run_one_services
+
+    roots = _roots(tmp_path)
+    variations: list[int] = []
+
+    def reserve(variation_index: int):
+        variations.append(variation_index)
+        return SimpleNamespace(
+            job_id=JobId(f"run-one-{len(variations)}"),
+            variation_index=variation_index,
+        )
+
+    def opener(_fds, reservation):
+        sequence = len(variations)
+        if sequence == 2:
+            return _BatchExecution(
+                error=InfrastructureError("run\tfailed\ncleanly"),
+                cleanup_error=True,
+            )
+        result = _batch_result(
+            reservation.job_id.value,
+            reservation.variation_index,
+            100 + sequence,
+            200 + sequence,
+        )
+        return _BatchExecution(result, cleanup_error=sequence == 1)
+
+    service = bind_production_run_one_services(
+        UiServices(lambda _text: pytest.fail("compile not used")),
+        roots,
+        reserve=reserve,
+        open_run_one=opener,
+    )
+
+    view = service.run_production_batch(*_batch_args(tmp_path), 3)
+
+    assert variations == [0, 2, 4]
+    assert view.status == "PARTIAL"
+    assert tuple(item.run.status for item in view.items) == (
+        "COMPLETED",
+        "JOB_FAILED",
+        "COMPLETED",
+    )
+    assert view.items[0].cleanup_error == "production run-one cleanup failed"
+    assert view.items[0].run.bundle_name == "bundle-run-one-1"
+    assert view.items[1].initial_seed is None
+    assert view.items[1].final_seed is None
+    assert view.items[1].cleanup_error == "production run-one cleanup failed"
+    assert view.items[2].run.bundle_name == "bundle-run-one-3"
+    assert "run failed cleanly" in view.evidence_tsv
+    assert all("\tfailed\n" not in line for line in view.evidence_tsv.splitlines())
+    assert list(roots.staging_root.iterdir()) == []
+
+
+def test_rejected_batch_can_complete_but_seed_collision_blocks_diversity_claim(
+    tmp_path: Path,
+) -> None:
+    from specstyle.ui.production_run import bind_production_run_one_services
+
+    roots = _roots(tmp_path)
+    variations: list[int] = []
+
+    def reserve(variation_index: int):
+        variations.append(variation_index)
+        return SimpleNamespace(
+            job_id=JobId(f"run-one-{len(variations)}"),
+            variation_index=variation_index,
+        )
+
+    def opener(_fds, reservation):
+        return _BatchExecution(
+            _batch_result(
+                reservation.job_id.value,
+                reservation.variation_index,
+                100 + len(variations),
+                999,
+                rejected=True,
+            )
+        )
+
+    service = bind_production_run_one_services(
+        UiServices(lambda _text: pytest.fail("compile not used")),
+        roots,
+        reserve=reserve,
+        open_run_one=opener,
+    )
+
+    view = service.run_production_batch(*_batch_args(tmp_path), 2)
+
+    assert view.status == "COMPLETED"
+    assert view.final_seed_collision is True
+    assert view.diversity_evidence is False
+    assert view.approved_images == ()
+    assert len(view.rejected_images) == 2
+    assert "NOT_DIVERSITY_EVIDENCE_FINAL_SEED_COLLISION" in view.evidence_tsv
+    assert all(item.run.status == "COMPLETED" for item in view.items)
+
+
+def test_production_batch_rejects_final_variation_outside_its_repair_range(
+    tmp_path: Path,
+) -> None:
+    from specstyle.ui.production_run import bind_production_run_one_services
+
+    roots = _roots(tmp_path)
+    variations: list[int] = []
+
+    def reserve(variation_index: int):
+        variations.append(variation_index)
+        return SimpleNamespace(
+            job_id=JobId(f"run-one-{len(variations)}"),
+            variation_index=variation_index,
+        )
+
+    def opener(_fds, reservation):
+        return _BatchExecution(
+            _batch_result(
+                reservation.job_id.value,
+                reservation.variation_index,
+                100 + len(variations),
+                200 + len(variations),
+                final_variation_index=2,
+            )
+        )
+
+    service = bind_production_run_one_services(
+        UiServices(lambda _text: pytest.fail("compile not used")),
+        roots,
+        reserve=reserve,
+        open_run_one=opener,
+    )
+
+    view = service.run_production_batch(*_batch_args(tmp_path), 2)
+
+    assert variations == [0, 2]
+    assert view.status == "PARTIAL"
+    assert view.items[0].run.status == "JOB_FAILED"
+    assert view.items[0].run.message == "production batch evidence unavailable"
+    assert view.items[1].run.status == "COMPLETED"

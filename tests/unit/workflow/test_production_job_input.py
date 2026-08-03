@@ -112,8 +112,10 @@ def test_metadata_loader_issues_frozen_exact_public_values() -> None:
     assert module.__all__ == (
         "ProductionAssetProvenance",
         "ProductionJobInputMetadata",
+        "ProductionJobSpecSummary",
         "load_production_job_input_metadata",
         "open_production_job_input",
+        "validate_production_job_spec_text",
     )
     assert all(
         parameter.kind is inspect.Parameter.POSITIONAL_ONLY
@@ -283,6 +285,36 @@ def _normalized_style(style: bytes) -> bytes:
     )
     reference = AssetRef(AssetId("style-1"), hash_bytes(style))
     return preprocess_image(style, reference, plan).content
+
+
+def test_production_spec_preflight_returns_the_validated_batch_contract() -> None:
+    from specstyle.workflow.production_job_input import (
+        ProductionJobSpecSummary,
+        validate_production_job_spec_text,
+    )
+
+    data = raw_spec().model_dump(mode="json")
+    data["repair"]["policy_version"] = "1.0"
+    summary = validate_production_job_spec_text(json.dumps(data))
+
+    assert summary == ProductionJobSpecSummary("preset", 1)
+
+
+def test_production_spec_preflight_rejects_noncontract_repair_budget() -> None:
+    from specstyle.workflow.production_job_input import (
+        validate_production_job_spec_text,
+    )
+
+    raw = raw_spec().model_copy(
+        update={
+            "repair": raw_spec().repair.model_copy(
+                update={"policy_version": "1.0", "max_rounds": 2}
+            )
+        }
+    )
+
+    with pytest.raises(DomainError, match="^invalid production job input$"):
+        validate_production_job_spec_text(json.dumps(raw.model_dump(mode="json")))
 
 
 def _open_job(module: object, fds: tuple[int, ...], metadata=None):

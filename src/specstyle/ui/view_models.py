@@ -67,3 +67,27 @@ class ProductionRunUiView:
     approved_images: tuple[str, ...]
     rejected_images: tuple[str, ...]
     qa_table: str
+
+
+@dataclass(frozen=True, slots=True)
+class ProductionBatchItemUiView:
+    item_index: int
+    requested_variation_index: int
+    initial_seed: int | None
+    final_variation_index: int | None
+    final_seed: int | None
+    run: ProductionRunUiView
+    cleanup_error: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class ProductionBatchUiView:
+    status: str
+    message: str
+    profile_label: str
+    items: tuple[ProductionBatchItemUiView, ...]
+    final_seed_collision: bool
+    diversity_evidence: bool
+    approved_images: tuple[str, ...]
+    rejected_images: tuple[str, ...]
+    evidence_tsv: str

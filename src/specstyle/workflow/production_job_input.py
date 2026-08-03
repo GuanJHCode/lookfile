@@ -32,8 +32,10 @@ from specstyle.workflow.production_service import ProductionJobRequest
 __all__ = (
     "ProductionAssetProvenance",
     "ProductionJobInputMetadata",
+    "ProductionJobSpecSummary",
     "load_production_job_input_metadata",
     "open_production_job_input",
+    "validate_production_job_spec_text",
 )
 
 _METADATA_BYTES = 64 * 1024
@@ -145,6 +147,21 @@ class ProductionJobInputMetadata:
                 self.source_provenance.consent,
             ),
         )
+
+
+@dataclass(frozen=True, slots=True)
+class ProductionJobSpecSummary:
+    preset_id: str
+    max_rounds: int
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.preset_id) is not str
+            or not self.preset_id
+            or type(self.max_rounds) is not int
+            or not 1 <= self.max_rounds <= 10
+        ):
+            raise _domain()
 
 
 def _prompt_strings(prompt: RenderedPrompt) -> tuple[str, ...]:
@@ -407,6 +424,20 @@ def _validate_spec(raw: object) -> tuple[object, str, tuple[int, int]]:
     if len(resolution) != 2 or any(type(item) is not int for item in resolution):
         raise _domain()
     return raw, canonical_json_bytes(primitive).decode("utf-8"), resolution
+
+
+def validate_production_job_spec_text(
+    text: str, /
+) -> ProductionJobSpecSummary:
+    try:
+        if type(text) is not str:
+            raise _domain()
+        raw, _canonical, _resolution = _validate_spec(load_style_spec_text(text))
+        return ProductionJobSpecSummary(raw.style.preset_id, raw.repair.max_rounds)
+    except DomainError:
+        raise _domain() from None
+    except Exception:
+        raise _domain() from None
 
 
 def _preprocess(
