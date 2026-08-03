@@ -22,6 +22,7 @@ from specstyle.observability.environment import capture_environment
 from specstyle.production.context_config import (
     load_production_context_config,
     make_production_compiler_context_factory,
+    require_validated_production_threshold,
 )
 from specstyle.production.supply_config import load_production_supply_config
 from specstyle.workflow.job_models import JobState
@@ -386,9 +387,6 @@ def _close_descriptors(descriptors: list[int]) -> None:
 def _open_resources(
     owned: tuple[int, ...], job_id: JobId, variation_index: int
 ) -> tuple[Any, ProductionJobInput, Any, JobStore]:
-    # Lazy: CannyControlInputBuilder pulls OpenCV; keep run_one importable without cv2.
-    from specstyle.generation.canny import CannyControlInputBuilder
-
     (
         config,
         evidence,
@@ -404,8 +402,12 @@ def _open_resources(
     ) = owned
     supply = store = job_input = None
     try:
-        input_metadata = load_production_job_input_metadata(metadata)
         context = load_production_context_config(config, evidence)
+        require_validated_production_threshold(context)
+        # Lazy: CannyControlInputBuilder pulls OpenCV; keep run_one importable without cv2.
+        from specstyle.generation.canny import CannyControlInputBuilder
+
+        input_metadata = load_production_job_input_metadata(metadata)
         supply_config = load_production_supply_config(config)
         supply = verify_pipeline_supply(
             models,

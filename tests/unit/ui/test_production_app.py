@@ -72,6 +72,18 @@ def test_build_services_borrows_then_closes_bootstrap_descriptors(
         production_app, "load_production_ui_compiler_context", bootstrap
     )
     monkeypatch.setattr(
+        production_app,
+        "load_production_context_config",
+        lambda *_fds: object(),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        production_app,
+        "require_validated_production_threshold",
+        lambda _context: None,
+        raising=False,
+    )
+    monkeypatch.setattr(
         production_app, "build_default_services", lambda candidate: base
     )
     monkeypatch.setattr(
@@ -85,6 +97,62 @@ def test_build_services_borrows_then_closes_bootstrap_descriptors(
     for fd in borrowed:
         with pytest.raises(OSError):
             os.fstat(fd)
+
+
+def test_build_services_keeps_compiler_but_disables_unvalidated_production(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from specstyle.ui import production_app
+
+    runtime = tmp_path / "runtime"
+    _trusted_roots(runtime)
+    paths = production_app.production_runtime_paths(runtime)
+    context_config, compiler, base, unavailable = (object() for _ in range(4))
+
+    monkeypatch.setattr(
+        production_app,
+        "load_production_context_config",
+        lambda *_fds: context_config,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        production_app,
+        "load_production_ui_compiler_context",
+        lambda *_fds: compiler,
+    )
+    monkeypatch.setattr(
+        production_app,
+        "build_default_services",
+        lambda candidate: base if candidate is compiler else pytest.fail("compiler"),
+    )
+
+    def reject(candidate: object) -> None:
+        assert candidate is context_config
+        raise DomainError("PRODUCTION_THRESHOLD_NOT_VALIDATED")
+
+    monkeypatch.setattr(
+        production_app,
+        "require_validated_production_threshold",
+        reject,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        production_app,
+        "bind_production_run_one_services",
+        lambda *_args: pytest.fail("normal Production must stay unbound"),
+    )
+    monkeypatch.setattr(
+        production_app,
+        "bind_unavailable_production_services",
+        lambda candidate, reason: (
+            unavailable
+            if candidate is base and reason == "PRODUCTION_THRESHOLD_NOT_VALIDATED"
+            else pytest.fail("unavailable binding")
+        ),
+        raising=False,
+    )
+
+    assert production_app.build_production_ui_services(paths) is unavailable
 
 
 def test_build_services_closes_opened_descriptor_when_later_open_fails(

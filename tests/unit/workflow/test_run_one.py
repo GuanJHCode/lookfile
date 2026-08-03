@@ -184,6 +184,12 @@ def test_open_duplicates_borrowed_fds_and_uses_the_shared_config_root(
         module, "load_production_job_input_metadata", lambda fd: object()
     )
     monkeypatch.setattr(module, "load_production_context_config", load_context_config)
+    monkeypatch.setattr(
+        module,
+        "require_validated_production_threshold",
+        lambda _context: None,
+        raising=False,
+    )
     monkeypatch.setattr(module, "load_production_supply_config", load_supply)
     monkeypatch.setattr(module, "verify_pipeline_supply", lambda *_args: supply)
     monkeypatch.setattr(module, "capture_environment", lambda: object())
@@ -221,6 +227,46 @@ def test_open_duplicates_borrowed_fds_and_uses_the_shared_config_root(
                 os.close(descriptor)
             except OSError:
                 pass
+
+
+def test_nonvalidated_threshold_stops_before_all_production_side_effects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import specstyle.workflow.run_one as module
+
+    events: list[str] = []
+    context = object()
+
+    def load_context(_config: int, _evidence: int) -> object:
+        events.append("context")
+        return context
+
+    def reject(candidate: object) -> None:
+        assert candidate is context
+        events.append("threshold_gate")
+        raise DomainError("PRODUCTION_THRESHOLD_NOT_VALIDATED")
+
+    monkeypatch.setattr(module, "load_production_context_config", load_context)
+    monkeypatch.setattr(
+        module, "require_validated_production_threshold", reject, raising=False
+    )
+    monkeypatch.setattr(
+        module,
+        "load_production_job_input_metadata",
+        lambda _fd: pytest.fail("metadata must not load"),
+    )
+    monkeypatch.setattr(
+        module,
+        "load_production_supply_config",
+        lambda _fd: pytest.fail("supply must not load"),
+    )
+    canny = types.ModuleType("specstyle.generation.canny")
+    monkeypatch.setitem(sys.modules, "specstyle.generation.canny", canny)
+
+    with pytest.raises(DomainError, match="^PRODUCTION_THRESHOLD_NOT_VALIDATED$"):
+        module._open_resources(tuple(range(11)), JobId("threshold-gated"), 0)
+
+    assert events == ["context", "threshold_gate"]
 
 
 def _run_one_fds(tmp_path):
@@ -429,6 +475,9 @@ def test_partial_open_failure_closes_resources_before_releasing_runtime_lane(
     )
     monkeypatch.setattr(
         module, "load_production_context_config", lambda *_args: context
+    )
+    monkeypatch.setattr(
+        module, "require_validated_production_threshold", lambda _context: None
     )
     monkeypatch.setattr(
         module, "load_production_supply_config", lambda _fd: supply_config

@@ -10,6 +10,10 @@ import stat
 from typing import Any
 
 from specstyle.errors import DomainError, InfrastructureError
+from specstyle.production.context_config import (
+    load_production_context_config,
+    require_validated_production_threshold,
+)
 from specstyle.ui.app import UiServices, build_default_services, launch_app
 from specstyle.ui.preview_run import (
     bind_preview_run_one_services,
@@ -20,6 +24,7 @@ from specstyle.ui.preview_ui_inputs import PreviewUiRuntimePaths
 from specstyle.ui.production_run import (
     ProductionUiRuntimePaths,
     bind_production_run_one_services,
+    bind_unavailable_production_services,
 )
 from specstyle.workflow.production_bootstrap import (
     load_production_ui_compiler_context,
@@ -36,6 +41,7 @@ __all__ = (
 
 _DEFAULT_ROOT = Path("/workspace/persistence/lookfile-runtime")
 _PUBLIC_HOST = "0.0.0.0"
+_THRESHOLD_UNAVAILABLE = "PRODUCTION_THRESHOLD_NOT_VALIDATED"
 _LOCAL_HOST = "127.0.0.1"
 
 
@@ -175,8 +181,15 @@ def build_production_ui_services(paths: ProductionUiRuntimePaths, /) -> UiServic
     try:
         for path in (paths.config_root, paths.evidence_root, paths.model_root):
             descriptors.append(_open_directory(path))
+        context_config = load_production_context_config(*descriptors[:2])
         context = load_production_ui_compiler_context(*descriptors)
         base = build_default_services(context)
+        try:
+            require_validated_production_threshold(context_config)
+        except DomainError as exc:
+            if str(exc) != _THRESHOLD_UNAVAILABLE:
+                raise
+            return bind_unavailable_production_services(base, _THRESHOLD_UNAVAILABLE)
         return bind_production_run_one_services(base, paths)
     except BaseException as error:
         primary = error
