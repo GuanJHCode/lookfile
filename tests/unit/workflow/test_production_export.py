@@ -21,7 +21,9 @@ from specstyle.domain.identifiers import (
     ArtifactId,
     AssetId,
     AttemptId,
+    DecisionId,
     JobId,
+    RuleId,
     Sha256,
 )
 from specstyle.errors import DomainError, InfrastructureError
@@ -48,8 +50,14 @@ from specstyle.reliability.fixtures import (
     sample_source,
     sample_style_spec,
 )
+from specstyle.repair.actions import RETRY_SAMPLING
 from specstyle.repair.history import start_repair_history
-from specstyle.repair.loop import RepairTerminal
+from specstyle.repair.loop import (
+    NextGeneration,
+    RepairTerminal,
+    consume_repair_result,
+    next_repair_step,
+)
 from specstyle.spec.compiled_models import ResourcePin
 from specstyle.spec.compiler import compile_style_spec
 from specstyle.spec.models import StyleSpecV1
@@ -110,7 +118,7 @@ class _Case:
     credits: tuple[AssetCredit, ...]
 
 
-def _compiled(profile: str):
+def _compiled(profile: str, *, retry_l1: bool = False):
     raw = sample_style_spec().model_dump(mode="python")
     raw["repair"]["policy_version"] = "1.0"
     raw["outputs"]["profiles"] = (profile,)
@@ -120,8 +128,18 @@ def _compiled(profile: str):
     rules = tuple(
         replace(
             rule,
+            rule_id=(
+                RuleId("l1_bundle")
+                if retry_l1 and rule.level.value == "L1"
+                else rule.rule_id
+            ),
             supported_output_profiles=(
                 (alternate,) if rule.scope is RuleScope.BATCH else (profile,)
+            ),
+            affected_by_actions=(
+                (RETRY_SAMPLING,)
+                if retry_l1 and rule.level.value == "L1"
+                else rule.affected_by_actions
             ),
         )
         for rule in context.rule_catalogs[0].rules
@@ -257,6 +275,173 @@ def _case(
         "bundle",
     )
     return _Case(request, result, environment, compiler_context, credits)
+
+
+def _initial_retry_history(compiled, environment):
+    graph = compiled.production_graphs[0]
+    plan = compiled.verification_plans[0]
+    source = sample_source()
+    prompt = RenderedPrompt(
+        ResourcePin("template", "r1", Sha256("e" * 64)),
+        graph.preset_id,
+        "a prompt",
+        "",
+    )
+    initial_request = GenerationRequest(
+        JobId("repair-job"),
+        AttemptId("repair-job-a0-xhs_grid-0"),
+        None,
+        compiled,
+        "production",
+        graph.output_profile,
+        source,
+        (AssetRef(AssetId("style"), graph.style_reference_hashes[0]),),
+        prompt,
+        PreparedControlInput("canny", source),
+        0,
+        hash_environment(environment),
+    )
+    initial_artifact = GeneratedArtifact(
+        ArtifactRef(ArtifactId("artifact-initial"), hash_bytes(source.content)),
+        source.content,
+        initial_request.request_hash,
+        initial_request.generation_fingerprint,
+    )
+    initial_report = VerificationReport(
+        (initial_artifact.ref,),
+        plan.applicable_rule_definitions,
+        tuple(
+            RuleResult(
+                rule.rule_id,
+                RuleStatus.FAIL
+                if rule.rule_id.value == "l1_bundle"
+                else RuleStatus.PASS,
+                (initial_artifact.ref.artifact_id,),
+                None,
+            )
+            for rule in plan.applicable_rule_definitions
+        ),
+    )
+    history = start_repair_history(initial_request, initial_artifact, initial_report)
+    return history, source, prompt
+
+
+def _successful_retry(history):
+    command = next_repair_step(
+        history,
+        DecisionId("repair-decision"),
+        AttemptId("repair-job-a1-xhs_grid-0"),
+    )
+    assert type(command) is NextGeneration
+    source = history.initial_attempt.request.source
+    plan = history.initial_attempt.request.compiled_spec.verification_plans[0]
+    child_artifact = GeneratedArtifact(
+        ArtifactRef(ArtifactId("artifact-child"), hash_bytes(source.content)),
+        source.content,
+        command.request.request_hash,
+        command.request.generation_fingerprint,
+    )
+    child_report = VerificationReport(
+        (child_artifact.ref,),
+        plan.applicable_rule_definitions,
+        tuple(
+            RuleResult(
+                rule.rule_id,
+                RuleStatus.PASS,
+                (child_artifact.ref.artifact_id,),
+                None,
+            )
+            for rule in plan.applicable_rule_definitions
+        ),
+    )
+    history = consume_repair_result(history, command, child_artifact, child_report)
+    terminal = next_repair_step(
+        history,
+        DecisionId("unused-decision"),
+        AttemptId("unused-attempt"),
+    )
+    assert type(terminal) is RepairTerminal
+    return history, terminal
+
+
+def _repaired_result(history, terminal):
+    initial_request = history.initial_attempt.request
+    compiled = initial_request.compiled_spec
+    job = Job(
+        initial_request.job_id,
+        compiled.compiled_spec_hash,
+        (initial_request.output_profile,),
+        JobBudget(2),
+        JobStatus.APPROVED,
+        "2026-08-02T00:00:00.000Z",
+        "2026-08-02T00:00:01.000Z",
+    )
+    return ProductionJobResult(
+        compiled,
+        initial_request.graph,
+        compiled.verification_plans[0],
+        history.current_request,
+        history.current_artifact,
+        history.current_report,
+        history,
+        terminal,
+        JobState(
+            job,
+            8,
+            tuple(
+                attempt.request.attempt_id
+                for attempt in (history.initial_attempt, *history.repair_attempts)
+            ),
+            (),
+        ),
+    )
+
+
+def _asset_credits(compiled, request):
+    style = compiled.source_spec.assets.style_references[0]
+    return tuple(
+        sorted(
+            (
+                AssetCredit(request.source.source, ("input",), None, None, None, None),
+                AssetCredit(
+                    request.style_references[0],
+                    ("style_reference",),
+                    style.source_url,
+                    style.license,
+                    style.attribution,
+                    style.consent,
+                ),
+            ),
+            key=lambda credit: credit.identity,
+        )
+    )
+
+
+def _repaired_case() -> _Case:
+    profile = "xhs_grid"
+    compiled, spec_text, compiler_context = _compiled(profile, retry_l1=True)
+    environment = sample_environment()
+    history, source, prompt = _initial_retry_history(compiled, environment)
+    history, terminal = _successful_retry(history)
+    result = _repaired_result(history, terminal)
+    initial_request = history.initial_attempt.request
+    request = ProductionJobRequest(
+        initial_request.job_id,
+        spec_text,
+        source,
+        initial_request.style_references,
+        prompt,
+        profile,
+        0,
+        "bundle-repaired",
+    )
+    return _Case(
+        request,
+        result,
+        environment,
+        compiler_context,
+        _asset_credits(compiled, initial_request),
+    )
 
 
 def _runtime(case: _Case) -> _ProductionGenerationRuntime:
@@ -867,6 +1052,33 @@ def test_prepare_export_recompiles_and_rejects_forged_outer_spec_text() -> None:
     )
 
     with pytest.raises(DomainError):
+        _runtime(case).prepare_export(forged, case.result, case.credits)
+
+
+def test_prepare_export_accepts_repaired_result_bound_to_initial_outer_request() -> (
+    None
+):
+    case = _repaired_case()
+
+    command = _runtime(case).prepare_export(case.request, case.result, case.credits)
+
+    item = command.export_request.cohorts[0].items[0]
+    assert case.request.variation_index == 0
+    assert item.history.initial_attempt.request.variation_index == 0
+    assert item.history.current_request.variation_index == 1
+    assert len(item.history.repair_attempts) == 1
+    assert item.history.current_artifact.ref == case.result.artifact.ref
+    assert (
+        item.terminal.artifact_decision.artifact_id
+        == item.history.current_artifact.ref.artifact_id
+    )
+
+
+def test_prepare_export_rejects_outer_request_bound_to_repair_child_variation() -> None:
+    case = _repaired_case()
+    forged = replace(case.request, variation_index=1)
+
+    with pytest.raises(DomainError, match="^invalid production export$"):
         _runtime(case).prepare_export(forged, case.result, case.credits)
 
 

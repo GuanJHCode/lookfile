@@ -427,16 +427,16 @@ def _validate_recompiled_contract(
 
 
 def _validate_job_request(request: object, value: _ValidatedResult) -> None:
-    current = value.request
+    initial = value.history.initial_attempt.request
     pairs = (
-        (request.source, current.source),
-        (request.style_references, current.style_references),
-        (request.prompt, current.prompt),
+        (request.source, initial.source),
+        (request.style_references, initial.style_references),
+        (request.prompt, initial.prompt),
     )
     if (
-        request.job_id.value != current.job_id.value
-        or request.output_profile != current.output_profile
-        or request.variation_index != current.variation_index
+        request.job_id.value != initial.job_id.value
+        or request.output_profile != initial.output_profile
+        or request.variation_index != initial.variation_index
         or any(not _same(actual, expected) for actual, expected in pairs)
     ):
         _invalid()
