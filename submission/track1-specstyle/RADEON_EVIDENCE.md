@@ -1,0 +1,74 @@
+# Radeon Evidence
+
+## Candidate identity
+
+- Candidate: `fd4e45b3e62a837d4a613473abc9310ce0c9a1b4`
+- Stable service during validation:
+  `657ac0b54248f0cd71b46c4d9576ef4eb0425104`
+- Candidate and stable `/config`: HTTP 200 before and after the UI run
+- Candidate Gradio: 6.15.1, 71 components, 12 dependencies
+
+## Runtime
+
+- ROCm: 7.2.1
+- PyTorch: `2.9.1+gitff65f5b`
+- PyTorch HIP: `7.2.53211-e1a6bc5663`
+- Diffusers: 0.39.0
+- Python: 3.12
+
+## Actual browser-driven Preview wall
+
+Wall ID: `preview-wall-3a18518754104e71ab06f32050c2e3bf`
+
+| Variation | Seed | Status | Content SHA-256 |
+|---:|---:|---|---|
+| 0 | 8387657995075258963 | `COMPLETED` | `2ea5dcbe18a5697d53b840f5b5c6f71ea60e84d9e4649056fe3db4a75308be54` |
+| 1 | 9099601000186757298 | `COMPLETED` | `d053b7359a65b0668d1584dc727229a461be0e2d18b56eac26c4b8b7df7f4388` |
+| 2 | 3199624802890984311 | `COMPLETED` | `3465123192ecef5e17266ba1b522b184ec332945a4307bc816b09cb51a323e8b` |
+| 3 | 5529225881622334695 | `COMPLETED` | `2084fb939d0a8a1d487c09a7d27a9b229565a05ac657fc83d2d0e0ba210396d6` |
+
+The Gradio capture completed in 65.38 seconds. The workflow manifest records
+38.45 seconds inside the wall run, four requested and completed items, four
+unique content hashes, zero failures, and completed cleanup. The difference is
+browser upload, readiness, queue, rendering, and capture overhead.
+
+This is execution evidence. It does not establish human-perceived quality or
+diversity. The machine-readable records truthfully retain:
+
+```text
+evidence_class=ENGINEERING_ONLY
+verification=NOT_RUN
+repair=NOT_RUN
+export=NOT_RUN
+quality=NOT_EVALUATED
+diversity=NOT_EVALUATED
+```
+
+## Verification gates
+
+- AMD focused tests: 1,009 passed, 1 skipped
+- Ruff check: passed
+- Ruff format check: 292 files already formatted
+- Candidate service after gates: HTTP 200
+- Stable service during candidate deployment: HTTP 200
+
+## Files
+
+- [`evidence/amd_environment.json`](evidence/amd_environment.json)
+- [`evidence/radeon_preview_wall.json`](evidence/radeon_preview_wall.json)
+- [`evidence/radeon_ui_capture.json`](evidence/radeon_ui_capture.json)
+- [`evidence/video_manifest.json`](evidence/video_manifest.json)
+- [`media/radeon-ui-preview-wall.png`](media/radeon-ui-preview-wall.png)
+- [`SpecStyle_Radeon_Demo.mp4`](SpecStyle_Radeon_Demo.mp4)
+- [`SpecStyle_Radeon_UI_Run.webm`](SpecStyle_Radeon_UI_Run.webm)
+
+## External inputs still required for stronger claims
+
+- Legally approved held-out assets and independent human labels
+- Label-approval and test-reveal authorization receipts
+- A trusted Production threshold package and owner approval
+- Independent raters for blind usable-yield evaluation
+- A frozen equal-budget five-arm Radeon repair study
+
+The repository implements fail-closed protocols for these inputs; it does not
+fabricate them.

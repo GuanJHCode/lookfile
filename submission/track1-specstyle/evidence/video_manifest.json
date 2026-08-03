@@ -1,0 +1,65 @@
+{
+  "artifacts": {
+    "demo": {
+      "audio": {
+        "channel_layout": "stereo",
+        "codec": "AAC-LC",
+        "sample_rate_hz": 48000
+      },
+      "duration_seconds": 235.88,
+      "path": "../SpecStyle_Radeon_Demo.mp4",
+      "sha256": "c712b73b1d9308c1d75f128796f4de47c52eb5953c617190a8e3db405beed28f",
+      "size_bytes": 2686729,
+      "video": {
+        "codec": "H.264 High",
+        "frame_rate": 25,
+        "height": 720,
+        "level": "4.0",
+        "pixel_format": "yuv420p",
+        "width": 1280
+      }
+    },
+    "raw_ui_capture": {
+      "duration_seconds": 73.28,
+      "path": "../SpecStyle_Radeon_UI_Run.webm",
+      "sha256": "f2f394e6888c2b63c0e50783648540099397e231cd104f95fb59b8857ab01b8d",
+      "size_bytes": 3821810,
+      "video": {
+        "codec": "VP8",
+        "frame_rate": 25,
+        "height": 900,
+        "pixel_format": "yuv420p",
+        "width": 1440
+      }
+    }
+  },
+  "composition": {
+    "audio_policy": "silent AAC compatibility track; no narration or synthesized claims",
+    "raw_capture_policy": "the standalone WebM is uncut; the demo presents the run at original speed and loses one 25 fps frame at its concat boundary",
+    "segments": [
+      {"duration_seconds": 14.96, "source": "deck slide 1"},
+      {"duration_seconds": 17.96, "source": "deck slide 2"},
+      {"duration_seconds": 21.96, "source": "deck slide 3"},
+      {"duration_seconds": 13.96, "source": "deck slide 4"},
+      {"duration_seconds": 73.24, "source": "raw UI capture"},
+      {"duration_seconds": 21.96, "source": "deck slide 5"},
+      {"duration_seconds": 17.96, "source": "deck slide 6"},
+      {"duration_seconds": 21.96, "source": "deck slide 7"},
+      {"duration_seconds": 19.96, "source": "deck slide 8"},
+      {"duration_seconds": 11.96, "source": "deck slide 9"}
+    ]
+  },
+  "inputs": {
+    "project_profile_pdf": {
+      "path": "../SpecStyle_Project_Profile.pdf",
+      "sha256": "5095d30dfaa16c6c3f72f5797bf1af2384d08ff7d5fa113b1b50677fd2525d77",
+      "size_bytes": 5396958
+    },
+    "presentation": {
+      "path": "../SpecStyle_Track1_Deck.pptx",
+      "sha256": "b9937d37251169d3f93eb1bd28cb8acecc6ca26387aada1584427d178982c575",
+      "size_bytes": 3131499
+    }
+  },
+  "schema_version": "specstyle.submission.video-manifest.v1"
+}
