@@ -33,6 +33,7 @@ _PROTOCOL_KEYS = {
     "study_id",
     "evidence_class",
     "dataset_manifest_sha256",
+    "generation_materials_sha256s",
     "input_ids",
     "initial_request_sha256s",
     "bindings",
@@ -49,14 +50,20 @@ _BINDING_KEYS = {
     "final_qa_contract_sha256",
     "model_supply_sha256",
     "preprocessor_sha256",
+    "production_context_sha256",
     "runtime_sha256",
+    "threshold_profile_sha256",
 }
 _STRATEGY_KEYS = {
-    "b_early_stop_rule_sha256",
+    "a_strategy_contract_sha256",
+    "b_strategy_contract_sha256",
+    "c_strategy_contract_sha256",
     "c_tie_break",
     "c_utility_sha256",
-    "d_early_stop_rule_sha256",
-    "e_early_stop_rule_sha256",
+    "d_guardrail_mode",
+    "d_strategy_contract_sha256",
+    "e_guardrail_mode",
+    "e_strategy_contract_sha256",
 }
 _STATISTIC_KEYS = {
     "bootstrap_resamples",
@@ -72,8 +79,11 @@ _SEALED_KEYS = {
     "schema_version",
     "protocol_sha256",
     "production_approval_sha256",
+    "production_context_sha256",
     "repo_sha",
     "sealed_at",
+    "threshold_profile_sha256",
+    "trust_level",
 }
 
 
@@ -105,22 +115,39 @@ def _validate_bindings(value: object) -> None:
 
 def _validate_strategies(value: object) -> None:
     strategies = _exact(value, _STRATEGY_KEYS, "evaluation strategies")
-    for name in _STRATEGY_KEYS - {"c_tie_break"}:
+    for name in _STRATEGY_KEYS - {
+        "c_tie_break",
+        "d_guardrail_mode",
+        "e_guardrail_mode",
+    }:
         _sha(strategies[name], name)
-    if strategies["c_tie_break"] != "lowest_seed_index":
+    if (
+        strategies["c_tie_break"] != "lowest_seed_index"
+        or strategies["d_guardrail_mode"] != "DISABLED_EVALUATION_ONLY"
+        or strategies["e_guardrail_mode"] != "ENFORCED"
+    ):
         raise DomainError("invalid evaluation protocol")
 
 
 def _validate_blind(value: object) -> None:
     blind = _exact(
         value,
-        {"adjudication", "minimum_raters_per_artifact", "protocol_sha256"},
+        {
+            "adjudication",
+            "minimum_raters_per_artifact",
+            "protocol_sha256",
+            "randomization_protocol_sha256",
+        },
         "evaluation blind protocol",
     )
     raters = _count(blind["minimum_raters_per_artifact"], "minimum raters", minimum=1)
     if blind["adjudication"] != "majority_boolean" or raters % 2 == 0:
         raise DomainError("invalid evaluation protocol")
     _sha(blind["protocol_sha256"], "blind protocol sha256")
+    _sha(
+        blind["randomization_protocol_sha256"],
+        "blind randomization protocol sha256",
+    )
 
 
 def _validate_statistics(value: object, input_count: int) -> None:
@@ -134,10 +161,10 @@ def _validate_statistics(value: object, input_count: int) -> None:
         < 1000
         or _count(stats["bootstrap_seed"], "bootstrap seed") < 0
         or not 0.0 < confidence < 1.0
-        or not -1.0 <= minimum_effect <= 1.0
-        or not 0.0 <= margin <= 1.0
-        or stats["method"] != "paired_percentile_bootstrap"
-        or stats["multiple_comparison"] != "holm_bonferroni"
+        or not 0.0 < minimum_effect <= 1.0
+        or not 0.0 < margin < 1.0
+        or stats["method"] != "paired_percentile_bootstrap_bonferroni"
+        or stats["multiple_comparison"] != "bonferroni_six_one_sided"
     ):
         raise DomainError("invalid evaluation protocol")
 
@@ -187,6 +214,7 @@ def _validate_protocol(document: dict[str, Any]) -> None:
     _text(raw["study_id"], "evaluation study id")
     _sha(raw["dataset_manifest_sha256"], "dataset manifest sha256")
     _validate_bindings(raw["bindings"])
+    _validate_initial_requests(raw["generation_materials_sha256s"], inputs)
     _validate_initial_requests(raw["initial_request_sha256s"], inputs)
     _validate_schedules(raw["seed_schedules"], inputs, maximum)
     _validate_strategies(raw["strategies"])
@@ -216,8 +244,16 @@ def load_sealed_protocol(data: bytes, /) -> dict[str, Any]:
         raw = _exact(_load_canonical(data), _SEALED_KEYS, "sealed protocol")
         if raw["schema_version"] != "specstyle.evaluation.sealed_protocol.v1":
             raise DomainError("invalid sealed evaluation protocol")
-        for name in ("protocol_sha256", "production_approval_sha256", "repo_sha"):
+        for name in (
+            "protocol_sha256",
+            "production_approval_sha256",
+            "production_context_sha256",
+            "repo_sha",
+            "threshold_profile_sha256",
+        ):
             _sha(raw[name], name)
+        if raw["trust_level"] != "LOCAL_PROCESS_ONLY":
+            raise DomainError("invalid sealed evaluation protocol")
         _timestamp(raw["sealed_at"], "protocol seal time")
     except (DomainError, KeyError, TypeError):
         raise DomainError("invalid sealed evaluation protocol") from None
@@ -231,18 +267,33 @@ def seal_protocol(
     *,
     sealed_at: str,
     repo_sha: str,
+    production_context_sha256: str,
 ) -> bytes:
     """Seal a preregistration only behind the validated Production gate."""
-    prepare_protocol(protocol)
+    raw = load_protocol(protocol)
     require_validated_production_threshold(production_context)
     try:
+        bindings = raw["bindings"]
         approval = production_context.l2_threshold_profile.production_binding.production_approval_sha256.value
+        if (
+            production_context.compiler_pin.sha256.value != bindings["compiler_sha256"]
+            or production_context.l2_threshold_profile.pin.sha256.value
+            != bindings["threshold_profile_sha256"]
+            or production_context.l2_threshold_profile.production_binding.preprocessor_pin.sha256.value
+            != bindings["preprocessor_sha256"]
+            or _sha(production_context_sha256, "production context sha256")
+            != bindings["production_context_sha256"]
+        ):
+            raise DomainError("PRODUCTION_THRESHOLD_NOT_VALIDATED")
         document = {
             "schema_version": "specstyle.evaluation.sealed_protocol.v1",
             "protocol_sha256": evidence_sha256(protocol).value,
             "production_approval_sha256": _sha(approval, "production approval sha256"),
+            "production_context_sha256": bindings["production_context_sha256"],
             "repo_sha": _sha(repo_sha, "repository sha"),
             "sealed_at": _timestamp(sealed_at, "protocol seal time"),
+            "threshold_profile_sha256": bindings["threshold_profile_sha256"],
+            "trust_level": "LOCAL_PROCESS_ONLY",
         }
     except (AttributeError, DomainError, TypeError):
         raise DomainError("PRODUCTION_THRESHOLD_NOT_VALIDATED") from None

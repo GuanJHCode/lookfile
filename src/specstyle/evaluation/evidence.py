@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 import math
+import re
 from typing import Any
 
 from specstyle.calibration.evidence_io import (
@@ -17,23 +18,33 @@ from specstyle.calibration.evidence_io import (
     evidence_sha256,
 )
 from specstyle.errors import DomainError
+from specstyle.evaluation.blind_assignment import validate_blind_assignment
 from specstyle.evaluation.protocol import (
     FORMAL_ARMS,
     load_protocol,
     load_sealed_protocol,
 )
+from specstyle.evaluation.stop_contract import parse_stop_event, validate_stopping
 
 _ATTEMPT_KEYS = {
     "artifact_sha256",
     "generation_index",
+    "generation_materials_sha256",
+    "generation_status",
     "gpu_seconds",
+    "guardrail_decision",
     "model_supply_sha256",
     "qa_pass",
     "qa_result_sha256",
+    "repair_action_sha256",
     "request_sha256",
     "runtime_sha256",
     "seed",
     "seed_reason",
+    "trigger_rule_ids",
+    "utility_contract_sha256",
+    "utility_result_sha256",
+    "utility_score",
 }
 _RECORD_KEYS = {
     "arm",
@@ -49,6 +60,8 @@ _RECORD_KEYS = {
     "input_id",
     "machine_terminal",
     "observed_at",
+    "stop_event",
+    "strategy_contract_sha256",
     "strategy_trace_sha256",
 }
 _LABEL_KEYS = {
@@ -63,6 +76,7 @@ _LABEL_KEYS = {
     "subject_preserved",
 }
 _TERMINALS = {"APPROVED", "REJECTED", "MANUAL_REVIEW", "FAILED"}
+_BLIND_ID = re.compile(r"blind-[0-9a-f]{12}4[0-9a-f]{3}[89ab][0-9a-f]{15}", re.ASCII)
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,6 +109,7 @@ class EvaluationEvidence:
     protocol: dict[str, Any]
     sealed: dict[str, Any]
     records: tuple[MachineArmRecord, ...]
+    latest_observed_at: datetime
     labels: tuple[BlindHumanLabel, ...] = ()
     label_source: str | None = None
     missing_blind_artifact_ids: tuple[str, ...] = ()
@@ -138,14 +153,62 @@ def _failure_reasons(value: object) -> tuple[str, ...]:
     return reasons
 
 
+def _rule_ids(value: object) -> tuple[str, ...]:
+    if type(value) is not list:
+        raise DomainError("invalid machine evaluation ledger")
+    rules = tuple(_text(item, "trigger rule id") for item in value)
+    if len(set(rules)) != len(rules):
+        raise DomainError("invalid machine evaluation ledger")
+    return rules
+
+
+def _validate_attempt_strategy(
+    attempt: dict[str, Any], arm: str, index: int, utility_contract: str
+) -> None:
+    rules = _rule_ids(attempt["trigger_rule_ids"])
+    action = _optional_sha(attempt["repair_action_sha256"], "repair action sha256")
+    utility_result = _optional_sha(
+        attempt["utility_result_sha256"], "utility result sha256"
+    )
+    utility_binding = _optional_sha(
+        attempt["utility_contract_sha256"], "utility contract sha256"
+    )
+    utility = attempt["utility_score"]
+    generated = attempt["generation_status"] == "GENERATED"
+    if arm == FORMAL_ARMS[2] and generated:
+        if (
+            utility_binding != utility_contract
+            or utility_result is None
+            or type(utility) is not float
+            or not math.isfinite(utility)
+        ):
+            raise DomainError("invalid machine evaluation ledger")
+    elif (
+        utility is not None or utility_result is not None or utility_binding is not None
+    ):
+        raise DomainError("invalid machine evaluation ledger")
+    if index == 0 or arm in FORMAL_ARMS[:3]:
+        expected = ((), None, "NOT_APPLICABLE")
+    elif arm == FORMAL_ARMS[3]:
+        expected = (rules, action, "DISABLED_EVALUATION_ONLY")
+    else:
+        expected = (rules, action, "PASSED")
+    if (rules, action, attempt["guardrail_decision"]) != expected or (
+        index > 0 and arm in FORMAL_ARMS[3:] and (not rules or action is None)
+    ):
+        raise DomainError("invalid machine evaluation ledger")
+
+
 def _attempts(
     values: object,
     *,
     arm: str,
     seeds: list[int],
     initial_request_sha256: str,
+    generation_materials_sha256: str,
     model_sha256: str,
     runtime_sha256: str,
+    utility_contract_sha256: str,
 ) -> tuple[dict[str, Any], ...]:
     if type(values) is not list or not values or len(values) > len(seeds):
         raise DomainError("invalid machine evaluation ledger")
@@ -165,14 +228,27 @@ def _attempts(
             or _sha(attempt["model_supply_sha256"], "model supply sha256")
             != model_sha256
             or _sha(attempt["runtime_sha256"], "runtime sha256") != runtime_sha256
+            or _sha(
+                attempt["generation_materials_sha256"],
+                "generation materials sha256",
+            )
+            != generation_materials_sha256
             or type(attempt["qa_pass"]) is not bool
         ):
             raise DomainError("invalid machine evaluation ledger")
         _sha(attempt["request_sha256"], "generation request sha256")
         if index == 0 and attempt["request_sha256"] != initial_request_sha256:
             raise DomainError("invalid machine evaluation ledger")
-        _sha(attempt["qa_result_sha256"], "QA result sha256")
-        _optional_sha(attempt["artifact_sha256"], "attempt artifact sha256")
+        artifact = _optional_sha(attempt["artifact_sha256"], "attempt artifact sha256")
+        qa_result = _optional_sha(attempt["qa_result_sha256"], "QA result sha256")
+        generated = attempt["generation_status"] == "GENERATED"
+        if attempt["generation_status"] not in {"GENERATED", "GENERATION_FAILED"} or (
+            generated != (artifact is not None and qa_result is not None)
+        ):
+            raise DomainError("invalid machine evaluation ledger")
+        if not generated and attempt["qa_pass"]:
+            raise DomainError("invalid machine evaluation ledger")
+        _validate_attempt_strategy(attempt, arm, index, utility_contract_sha256)
         parsed.append({**attempt, "gpu_seconds": gpu_seconds})
     return tuple(parsed)
 
@@ -217,10 +293,16 @@ def _validate_terminal(
         if raw["blind_artifact_id"] is None
         else _text(raw["blind_artifact_id"], "blind artifact id")
     )
+    if blind_id is not None and _BLIND_ID.fullmatch(blind_id) is None:
+        raise DomainError("invalid machine evaluation ledger")
     final_pass = raw["final_machine_pass"]
     if type(final_pass) is not bool or type(raw["initial_machine_pass"]) is not bool:
         raise DomainError("invalid machine evaluation ledger")
-    artifact_hashes = {item["artifact_sha256"] for item in attempts}
+    artifact_hashes = {
+        item["artifact_sha256"]
+        for item in attempts
+        if item["artifact_sha256"] is not None
+    }
     approved = terminal == "APPROVED"
     selected = next(
         (item for item in attempts if item["artifact_sha256"] == candidate), None
@@ -230,8 +312,8 @@ def _validate_terminal(
         or final_pass is not approved
         or (candidate is None) != (blind_id is None)
         or (candidate is not None and candidate not in artifact_hashes)
-        or (terminal == "FAILED" and candidate is not None)
-        or (terminal != "FAILED" and candidate is None)
+        or ((not artifact_hashes) != (terminal == "FAILED"))
+        or ((candidate is None) != (not artifact_hashes))
         or (candidate is not None and selected is None)
         or (selected is not None and selected["qa_pass"] is not approved)
         or (approved and reasons)
@@ -242,22 +324,33 @@ def _validate_terminal(
     return candidate, blind_id
 
 
-def _validate_stopping(
+def _strategy_contract(protocol: dict[str, Any], arm: str) -> str:
+    names = {
+        FORMAL_ARMS[0]: "a_strategy_contract_sha256",
+        FORMAL_ARMS[1]: "b_strategy_contract_sha256",
+        FORMAL_ARMS[2]: "c_strategy_contract_sha256",
+        FORMAL_ARMS[3]: "d_strategy_contract_sha256",
+        FORMAL_ARMS[4]: "e_strategy_contract_sha256",
+    }
+    return protocol["strategies"][names[arm]]
+
+
+def _strategy_trace_sha256(
     arm: str,
+    strategy_contract: str,
     attempts: tuple[dict[str, Any], ...],
-    candidate: str | None,
-    maximum: int,
-) -> None:
-    if arm == FORMAL_ARMS[0] and len(attempts) != 1:
-        raise DomainError("invalid machine evaluation ledger")
-    if arm == FORMAL_ARMS[2] and len(attempts) != maximum:
-        raise DomainError("invalid machine evaluation ledger")
-    if arm != FORMAL_ARMS[2]:
-        passing = [index for index, item in enumerate(attempts) if item["qa_pass"]]
-        if passing and passing[0] != len(attempts) - 1:
-            raise DomainError("invalid machine evaluation ledger")
-        if candidate is not None and candidate != attempts[-1]["artifact_sha256"]:
-            raise DomainError("invalid machine evaluation ledger")
+    decision: dict[str, object],
+) -> str:
+    return evidence_sha256(
+        canonical_json(
+            {
+                "arm": arm,
+                "strategy_contract_sha256": strategy_contract,
+                "attempts": list(attempts),
+                "decision": decision,
+            }
+        )
+    ).value
 
 
 def _machine_record(
@@ -270,16 +363,26 @@ def _machine_record(
 ) -> MachineArmRecord:
     raw = _exact(value, _RECORD_KEYS, "machine arm record")
     bindings = protocol["bindings"]
+    strategy_contract = _strategy_contract(protocol, arm)
     attempts = _attempts(
         raw["attempts"],
         arm=arm,
         seeds=protocol["seed_schedules"][input_id],
         initial_request_sha256=protocol["initial_request_sha256s"][input_id],
+        generation_materials_sha256=protocol["generation_materials_sha256s"][input_id],
         model_sha256=bindings["model_supply_sha256"],
         runtime_sha256=bindings["runtime_sha256"],
+        utility_contract_sha256=protocol["strategies"]["c_utility_sha256"],
     )
     reasons = _failure_reasons(raw["failure_reasons"])
     candidate, blind_id = _validate_terminal(raw, attempts, reasons)
+    stop_event = parse_stop_event(raw["stop_event"], attempts)
+    decision = {
+        "candidate_sha256": candidate,
+        "failure_reasons": list(reasons),
+        "machine_terminal": raw["machine_terminal"],
+        "stop_event": stop_event,
+    }
     generations = _integer(raw["generations_used"], "generations used", minimum=1)
     gpu_seconds = _nonnegative_float(raw["gpu_seconds"], "record GPU seconds")
     if (
@@ -295,15 +398,18 @@ def _machine_record(
         )
         or raw["final_qa_contract_sha256"] != bindings["final_qa_contract_sha256"]
         or _timestamp(raw["observed_at"], "machine observation time") < sealed_at
+        or raw["strategy_contract_sha256"] != strategy_contract
+        or raw["strategy_trace_sha256"]
+        != _strategy_trace_sha256(arm, strategy_contract, attempts, decision)
     ):
         raise DomainError("invalid machine evaluation ledger")
-    _validate_stopping(
+    validate_stopping(
         arm,
         attempts,
         candidate,
         protocol["budget"]["max_generations_b_to_e"],
+        stop_event,
     )
-    _sha(raw["strategy_trace_sha256"], "strategy trace sha256")
     return MachineArmRecord(
         input_id,
         arm,
@@ -328,7 +434,15 @@ def load_machine_evidence(
             raise DomainError("invalid machine evaluation ledger")
         ledger = _exact(
             _load_canonical(ledger_data),
-            {"schema_version", "sealed_protocol_sha256", "profile", "records"},
+            {
+                "blind_assignment_receipt",
+                "blind_presentation_order",
+                "schema_version",
+                "sealed_protocol_sha256",
+                "profile",
+                "records",
+                "execution_trust",
+            },
             "machine evaluation ledger",
         )
         expected = [
@@ -338,11 +452,20 @@ def load_machine_evidence(
             ledger["schema_version"] != "specstyle.evaluation.machine_ledger.v1"
             or ledger["sealed_protocol_sha256"] != evidence_sha256(sealed_data).value
             or ledger["profile"] != "production"
+            or ledger["execution_trust"] != "UNVERIFIED_EXTERNAL_EXECUTOR"
             or type(ledger["records"]) is not list
             or len(ledger["records"]) != len(expected)
+            or sealed["production_context_sha256"]
+            != protocol["bindings"]["production_context_sha256"]
+            or sealed["threshold_profile_sha256"]
+            != protocol["bindings"]["threshold_profile_sha256"]
         ):
             raise DomainError("invalid machine evaluation ledger")
         sealed_at = _timestamp(sealed["sealed_at"], "protocol seal time")
+        latest_observed_at = max(
+            _timestamp(value["observed_at"], "machine observation time")
+            for value in ledger["records"]
+        )
         records = tuple(
             _machine_record(
                 value,
@@ -358,9 +481,15 @@ def load_machine_evidence(
         ]
         if len(set(blind_ids)) != len(blind_ids):
             raise DomainError("invalid machine evaluation ledger")
+        assignments = tuple(
+            (item.candidate_sha256, item.blind_artifact_id)
+            for item in records
+            if item.candidate_sha256 is not None and item.blind_artifact_id is not None
+        )
+        validate_blind_assignment(ledger, protocol, assignments, latest_observed_at)
     except (DomainError, KeyError, TypeError):
         raise DomainError("invalid machine evaluation ledger") from None
-    return EvaluationEvidence(protocol, sealed, records)
+    return EvaluationEvidence(protocol, sealed, records, latest_observed_at)
 
 
 def validate_machine_ledger(
@@ -371,8 +500,9 @@ def validate_machine_ledger(
     return canonical_json(
         {
             "schema_version": "specstyle.evaluation.machine_validation.v1",
-            "status": "AWAITING_BLIND_LABELS",
-            "evidence_class": evidence.protocol["evidence_class"],
+            "status": "STRUCTURALLY_VALIDATED_AWAITING_BLIND_LABELS",
+            "evidence_class": "UNVERIFIED",
+            "formal_eligible": False,
             "input_count": len(evidence.protocol["input_ids"]),
             "record_count": len(evidence.records),
             "missing_artifact_count": sum(
@@ -380,6 +510,10 @@ def validate_machine_ledger(
             ),
             "machine_ledger_sha256": evidence_sha256(ledger_data).value,
             "sealed_protocol_sha256": evidence_sha256(sealed_data).value,
+            "blind_assignment_trust": "UNVERIFIED_EXTERNAL_RANDOMIZER",
+            "blind_assignment_receipt_sha256": evidence_sha256(
+                canonical_json(_load_canonical(ledger_data)["blind_assignment_receipt"])
+            ).value,
         }
     )
 
@@ -394,8 +528,11 @@ def _blind_label(value: object) -> BlindHumanLabel:
     }
     if any(type(raw[name]) is not bool for name in boolean_keys):
         raise DomainError("invalid blind evaluation labels")
+    blind_id = _text(raw["blind_artifact_id"], "blind artifact id")
+    if _BLIND_ID.fullmatch(blind_id) is None:
+        raise DomainError("invalid blind evaluation labels")
     return BlindHumanLabel(
-        _text(raw["blind_artifact_id"], "blind artifact id"),
+        blind_id,
         _text(raw["rater_pseudonym"], "rater pseudonym"),
         raw["style_faithful"],
         raw["subject_preserved"],
@@ -428,6 +565,7 @@ def _approval_receipt(
         "receipt_id",
         "sealed_protocol_sha256",
         "study_id",
+        "trust_level",
     }
     try:
         raw = _exact(_load_canonical(data), keys, "label approval receipt")
@@ -443,8 +581,9 @@ def _approval_receipt(
             or raw["blind_labels_sha256"] != evidence_sha256(label_data).value
             or raw["machine_ledger_sha256"] != evidence_sha256(ledger_data).value
             or raw["sealed_protocol_sha256"] != evidence_sha256(sealed_data).value
+            or raw["trust_level"] != "LOCAL_ASSERTION_ONLY"
             or _timestamp(raw["issued_at"], "label approval time")
-            < _timestamp(machine.sealed["sealed_at"], "protocol seal time")
+            < machine.latest_observed_at
             or approver in raters
         ):
             raise DomainError("invalid label approval receipt")
@@ -529,6 +668,7 @@ def load_blind_evidence(
         machine.protocol,
         machine.sealed,
         machine.records,
+        machine.latest_observed_at,
         labels,
         raw["label_source"],
         missing,
@@ -553,12 +693,12 @@ def import_blind_labels(
         approval_data,
     )
     complete = not evidence.missing_blind_artifact_ids
-    formal = (
+    pending = (
         complete
         and evidence.protocol["evidence_class"] == "FORMAL"
         and evidence.label_source == "EXTERNAL_HUMAN"
     )
-    evidence_class = "FORMAL" if formal else "TEST_ONLY"
+    evidence_class = "FORMAL_PENDING_EXTERNAL_AUTHORIZATION" if pending else "TEST_ONLY"
     return canonical_json(
         {
             "schema_version": "specstyle.evaluation.label_import.v1",
@@ -566,7 +706,7 @@ def import_blind_labels(
                 "BLIND_LABELS_COMPLETE" if complete else "BLIND_LABELS_INCOMPLETE"
             ),
             "evidence_class": evidence_class,
-            "formal_eligible": formal,
+            "formal_eligible": False,
             "labeled_artifact_count": len(
                 {item.blind_artifact_id for item in evidence.labels}
             ),

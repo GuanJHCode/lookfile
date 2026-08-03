@@ -55,6 +55,7 @@ def test_seal_protocol_requires_validated_production_gate() -> None:
             object(),
             sealed_at="2026-08-03T10:00:00Z",
             repo_sha=_sha("c"),
+            production_context_sha256=_sha("d"),
         )
 
 
@@ -66,13 +67,20 @@ def test_sealed_protocol_cross_binds_preregistration_and_gate_snapshot(
         lambda _value: None,
     )
 
+    class _Pin:
+        def __init__(self, value: str) -> None:
+            self.sha256 = Sha256(value)
+
     class _Binding:
         production_approval_sha256 = Sha256(_sha("d"))
+        preprocessor_pin = _Pin(_sha("5"))
 
     class _Threshold:
         production_binding = _Binding()
+        pin = _Pin(_sha("e"))
 
     class _Gate:
+        compiler_pin = _Pin(_sha("2"))
         l2_threshold_profile = _Threshold()
 
     sealed = seal_protocol(
@@ -80,6 +88,7 @@ def test_sealed_protocol_cross_binds_preregistration_and_gate_snapshot(
         _Gate(),
         sealed_at="2026-08-03T10:00:00Z",
         repo_sha=_sha("c"),
+        production_context_sha256=_sha("d"),
     )
     value = json.loads(sealed)
 
@@ -87,6 +96,25 @@ def test_sealed_protocol_cross_binds_preregistration_and_gate_snapshot(
         "schema_version": "specstyle.evaluation.sealed_protocol.v1",
         "protocol_sha256": evidence_sha256(_draft()).value,
         "production_approval_sha256": _sha("d"),
+        "production_context_sha256": _sha("d"),
         "repo_sha": _sha("c"),
         "sealed_at": "2026-08-03T10:00:00Z",
+        "threshold_profile_sha256": _sha("e"),
+        "trust_level": "LOCAL_PROCESS_ONLY",
     }
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("minimum_effect", 0.0),
+        ("minimum_effect", -0.1),
+        ("noninferiority_margin", 1.0),
+    ),
+)
+def test_protocol_rejects_trivial_success_thresholds(field: str, value: float) -> None:
+    document = json.loads(_draft())
+    document["statistics"][field] = value
+
+    with pytest.raises(DomainError, match="evaluation protocol"):
+        prepare_protocol(canonical_json(document))

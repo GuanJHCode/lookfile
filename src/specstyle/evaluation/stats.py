@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import random
 from dataclasses import dataclass
+import math
 from typing import Any
 
 from specstyle.calibration.evidence_io import canonical_json, evidence_sha256
@@ -140,9 +141,12 @@ def _paired_vectors(
     return usable, degraded
 
 
-def _percentile(samples: list[float], probability: float) -> float:
+def _percentile(
+    samples: list[float], probability: float, *, upper: bool = False
+) -> float:
     ordered = sorted(samples)
-    index = int(probability * (len(ordered) - 1))
+    position = probability * (len(ordered) - 1)
+    index = math.ceil(position) if upper else math.floor(position)
     return ordered[index]
 
 
@@ -157,39 +161,41 @@ def _paired_comparison(
     baseline: tuple[list[float], list[float]],
     samples: list[tuple[int, ...]],
     confidence: float,
-    minimum_effect: float,
-    margin: float,
 ) -> dict[str, Any]:
     primary = [left - right for left, right in zip(full[0], baseline[0], strict=True)]
     degraded = [left - right for left, right in zip(full[1], baseline[1], strict=True)]
     primary_samples = [sum(primary[i] for i in draw) / len(draw) for draw in samples]
     degraded_samples = [sum(degraded[i] for i in draw) / len(draw) for draw in samples]
-    alpha = (1.0 - confidence) / 2.0
+    two_sided_alpha = (1.0 - confidence) / 2.0
+    simultaneous_alpha = (1.0 - confidence) / 6.0
     return {
         "comparator": comparator,
         "primary_effect": sum(primary) / len(primary),
         "primary_confidence_interval": [
-            _percentile(primary_samples, alpha),
-            _percentile(primary_samples, 1.0 - alpha),
+            _percentile(primary_samples, two_sided_alpha),
+            _percentile(primary_samples, 1.0 - two_sided_alpha, upper=True),
         ],
-        "primary_one_sided_p": (
-            1 + sum(item < minimum_effect for item in primary_samples)
-        )
-        / (len(primary_samples) + 1),
+        "primary_simultaneous_lower_bound": _percentile(
+            primary_samples, simultaneous_alpha
+        ),
         "degradation_effect": sum(degraded) / len(degraded),
         "degradation_confidence_interval": [
-            _percentile(degraded_samples, alpha),
-            _percentile(degraded_samples, 1.0 - alpha),
+            _percentile(degraded_samples, two_sided_alpha),
+            _percentile(degraded_samples, 1.0 - two_sided_alpha, upper=True),
         ],
-        "degradation_one_sided_p": (1 + sum(item > margin for item in degraded_samples))
-        / (len(degraded_samples) + 1),
+        "degradation_simultaneous_upper_bound": _percentile(
+            degraded_samples, 1.0 - simultaneous_alpha, upper=True
+        ),
     }
 
 
-def _holm_pass(comparisons: list[dict[str, Any]], field: str, alpha: float) -> bool:
-    ordered = sorted(float(item[field]) for item in comparisons)
+def _preregistered_criteria_met(
+    comparisons: list[dict[str, Any]], minimum_effect: float, margin: float
+) -> bool:
     return all(
-        value <= alpha / (len(ordered) - index) for index, value in enumerate(ordered)
+        item["primary_simultaneous_lower_bound"] > minimum_effect
+        and item["degradation_simultaneous_upper_bound"] < margin
+        for item in comparisons
     )
 
 
@@ -212,16 +218,13 @@ def _comparisons(
             _paired_vectors(arm_records, humans, comparator),
             samples,
             config["confidence_level"],
-            config["minimum_effect"],
-            config["noninferiority_margin"],
         )
         for comparator in FORMAL_ARMS[1:4]
     ]
-    alpha = 1.0 - config["confidence_level"]
-    demonstrated = _holm_pass(results, "primary_one_sided_p", alpha) and _holm_pass(
-        results, "degradation_one_sided_p", alpha
+    criteria_met = _preregistered_criteria_met(
+        results, config["minimum_effect"], config["noninferiority_margin"]
     )
-    return results, demonstrated
+    return results, criteria_met
 
 
 def _incomplete_report(
@@ -235,9 +238,12 @@ def _incomplete_report(
         {
             "schema_version": "specstyle.evaluation.final_report.v1",
             "status": "INCOMPLETE",
-            "evidence_class": "FORMAL"
-            if evidence.label_source == "EXTERNAL_HUMAN"
-            else "TEST_ONLY",
+            "evidence_class": (
+                "TEST_ONLY"
+                if evidence.protocol["evidence_class"] == "TEST_ONLY"
+                else "UNVERIFIED"
+            ),
+            "formal_eligible": False,
             "main_metric_definition": "blind_human_usable_and_machine_approved/all_inputs",
             "repair_lift_conclusion": "NOT_EVALUATED",
             "input_count": len(evidence.protocol["input_ids"]),
@@ -278,24 +284,24 @@ def finalize_evaluation(
         for arm in FORMAL_ARMS
     }
     arms = [_arm_statistics(arm, arm_records[arm], humans) for arm in FORMAL_ARMS]
-    comparisons, demonstrated = _comparisons(evidence, arm_records, humans)
-    formal = (
+    comparisons, criteria_met = _comparisons(evidence, arm_records, humans)
+    pending = (
         evidence.protocol["evidence_class"] == "FORMAL"
         and evidence.label_source == "EXTERNAL_HUMAN"
     )
     return canonical_json(
         {
             "schema_version": "specstyle.evaluation.final_report.v1",
-            "status": "FORMAL" if formal else "TEST_ONLY",
-            "evidence_class": "FORMAL" if formal else "TEST_ONLY",
-            "main_metric_definition": "blind_human_usable_and_machine_approved/all_inputs",
-            "repair_lift_conclusion": (
-                "DEMONSTRATED"
-                if formal and demonstrated
-                else "NOT_DEMONSTRATED"
-                if formal
-                else "NOT_FORMAL"
+            "status": (
+                "FORMAL_PENDING_EXTERNAL_AUTHORIZATION" if pending else "TEST_ONLY"
             ),
+            "evidence_class": (
+                "FORMAL_PENDING_EXTERNAL_AUTHORIZATION" if pending else "TEST_ONLY"
+            ),
+            "formal_eligible": False,
+            "main_metric_definition": "blind_human_usable_and_machine_approved/all_inputs",
+            "repair_lift_conclusion": ("NOT_AUTHORIZED" if pending else "NOT_FORMAL"),
+            "preregistered_criteria_met": criteria_met,
             "input_count": len(evidence.protocol["input_ids"]),
             "missing_blind_artifact_ids": [],
             "arms": arms,

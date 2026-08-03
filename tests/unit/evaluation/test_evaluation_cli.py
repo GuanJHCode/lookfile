@@ -68,7 +68,9 @@ def test_cli_exposes_validation_import_and_finalize_without_run(tmp_path: Path) 
         )
         == 0
     )
-    assert json.loads(validate_out.read_bytes())["status"] == "AWAITING_BLIND_LABELS"
+    assert json.loads(validate_out.read_bytes())["status"] == (
+        "STRUCTURALLY_VALIDATED_AWAITING_BLIND_LABELS"
+    )
 
     labels_out = tmp_path / "label-import.json"
     assert (
@@ -89,7 +91,7 @@ def test_cli_exposes_validation_import_and_finalize_without_run(tmp_path: Path) 
                 str(labels_out),
             ]
         )
-        == 0
+        == 2
     )
     assert json.loads(labels_out.read_bytes())["status"] == "BLIND_LABELS_COMPLETE"
 
@@ -112,9 +114,11 @@ def test_cli_exposes_validation_import_and_finalize_without_run(tmp_path: Path) 
                 str(final_out),
             ]
         )
-        == 0
+        == 2
     )
-    assert json.loads(final_out.read_bytes())["status"] == "FORMAL"
+    final = json.loads(final_out.read_bytes())
+    assert final["status"] == "FORMAL_PENDING_EXTERNAL_AUTHORIZATION"
+    assert final["formal_eligible"] is False
 
     with pytest.raises(SystemExit):
         main(["run"])
@@ -131,7 +135,7 @@ def test_seal_protocol_fails_closed_before_writing_without_validated_gate(
     output = tmp_path / "sealed.json"
     monkeypatch.setattr(
         "specstyle.evaluation.evaluation_cli._load_production_context",
-        lambda _config, _evidence: object(),
+        lambda _config, _evidence: (object(), "d" * 64),
     )
 
     with pytest.raises(DomainError, match="PRODUCTION_THRESHOLD_NOT_VALIDATED"):
@@ -154,3 +158,35 @@ def test_seal_protocol_fails_closed_before_writing_without_validated_gate(
         )
 
     assert not output.exists()
+
+
+def test_output_is_complete_before_atomic_no_replace_publish(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _write(tmp_path / "draft.json", protocol_document())
+    output = tmp_path / "prepared.json"
+    real_link = os.link
+    observed: list[str] = []
+
+    def inspect_link(source_name, target_name, **kwargs):
+        source_fd = os.open(source_name, os.O_RDONLY, dir_fd=kwargs["src_dir_fd"])
+        try:
+            assert (
+                os.read(source_fd, len(protocol_document()) + 1) == protocol_document()
+            )
+        finally:
+            os.close(source_fd)
+        with pytest.raises(FileNotFoundError):
+            os.stat(
+                target_name,
+                dir_fd=kwargs["dst_dir_fd"],
+                follow_symlinks=False,
+            )
+        observed.append(source_name)
+        return real_link(source_name, target_name, **kwargs)
+
+    monkeypatch.setattr(os, "link", inspect_link)
+
+    assert main(["prepare-protocol", "--input", str(source), "--out", str(output)]) == 0
+    assert observed and observed[0].startswith(".evaluation-")
+    assert output.read_bytes() == protocol_document()
