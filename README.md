@@ -26,8 +26,8 @@ The following path has been exercised on an AMD Radeon ROCm 7.2.1 runtime:
    and rejected outputs, QA rows, deterministic seed evidence, and the published
    bundle digest.
 
-The current AMD candidate is `f0d258d`. It serves 49 Gradio components on the
-isolated candidate port and passed 846 affected AMD tests with one capability
+The current AMD candidate is `597642e`. It serves 49 Gradio components on the
+isolated candidate port and passed 872 affected AMD tests with one capability
 skip, plus repository-configured Ruff check and format gates. The stable
 `1a1af45` service remained online during candidate validation.
 
@@ -45,6 +45,14 @@ on the following commits, all of which are ancestors of the current candidate:
 - `ec1e27d`: two new synthetic source materials reused the same Spec, style
   reference, compiler graph, rules, and environment and both completed. This is
   new-material contract reuse, not same-input semantic replay.
+- `597642e`: a successful Production job established an in-process baseline,
+  then Replay submitted the same nine form inputs into a new job and immutable
+  bundle. The assessment was `EXACT`: both runs used seed
+  `4493853825484117685`, L2 style score `0.9241587906927828`, and L2 delta
+  `0/0`; L3 remained truthfully `NOT_APPLICABLE` with `NO_L3_CONFIG`. The two
+  artifact hashes happened to match, but pixel equality is diagnostic and is
+  not required by the semantic replay contract. Replay baselines are
+  process-local and must be re-established after a UI restart.
 
 ## Known submission gaps
 
@@ -54,9 +62,9 @@ on the following commits, all of which are ancestors of the current candidate:
   placeholder calibration evidence. No universal L2 threshold is claimed.
 - No calibrated L3 domain plugin is enabled. `NOT_APPLICABLE` and
   `UNVERIFIABLE` are not presented as `PASS`.
-- A real failure-to-repair-to-reverification Radeon comparison, same-input
-  semantic replay evidence, five-arm equal-budget ablation, and blind human
-  evaluation are still required for the full competition claim.
+- A real failure-to-repair-to-reverification Radeon comparison, five-arm
+  equal-budget ablation, and blind human evaluation are still required for the
+  full competition claim.
 - The current production upload contract accepts `xhs_grid`; the other output
   profiles are not yet productized.
 
