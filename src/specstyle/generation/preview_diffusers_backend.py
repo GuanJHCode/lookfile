@@ -8,7 +8,7 @@ from typing import Any
 
 from PIL import Image
 
-from specstyle.errors import DomainError
+from specstyle.errors import DomainError, InfrastructureError
 from specstyle.generation.diffusers_backend import (
     StyleAssetResolver,
     _CancelBinding,
@@ -22,6 +22,8 @@ from specstyle.generation.diffusers_backend import (
 from specstyle.generation.diffusers_loader import _GPU_LEASE
 from specstyle.generation.preview_diffusers_loader import (
     LoadedPreviewPipeline,
+    _PreviewPipelineIntegrityError,
+    _poison_loaded_preview_pipeline,
     _validate_loaded_preview_pipeline,
 )
 from specstyle.generation.preview_execution import (
@@ -32,6 +34,30 @@ from specstyle.generation.preview_execution import (
 )
 from specstyle.generation.requests import GenerationRequest
 from specstyle.observability.hashing import hash_bytes
+
+
+class _PreviewRuntimeIntegrityError(InfrastructureError):
+    pass
+
+
+def _raise_runtime_integrity_failure(
+    loaded: object, error: BaseException | None = None
+) -> None:
+    try:
+        _poison_loaded_preview_pipeline(loaded)
+    except DomainError:
+        pass
+    failure = _PreviewRuntimeIntegrityError("preview runtime integrity failed")
+    if error is None:
+        raise failure
+    raise failure from error
+
+
+def _verify_runtime_integrity(loaded: object) -> None:
+    try:
+        _validate_loaded_preview_pipeline(loaded, require_open=True)
+    except Exception as exc:
+        _raise_runtime_integrity_failure(loaded, exc)
 
 
 class PreviewDiffusersBackend:
@@ -49,8 +75,8 @@ class PreviewDiffusersBackend:
     ) -> None:
         try:
             _validate_loaded_preview_pipeline(loaded, require_open=True)
-        except DomainError:
-            raise DomainError("invalid loaded preview pipeline") from None
+        except Exception as exc:
+            _raise_runtime_integrity_failure(loaded, exc)
         if not callable(resolver):
             raise DomainError("invalid preview style asset resolver")
         if cancel_event is not None and type(cancel_event) is not threading.Event:
@@ -82,9 +108,16 @@ class PreviewDiffusersBackend:
     def _generate_under_lease(
         self, request: GenerationRequest
     ) -> PreviewGeneratedArtifact:
-        request = _validate_preview_request(self._loaded, request)
-        binding = bind_preview_execution(self._loaded, request)
-        content = self._generate_content(request)
+        _verify_runtime_integrity(self._loaded)
+        try:
+            request = _validate_preview_request(self._loaded, request)
+            binding = bind_preview_execution(self._loaded, request)
+        except _PreviewPipelineIntegrityError as exc:
+            _raise_runtime_integrity_failure(self._loaded, exc)
+        try:
+            content = self._generate_content(request)
+        finally:
+            _verify_runtime_integrity(self._loaded)
         return build_preview_artifact(content, binding)
 
     def _generate_content(self, request: GenerationRequest) -> bytes:

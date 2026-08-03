@@ -30,7 +30,9 @@ def _publication(
         (512, 512),
         "ENGINEERING_ONLY",
         "float16",
+        "float16",
         "float32",
+        "diffusers_force_upcast_roundtrip_v1",
     )
 
 
@@ -252,7 +254,10 @@ def test_wall_aborts_remaining_items_after_runtime_failure(
             _publication(run_ids[0], 0, "1" * 64),
         ),
         PreviewRunOneResult(
-            run_ids[1], PreviewRunStatus.UNAVAILABLE, "RUNTIME_FAILED", None
+            run_ids[1],
+            PreviewRunStatus.UNAVAILABLE,
+            "RUNTIME_INTEGRITY_FAILED",
+            None,
         ),
     ]
     session = _Session(results)
@@ -268,7 +273,7 @@ def test_wall_aborts_remaining_items_after_runtime_failure(
     assert [item.attempted for item in result.items] == [True, True, False, False]
     assert [item.run.reason_code for item in result.items] == [
         "OK",
-        "RUNTIME_FAILED",
+        "RUNTIME_INTEGRITY_FAILED",
         "WALL_ABORTED",
         "WALL_ABORTED",
     ]

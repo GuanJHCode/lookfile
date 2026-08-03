@@ -57,9 +57,30 @@ class _VersionedParameter:
     def __init__(self) -> None:
         self._version = 0
         self._data_ptr = id(self)
+        self.dtype = "torch.float16"
+        self.shape = (2,)
+        self._content = bytearray(b"\x00<\x00@")
 
     def data_ptr(self) -> int:
         return self._data_ptr
+
+    def detach(self) -> _VersionedParameter:
+        return self
+
+    def to(self, *, device: str, copy: bool) -> _VersionedParameter:
+        assert device == "cpu"
+        assert copy is True
+        snapshot = _VersionedParameter()
+        snapshot.dtype = self.dtype
+        snapshot.shape = self.shape
+        snapshot._content = bytearray(self._content)
+        return snapshot
+
+    def contiguous(self) -> _VersionedParameter:
+        return self
+
+    def numpy(self) -> bytearray:
+        return self._content
 
 
 class _FakeVae:
@@ -71,6 +92,9 @@ class _FakeVae:
     def to(self, **kwargs: object) -> _FakeVae:
         self.to_calls.append(kwargs)
         self.dtype = kwargs["dtype"]
+        self.weight.dtype = (
+            "torch.float16" if self.dtype is _FLOAT16 else "torch.float32"
+        )
         self.weight._data_ptr += 1
         return self
 
@@ -422,8 +446,8 @@ def test_loader_applies_exact_lcm_scheduler_adapter_and_fuse_contract(
     assert pipeline.fuse_calls == [
         {"lora_scale": 1.0, "adapter_names": ["specstyle_lcm"]}
     ]
-    assert pipeline.vae.dtype is torch.float32
-    assert pipeline.vae.to_calls == [{"dtype": torch.float32}]
+    assert pipeline.vae.dtype is torch.float16
+    assert pipeline.vae.to_calls == []
     assert not hasattr(loaded, "_borrow_image_evidence_encoder")
     assert not hasattr(loaded, "borrow_pipeline")
     for operation in (copy.copy, copy.deepcopy, pickle.dumps):
@@ -554,7 +578,7 @@ def test_loader_requires_exact_pinned_peft_runtime(tmp_path: Path) -> None:
     supply.close()
 
 
-@pytest.mark.parametrize("stage", ("scheduler", "vae", "lora", "fuse"))
+@pytest.mark.parametrize("stage", ("scheduler", "lora", "fuse"))
 def test_loader_releases_partial_pipeline_on_lcm_stage_failure(
     tmp_path: Path, stage: str
 ) -> None:
@@ -571,10 +595,6 @@ def test_loader_releases_partial_pipeline_on_lcm_stage_failure(
 
     def issue(*args: object, **kwargs: object):
         pipeline = original(*args, **kwargs)
-        if stage == "vae":
-            pipeline.vae.to = lambda **_kwargs: (_ for _ in ()).throw(
-                RuntimeError("vae")
-            )
         if stage == "lora":
             pipeline.load_lora_weights = lambda *a, **k: (_ for _ in ()).throw(
                 RuntimeError("lora")
@@ -622,7 +642,11 @@ def test_execution_binding_is_distinct_and_binds_four_models_and_runtime(
     assert binding.compiled_request_fingerprint != binding.execution_fingerprint
     assert material["schema_version"] == "specstyle.preview.execution.v3"
     assert material["runtime"]["dtype"] == "float16"
-    assert material["runtime"]["vae_dtype"] == "float32"
+    assert material["runtime"]["vae_at_rest_dtype"] == "float16"
+    assert material["runtime"]["vae_compute_dtype"] == "float32"
+    assert material["runtime"]["vae_precision_policy"] == (
+        "diffusers_force_upcast_roundtrip_v1"
+    )
     compiled = material["compiled_request"]
     assert compiled["schema_version"] == "specstyle.preview.compiled-request.v2"
     assert compiled["run_id"] == request.job_id.value
@@ -693,6 +717,49 @@ def test_execution_fingerprint_changes_when_only_preview_approval_changes(
     second.close()
     changed_adapter.close()
     supply.close()
+
+
+def test_execution_v3_rejects_legacy_vae_dtype_runtime_shape(tmp_path: Path) -> None:
+    from specstyle.generation.preview_diffusers_loader import load_preview_pipeline
+    from specstyle.generation.preview_execution import (
+        _canonical_json,
+        _fingerprint,
+        _validate_execution_binding,
+        bind_preview_execution,
+    )
+
+    supply, adapter, graph, request = _runtime(tmp_path)
+    loaded = load_preview_pipeline(
+        supply,
+        adapter,
+        graph,
+        _environment(),
+        torch_module=_Torch(),
+        diffusers_module=_PreviewDiffusers(),
+        peft_module=_Peft(),
+    )
+    try:
+        binding = bind_preview_execution(loaded, request)
+        material = json.loads(binding.material_json)
+        material["runtime"] = {
+            "rocm_version": "7.2.1",
+            "torch_version": "2.8.0",
+            "diffusers_version": "0.39.0",
+            "peft_version": "0.18.1",
+            "dtype": "float16",
+            "vae_dtype": "float32",
+        }
+        material_json = _canonical_json(material)
+        object.__setattr__(binding, "material_json", material_json)
+        object.__setattr__(
+            binding, "execution_fingerprint", _fingerprint(material_json)
+        )
+        with pytest.raises(DomainError, match="execution binding"):
+            _validate_execution_binding(binding)
+    finally:
+        loaded.close()
+        adapter.close()
+        supply.close()
 
 
 def test_execution_fingerprint_binds_scheduler_config_and_valid_graph_changes(
@@ -917,8 +984,8 @@ def test_backend_reuses_pipeline_after_diffusers_vae_upcast(
     def call(_self, **_kwargs: object):
         nonlocal calls
         calls += 1
-        if pipeline.vae.dtype is _FLOAT16:
-            pipeline.vae.to(dtype=_FLOAT32)
+        pipeline.vae.to(dtype=_FLOAT32)
+        pipeline.vae.to(dtype=_FLOAT16)
         return type("Result", (), {"images": [Image.new("RGB", (512, 512))]})()
 
     monkeypatch.setattr(pipeline.__class__, "__call__", call)
@@ -927,13 +994,22 @@ def test_backend_reuses_pipeline_after_diffusers_vae_upcast(
         second = PreviewDiffusersBackend(loaded, lambda _ref: style).generate(request)
         assert first.content == second.content
         assert calls == 2
+        assert pipeline.vae.dtype is _FLOAT16
+        assert pipeline.vae.to_calls == [
+            {"dtype": _FLOAT32},
+            {"dtype": _FLOAT16},
+            {"dtype": _FLOAT32},
+            {"dtype": _FLOAT16},
+        ]
     finally:
         loaded.close()
         adapter.close()
         supply.close()
 
 
-def test_execution_rejects_vae_dtype_or_storage_tamper(tmp_path: Path) -> None:
+def test_execution_allows_vae_storage_move_but_rejects_content_tamper(
+    tmp_path: Path,
+) -> None:
     from specstyle.generation.preview_diffusers_loader import load_preview_pipeline
     from specstyle.generation.preview_execution import bind_preview_execution
 
@@ -950,13 +1026,187 @@ def test_execution_rejects_vae_dtype_or_storage_tamper(tmp_path: Path) -> None:
     )
     pipeline = diffusers.issued_pipelines[0]
     try:
-        pipeline.vae.dtype = _FLOAT16
-        with pytest.raises(DomainError, match="capability"):
-            bind_preview_execution(loaded, request)
-        pipeline.vae.dtype = _FLOAT32
         pipeline.vae.weight._data_ptr += 1
+        bind_preview_execution(loaded, request)
+        pipeline.vae.weight._content[0] ^= 1
         with pytest.raises(DomainError, match="capability"):
             bind_preview_execution(loaded, request)
+
+    finally:
+        loaded.close()
+        adapter.close()
+        supply.close()
+
+
+def test_execution_rejects_vae_dtype_and_non_vae_storage_tamper(
+    tmp_path: Path,
+) -> None:
+    from specstyle.generation.preview_diffusers_loader import load_preview_pipeline
+    from specstyle.generation.preview_execution import bind_preview_execution
+
+    supply, adapter, graph, request = _runtime(tmp_path)
+    diffusers = _PreviewDiffusers()
+    loaded = load_preview_pipeline(
+        supply,
+        adapter,
+        graph,
+        _environment(),
+        torch_module=_Torch(),
+        diffusers_module=diffusers,
+        peft_module=_Peft(),
+    )
+    pipeline = diffusers.issued_pipelines[0]
+    try:
+        pipeline.vae.dtype = _FLOAT32
+        with pytest.raises(DomainError, match="capability"):
+            bind_preview_execution(loaded, request)
+        pipeline.vae.dtype = _FLOAT16
+        pipeline.unet.layer.weight._data_ptr += 1
+        with pytest.raises(DomainError, match="capability"):
+            bind_preview_execution(loaded, request)
+    finally:
+        loaded.close()
+        adapter.close()
+        supply.close()
+
+
+def test_backend_postcondition_poisoning_overrides_inference_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from specstyle.generation.preview_diffusers_backend import (
+        PreviewDiffusersBackend,
+        _PreviewRuntimeIntegrityError,
+    )
+    from specstyle.generation.preview_diffusers_loader import load_preview_pipeline
+
+    style = _png((512, 512), "blue")
+    supply, adapter, graph, request = _runtime(tmp_path, style=style)
+    torch, diffusers = _Torch(), _PreviewDiffusers()
+
+    class Generator:
+        def __init__(self, device: str) -> None:
+            self.device = device
+
+        def manual_seed(self, seed: int) -> Generator:
+            self.seed = seed
+            return self
+
+    torch.Generator = Generator
+    loaded = load_preview_pipeline(
+        supply,
+        adapter,
+        graph,
+        _environment(),
+        torch_module=torch,
+        diffusers_module=diffusers,
+        peft_module=_Peft(),
+    )
+    pipeline = diffusers.issued_pipelines[0]
+    pipeline.set_ip_adapter_scale = lambda _scale: None
+
+    def corrupt_then_fail(_self, **_kwargs: object):
+        pipeline.vae.weight._content[0] ^= 1
+        raise RuntimeError("inference failed after corruption")
+
+    monkeypatch.setattr(pipeline.__class__, "__call__", corrupt_then_fail)
+    backend = PreviewDiffusersBackend(loaded, lambda _ref: style)
+    try:
+        with pytest.raises(_PreviewRuntimeIntegrityError):
+            backend.generate(request)
+        with pytest.raises(_PreviewRuntimeIntegrityError):
+            backend.generate(request)
+    finally:
+        loaded.close()
+        adapter.close()
+        supply.close()
+
+
+def test_backend_does_not_build_artifact_when_success_corrupts_vae(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from specstyle.generation.preview_diffusers_backend import (
+        PreviewDiffusersBackend,
+        _PreviewRuntimeIntegrityError,
+    )
+    from specstyle.generation.preview_diffusers_loader import load_preview_pipeline
+
+    style = _png((512, 512), "blue")
+    supply, adapter, graph, request = _runtime(tmp_path, style=style)
+    torch, diffusers = _Torch(), _PreviewDiffusers()
+
+    class Generator:
+        def __init__(self, device: str) -> None:
+            self.device = device
+
+        def manual_seed(self, seed: int) -> Generator:
+            self.seed = seed
+            return self
+
+    torch.Generator = Generator
+    loaded = load_preview_pipeline(
+        supply,
+        adapter,
+        graph,
+        _environment(),
+        torch_module=torch,
+        diffusers_module=diffusers,
+        peft_module=_Peft(),
+    )
+    pipeline = diffusers.issued_pipelines[0]
+    pipeline.set_ip_adapter_scale = lambda _scale: None
+
+    def corrupt_then_return(_self, **_kwargs: object):
+        pipeline.vae.weight._content[0] ^= 1
+        return type("Result", (), {"images": [Image.new("RGB", (512, 512))]})()
+
+    monkeypatch.setattr(pipeline.__class__, "__call__", corrupt_then_return)
+    try:
+        with pytest.raises(_PreviewRuntimeIntegrityError):
+            PreviewDiffusersBackend(loaded, lambda _ref: style).generate(request)
+    finally:
+        loaded.close()
+        adapter.close()
+        supply.close()
+
+
+@pytest.mark.parametrize("failure_call", (3, 4))
+def test_backend_poisons_nested_integrity_read_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_call: int,
+) -> None:
+    import specstyle.generation.preview_diffusers_loader as loader_module
+    from specstyle.generation.preview_diffusers_backend import (
+        PreviewDiffusersBackend,
+        _PreviewRuntimeIntegrityError,
+    )
+
+    supply, adapter, graph, request = _runtime(tmp_path)
+    loaded = loader_module.load_preview_pipeline(
+        supply,
+        adapter,
+        graph,
+        _environment(),
+        torch_module=_Torch(),
+        diffusers_module=_PreviewDiffusers(),
+        peft_module=_Peft(),
+    )
+    real_hash = loader_module._vae_content_sha256
+    calls = 0
+
+    def fail_nested_read(*args: object, **kwargs: object) -> str:
+        nonlocal calls
+        calls += 1
+        if calls == failure_call:
+            raise DomainError("injected VAE read failure")
+        return real_hash(*args, **kwargs)
+
+    monkeypatch.setattr(loader_module, "_vae_content_sha256", fail_nested_read)
+    try:
+        backend = PreviewDiffusersBackend(loaded, lambda _ref: _png((512, 512)))
+        with pytest.raises(_PreviewRuntimeIntegrityError):
+            backend.generate(request)
+        assert loaded._poisoned is True
     finally:
         loaded.close()
         adapter.close()

@@ -101,7 +101,12 @@ def test_preview_evidence_atomically_publishes_private_pair_then_display(
     assert record["artifact"]["execution_fingerprint"] == (
         artifact.execution_fingerprint.value
     )
-    assert record["runtime"] == {"dtype": "float16", "vae_dtype": "float32"}
+    assert record["runtime"] == {
+        "dtype": "float16",
+        "vae_at_rest_dtype": "float16",
+        "vae_compute_dtype": "float32",
+        "vae_precision_policy": "diffusers_force_upcast_roundtrip_v1",
+    }
     assert record["planes"] == {
         "verification": "NOT_RUN",
         "repair": "NOT_RUN",
@@ -111,7 +116,9 @@ def test_preview_evidence_atomically_publishes_private_pair_then_display(
     assert published.content_sha256 == hash_bytes(display_bytes)
     assert published.schema_version == "specstyle.preview.evidence.v3"
     assert published.runtime_dtype == "float16"
-    assert published.vae_dtype == "float32"
+    assert published.vae_at_rest_dtype == "float16"
+    assert published.vae_compute_dtype == "float32"
+    assert published.vae_precision_policy == "diffusers_force_upcast_roundtrip_v1"
     assert published.variation_index == 0
     assert published.seed_algorithm == "specstyle.seed.v1"
     assert published.resolution == (512, 512)
@@ -240,7 +247,9 @@ def test_stored_v3_publication_rejects_compiled_fingerprint_tamper(
         os.close(private_fd)
 
 
-def test_stored_v3_publication_rejects_vae_dtype_tamper(tmp_path: Path) -> None:
+def test_stored_v3_publication_rejects_vae_precision_policy_tamper(
+    tmp_path: Path,
+) -> None:
     from specstyle.exporting.qa_report import canonical_json_bytes
     from specstyle.workflow.preview_evidence import (
         publish_preview_evidence,
@@ -254,7 +263,7 @@ def test_stored_v3_publication_rejects_vae_dtype_tamper(tmp_path: Path) -> None:
         publication = publish_preview_evidence(private_fd, display_fd, run_id, artifact)
         record_path = private / run_id / "record.json"
         record = json.loads(record_path.read_text())
-        record["runtime"]["vae_dtype"] = "float16"
+        record["runtime"]["vae_precision_policy"] = "untrusted"
         record_path.write_bytes(canonical_json_bytes(record))
         with pytest.raises(DomainError, match="record"):
             verify_preview_evidence_publication(private_fd, publication)

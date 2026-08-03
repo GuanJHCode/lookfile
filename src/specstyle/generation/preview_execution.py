@@ -196,12 +196,39 @@ def _valid_binding_material(binding: PreviewExecutionBinding, material: object) 
         _canonical_json(material) == binding.material_json
         and material["schema_version"] == "specstyle.preview.execution.v3"
         and _valid_compiled_material(compiled)
+        and _valid_runtime_material(material["runtime"])
         and material["compiled_request_fingerprint"]
         == binding.compiled_request_fingerprint.value
         and _fingerprint(_canonical_json(compiled))
         == binding.compiled_request_fingerprint
         and _fingerprint(binding.material_json) == binding.execution_fingerprint
         and binding.execution_fingerprint != binding.compiled_request_fingerprint
+    )
+
+
+def _valid_runtime_material(value: object) -> bool:
+    keys = {
+        "rocm_version",
+        "torch_version",
+        "diffusers_version",
+        "peft_version",
+        "dtype",
+        "vae_at_rest_dtype",
+        "vae_compute_dtype",
+        "vae_precision_policy",
+    }
+    return (
+        type(value) is dict
+        and set(value) == keys
+        and value["peft_version"] == "0.18.1"
+        and value["dtype"] == "float16"
+        and value["vae_at_rest_dtype"] == "float16"
+        and value["vae_compute_dtype"] == "float32"
+        and value["vae_precision_policy"] == "diffusers_force_upcast_roundtrip_v1"
+        and all(
+            type(value[key]) is str and value[key]
+            for key in ("rocm_version", "torch_version", "diffusers_version")
+        )
     )
 
 
@@ -372,7 +399,9 @@ def bind_preview_execution(loaded: object, request: object) -> PreviewExecutionB
             "diffusers_version": loaded._runtime[2],
             "peft_version": loaded._peft_version,
             "dtype": loaded._runtime[3],
-            "vae_dtype": loaded._vae_dtype,
+            "vae_at_rest_dtype": loaded._vae_at_rest_dtype,
+            "vae_compute_dtype": loaded._vae_compute_dtype,
+            "vae_precision_policy": loaded._vae_precision_policy,
         },
         "scheduler": {
             "identity": loaded._scheduler_identity,

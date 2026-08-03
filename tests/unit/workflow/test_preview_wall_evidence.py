@@ -26,7 +26,9 @@ def _publication(run_id: str, variation_index: int, digest: str):
         (512, 512),
         "ENGINEERING_ONLY",
         "float16",
+        "float16",
         "float32",
+        "diffusers_force_upcast_roundtrip_v1",
     )
 
 
@@ -202,4 +204,8 @@ def test_wall_accepts_publication_backed_by_private_v3_evidence(tmp_path: Path) 
         "specstyle.preview.evidence.v3"
     )
     assert manifest["items"][0]["artifact"]["runtime_dtype"] == "float16"
-    assert manifest["items"][0]["artifact"]["vae_dtype"] == "float32"
+    assert manifest["items"][0]["artifact"]["vae_at_rest_dtype"] == "float16"
+    assert manifest["items"][0]["artifact"]["vae_compute_dtype"] == "float32"
+    assert manifest["items"][0]["artifact"]["vae_precision_policy"] == (
+        "diffusers_force_upcast_roundtrip_v1"
+    )

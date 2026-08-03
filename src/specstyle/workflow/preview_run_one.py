@@ -18,7 +18,10 @@ from specstyle.generation.model_approval import verify_pipeline_supply
 from specstyle.generation.model_registry import ModelRegistry
 from specstyle.generation.pipeline_factory import PipelineFactory
 from specstyle.generation.preview_adapter_supply import verify_preview_adapter
-from specstyle.generation.preview_diffusers_backend import PreviewDiffusersBackend
+from specstyle.generation.preview_diffusers_backend import (
+    PreviewDiffusersBackend,
+    _PreviewRuntimeIntegrityError,
+)
 from specstyle.generation.preview_diffusers_loader import load_preview_pipeline
 from specstyle.generation.protocols import build_control_input
 from specstyle.generation.requests import GenerationRequest
@@ -439,6 +442,10 @@ def _load_runtime(preflight: _PreviewPreflight):
 def _generate_artifact(loaded: object, job_input: PreviewJobInput, request: object):
     try:
         return PreviewDiffusersBackend(loaded, job_input.style_assets).generate(request)
+    except _PreviewRuntimeIntegrityError:
+        raise _PreviewRunFailure(
+            PreviewRunStatus.UNAVAILABLE, "RUNTIME_INTEGRITY_FAILED"
+        ) from None
     except DomainError:
         raise _PreviewRunFailure(
             PreviewRunStatus.FAILED, "GENERATION_REJECTED"

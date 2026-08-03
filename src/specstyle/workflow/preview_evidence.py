@@ -74,7 +74,9 @@ class PreviewEvidencePublication:
     resolution: tuple[int, int]
     evidence_class: str
     runtime_dtype: str
-    vae_dtype: str
+    vae_at_rest_dtype: str
+    vae_compute_dtype: str
+    vae_precision_policy: str
 
     def __post_init__(self) -> None:
         if (
@@ -97,7 +99,9 @@ class PreviewEvidencePublication:
             or any(type(item) is not int or item <= 0 for item in self.resolution)
             or self.evidence_class != "ENGINEERING_ONLY"
             or self.runtime_dtype != "float16"
-            or self.vae_dtype != "float32"
+            or self.vae_at_rest_dtype != "float16"
+            or self.vae_compute_dtype != "float32"
+            or self.vae_precision_policy != "diffusers_force_upcast_roundtrip_v1"
         ):
             raise _domain()
 
@@ -321,7 +325,9 @@ def publish_preview_evidence(
             tuple(generation["resolution"]),
             "ENGINEERING_ONLY",
             runtime["dtype"],
-            runtime["vae_dtype"],
+            runtime["vae_at_rest_dtype"],
+            runtime["vae_compute_dtype"],
+            runtime["vae_precision_policy"],
         )
     finally:
         close_owned(display_fd, sys.exception())
@@ -406,7 +412,9 @@ def _match_publication_record(
         or runtime
         != {
             "dtype": publication.runtime_dtype,
-            "vae_dtype": publication.vae_dtype,
+            "vae_at_rest_dtype": publication.vae_at_rest_dtype,
+            "vae_compute_dtype": publication.vae_compute_dtype,
+            "vae_precision_policy": publication.vae_precision_policy,
         }
         or artifact["artifact_id"] != publication.artifact_id.value
         or artifact["file"] != "artifact.png"
@@ -510,18 +518,25 @@ def _valid_v2(raw: dict[str, object]) -> bool:
 def _valid_v3(raw: dict[str, object]) -> bool:
     return _valid_v2(raw) and raw.get("runtime") == {
         "dtype": "float16",
-        "vae_dtype": "float32",
+        "vae_at_rest_dtype": "float16",
+        "vae_compute_dtype": "float32",
+        "vae_precision_policy": "diffusers_force_upcast_roundtrip_v1",
     }
 
 
 def _evidence_runtime(material: dict[str, object]) -> dict[str, str]:
     runtime = material.get("runtime")
-    if type(runtime) is not dict or (
-        runtime.get("dtype"),
-        runtime.get("vae_dtype"),
-    ) != ("float16", "float32"):
+    expected = {
+        "dtype": "float16",
+        "vae_at_rest_dtype": "float16",
+        "vae_compute_dtype": "float32",
+        "vae_precision_policy": "diffusers_force_upcast_roundtrip_v1",
+    }
+    if type(runtime) is not dict or {
+        key: runtime.get(key) for key in expected
+    } != expected:
         raise _domain("invalid preview execution runtime")
-    return {"dtype": "float16", "vae_dtype": "float32"}
+    return expected
 
 
 def _remove_display_file(root_fd: int, root_dev: int, name: str) -> bool:

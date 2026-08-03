@@ -28,7 +28,9 @@ def _publication(run_id: str) -> PreviewEvidencePublication:
         (512, 512),
         "ENGINEERING_ONLY",
         "float16",
+        "float16",
         "float32",
+        "diffusers_force_upcast_roundtrip_v1",
     )
 
 
@@ -289,6 +291,30 @@ def test_cleanup_failure_closes_remaining_resources_and_releases_lane(
     next_lease.close()
     for descriptor in descriptors:
         os.close(descriptor)
+
+
+def test_runtime_integrity_failure_has_dedicated_unavailable_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import specstyle.workflow.preview_run_one as module
+    from specstyle.generation.preview_diffusers_backend import (
+        _PreviewRuntimeIntegrityError,
+    )
+
+    class Backend:
+        def __init__(self, *_args: object) -> None:
+            pass
+
+        def generate(self, _request: object) -> object:
+            raise _PreviewRuntimeIntegrityError("preview runtime integrity failed")
+
+    monkeypatch.setattr(module, "PreviewDiffusersBackend", Backend)
+    with pytest.raises(module._PreviewRunFailure) as raised:
+        module._generate_artifact(
+            object(), type("Input", (), {"style_assets": object()})(), object()
+        )
+    assert raised.value.status is module.PreviewRunStatus.UNAVAILABLE
+    assert raised.value.reason_code == "RUNTIME_INTEGRITY_FAILED"
 
 
 def test_invalid_preview_config_isolated_as_unavailable(

@@ -68,7 +68,10 @@ class PreviewWallEvidenceItem:
                 publication.schema_version != "specstyle.preview.evidence.v3"
                 or publication.evidence_class != "ENGINEERING_ONLY"
                 or publication.runtime_dtype != "float16"
-                or publication.vae_dtype != "float32"
+                or publication.vae_at_rest_dtype != "float16"
+                or publication.vae_compute_dtype != "float32"
+                or publication.vae_precision_policy
+                != "diffusers_force_upcast_roundtrip_v1"
                 or publication.evidence_name != self.run_id
                 or publication.variation_index != self.variation_index
             ):
@@ -103,7 +106,9 @@ def _item_primitive(item: PreviewWallEvidenceItem) -> dict[str, object]:
             "execution_fingerprint": item.publication.execution_fingerprint.value,
             "evidence_schema_version": item.publication.schema_version,
             "runtime_dtype": item.publication.runtime_dtype,
-            "vae_dtype": item.publication.vae_dtype,
+            "vae_at_rest_dtype": item.publication.vae_at_rest_dtype,
+            "vae_compute_dtype": item.publication.vae_compute_dtype,
+            "vae_precision_policy": item.publication.vae_precision_policy,
             "seed_algorithm": item.publication.seed_algorithm,
             "seed": item.publication.seed,
             "resolution": list(item.publication.resolution),

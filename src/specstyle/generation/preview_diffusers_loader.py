@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import gc
+import hashlib
 import importlib
+import json
 import math
+import sys
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -37,7 +40,24 @@ _LORA_FUSE_SCALE = 1.0
 _LORA_ADAPTER_NAME = "specstyle_lcm"
 _PEFT_VERSION = "0.18.1"
 _RUNTIME_DTYPE = "float16"
-_VAE_DTYPE = "float32"
+_VAE_AT_REST_DTYPE = "float16"
+_VAE_COMPUTE_DTYPE = "float32"
+_VAE_PRECISION_POLICY = "diffusers_force_upcast_roundtrip_v1"
+_VAE_HASH_DOMAIN = b"specstyle.preview.vae-tensor-integrity.v1\x00"
+_DTYPE_BYTES = {
+    "bfloat16": 2,
+    "bool": 1,
+    "complex128": 16,
+    "complex64": 8,
+    "float16": 2,
+    "float32": 4,
+    "float64": 8,
+    "int16": 2,
+    "int32": 4,
+    "int64": 8,
+    "int8": 1,
+    "uint8": 1,
+}
 _PIPELINE_COMPONENTS = (
     "unet",
     "controlnet",
@@ -47,6 +67,10 @@ _PIPELINE_COMPONENTS = (
     "image_encoder",
     "feature_extractor",
 )
+
+
+class _PreviewPipelineIntegrityError(DomainError):
+    pass
 
 
 @dataclass(slots=True)
@@ -69,6 +93,9 @@ class _TensorIntegrity:
     tensor: Any
     version: int
     data_ptr: int | None
+    shape: tuple[int, ...]
+    dtype: str
+    content_sha256: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,10 +120,13 @@ class LoadedPreviewPipeline:
     _scheduler_identity: str = field(repr=False, compare=False)
     _scheduler_config_json: str = field(repr=False, compare=False)
     _lora_fuse_scale: float = field(repr=False, compare=False)
-    _vae_dtype: str = field(repr=False, compare=False)
+    _vae_at_rest_dtype: str = field(repr=False, compare=False)
+    _vae_compute_dtype: str = field(repr=False, compare=False)
+    _vae_precision_policy: str = field(repr=False, compare=False)
     _integrity: _PipelineIntegrity | None = field(repr=False, compare=False)
     _torch: Any = field(repr=False, compare=False)
     _closed: bool = field(repr=False, compare=False)
+    _poisoned: bool = field(repr=False, compare=False)
     _seal: object = field(repr=False, compare=False)
 
     def __init__(self, *_: object, **__: object) -> None:
@@ -139,40 +169,58 @@ class LoadedPreviewPipeline:
 
 
 def _validate_loaded_preview_pipeline(value: object, *, require_open: bool) -> None:
-    if (
-        type(value) is not LoadedPreviewPipeline
-        or getattr(value, "_seal", None) is not _CAPABILITY_SEAL
-        or type(getattr(value, "_graph", None)) is not PipelineGraph
-        or type(getattr(value, "_environment_hash", None)) is not Sha256
-        or type(getattr(value, "_runtime", None)) is not tuple
-        or len(value._runtime) != 4
-        or any(type(item) is not str for item in value._runtime)
-        or value._runtime[3] != _RUNTIME_DTYPE
-        or getattr(value, "_peft_version", None) != _PEFT_VERSION
-        or type(getattr(value, "_model_bindings_json", None)) is not str
-        or getattr(value, "_scheduler_identity", None) != _SCHEDULER_IDENTITY
-        or type(getattr(value, "_scheduler_config_json", None)) is not str
-        or getattr(value, "_lora_fuse_scale", None) != _LORA_FUSE_SCALE
-        or getattr(value, "_vae_dtype", None) != _VAE_DTYPE
-        or type(getattr(value, "_closed", None)) is not bool
-        or (
-            not getattr(value, "_closed", True)
-            and type(getattr(value, "_integrity", None)) is not _PipelineIntegrity
-        )
-    ):
-        raise DomainError("invalid loaded preview pipeline capability")
-    if require_open and (value._closed or value._pipeline is None):
-        raise DomainError("loaded preview pipeline is closed")
-    if require_open and (
-        value._pipeline is not value._pipeline_identity
-        or value._pipeline.scheduler is not value._scheduler_identity_object
-        or type(value._pipeline.scheduler) is not value._scheduler_type
-        or getattr(value._pipeline.vae, "dtype", None) is not value._torch.float32
-        or _canonical_scheduler_config(value._pipeline.scheduler.config)
-        != value._scheduler_config_json
-        or not _pipeline_integrity_matches(value._pipeline, value._integrity)
-    ):
-        raise DomainError("invalid loaded preview pipeline capability")
+    try:
+        if (
+            type(value) is not LoadedPreviewPipeline
+            or getattr(value, "_seal", None) is not _CAPABILITY_SEAL
+            or type(getattr(value, "_graph", None)) is not PipelineGraph
+            or type(getattr(value, "_environment_hash", None)) is not Sha256
+            or type(getattr(value, "_runtime", None)) is not tuple
+            or len(value._runtime) != 4
+            or any(type(item) is not str for item in value._runtime)
+            or value._runtime[3] != _RUNTIME_DTYPE
+            or getattr(value, "_peft_version", None) != _PEFT_VERSION
+            or type(getattr(value, "_model_bindings_json", None)) is not str
+            or getattr(value, "_scheduler_identity", None) != _SCHEDULER_IDENTITY
+            or type(getattr(value, "_scheduler_config_json", None)) is not str
+            or getattr(value, "_lora_fuse_scale", None) != _LORA_FUSE_SCALE
+            or getattr(value, "_vae_at_rest_dtype", None) != _VAE_AT_REST_DTYPE
+            or getattr(value, "_vae_compute_dtype", None) != _VAE_COMPUTE_DTYPE
+            or getattr(value, "_vae_precision_policy", None) != _VAE_PRECISION_POLICY
+            or type(getattr(value, "_closed", None)) is not bool
+            or type(getattr(value, "_poisoned", None)) is not bool
+            or (
+                not getattr(value, "_closed", True)
+                and type(getattr(value, "_integrity", None)) is not _PipelineIntegrity
+            )
+        ):
+            raise _PreviewPipelineIntegrityError(
+                "invalid loaded preview pipeline capability"
+            )
+        if require_open and value._poisoned:
+            raise _PreviewPipelineIntegrityError(
+                "preview pipeline runtime integrity failed"
+            )
+        if require_open and (value._closed or value._pipeline is None):
+            raise _PreviewPipelineIntegrityError("loaded preview pipeline is closed")
+        if require_open and (
+            value._pipeline is not value._pipeline_identity
+            or value._pipeline.scheduler is not value._scheduler_identity_object
+            or type(value._pipeline.scheduler) is not value._scheduler_type
+            or getattr(value._pipeline.vae, "dtype", None) is not value._torch.float16
+            or _canonical_scheduler_config(value._pipeline.scheduler.config)
+            != value._scheduler_config_json
+            or not _pipeline_integrity_matches(value._pipeline, value._integrity)
+        ):
+            raise _PreviewPipelineIntegrityError(
+                "invalid loaded preview pipeline capability"
+            )
+    except _PreviewPipelineIntegrityError:
+        raise
+    except Exception as exc:
+        raise _PreviewPipelineIntegrityError(
+            "invalid loaded preview pipeline capability"
+        ) from exc
 
 
 def _adapter_state(pipeline: Any) -> tuple[object, ...]:
@@ -210,6 +258,71 @@ def _tensor_data_ptr(tensor: Any) -> int | None:
     return value
 
 
+def _tensor_shape(tensor: Any) -> tuple[int, ...]:
+    try:
+        shape = tuple(tensor.shape)
+    except Exception as exc:
+        raise DomainError("invalid loaded preview pipeline capability") from exc
+    if any(type(item) is not int or item < 0 for item in shape):
+        raise DomainError("invalid loaded preview pipeline capability")
+    return shape
+
+
+def _tensor_dtype(tensor: Any) -> str:
+    try:
+        value = str(tensor.dtype)
+    except Exception as exc:
+        raise DomainError("invalid loaded preview pipeline capability") from exc
+    normalized = value.removeprefix("torch.")
+    if normalized not in _DTYPE_BYTES:
+        raise DomainError("invalid loaded preview pipeline capability")
+    return normalized
+
+
+def _vae_content_sha256(
+    name: str, tensor: Any, shape: tuple[int, ...], dtype: str
+) -> str:
+    snapshot = array = None
+    try:
+        metadata = json.dumps(
+            {
+                "byte_order": "little",
+                "dtype": dtype,
+                "layout": "C",
+                "name": name,
+                "shape": list(shape),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        ).encode("ascii")
+        snapshot = tensor.detach().to(device="cpu", copy=True).contiguous()
+        array = snapshot.numpy()
+        array_dtype = getattr(array, "dtype", None)
+        byteorder = getattr(array_dtype, "byteorder", "=")
+        if byteorder == ">" or (byteorder == "=" and sys.byteorder != "little"):
+            raise ValueError("non-little-endian tensor")
+        view = memoryview(array)
+        if not view.c_contiguous:
+            raise ValueError("non-contiguous tensor")
+        byte_view = view.cast("B")
+        expected_bytes = math.prod(shape) * _DTYPE_BYTES[dtype]
+        if byte_view.nbytes != expected_bytes:
+            raise ValueError("tensor byte length mismatch")
+        digest = hashlib.sha256()
+        digest.update(_VAE_HASH_DOMAIN)
+        digest.update(len(metadata).to_bytes(8, "big"))
+        digest.update(metadata)
+        digest.update(byte_view.nbytes.to_bytes(8, "big"))
+        digest.update(byte_view)
+        return digest.hexdigest()
+    except Exception as exc:
+        raise DomainError("invalid loaded preview pipeline capability") from exc
+    finally:
+        array = snapshot = None
+
+
 def _capture_tensor_integrity(
     components: tuple[tuple[str, Any], ...],
 ) -> tuple[_TensorIntegrity, ...]:
@@ -228,17 +341,27 @@ def _capture_tensor_integrity(
                 version = getattr(tensor, "_version", None)
                 if type(name) is not str or type(version) is not int or version < 0:
                     raise DomainError("invalid loaded preview pipeline capability")
+                full_name = f"{component_name}.{kind}.{name}"
+                shape = _tensor_shape(tensor)
+                dtype = _tensor_dtype(tensor)
                 captured.append(
                     _TensorIntegrity(
-                        f"{component_name}.{kind}.{name}",
+                        full_name,
                         tensor,
                         version,
                         _tensor_data_ptr(tensor),
+                        shape,
+                        dtype,
+                        (
+                            _vae_content_sha256(full_name, tensor, shape, dtype)
+                            if component_name == "vae"
+                            else None
+                        ),
                     )
                 )
     if not captured or len({item.name for item in captured}) != len(captured):
         raise DomainError("invalid loaded preview pipeline capability")
-    return tuple(captured)
+    return tuple(sorted(captured, key=lambda item: item.name))
 
 
 def _lora_layer_state(
@@ -303,7 +426,10 @@ def _tensor_integrity_matches(
         left.name == right.name
         and left.tensor is right.tensor
         and left.version == right.version
-        and left.data_ptr == right.data_ptr
+        and left.shape == right.shape
+        and left.dtype == right.dtype
+        and left.content_sha256 == right.content_sha256
+        and (left.data_ptr == right.data_ptr or left.name.startswith("vae."))
         for left, right in zip(current, expected, strict=True)
     )
 
@@ -446,10 +572,13 @@ def _issue_loaded_preview(
         "_scheduler_identity": _SCHEDULER_IDENTITY,
         "_scheduler_config_json": scheduler_config_json,
         "_lora_fuse_scale": _LORA_FUSE_SCALE,
-        "_vae_dtype": _VAE_DTYPE,
+        "_vae_at_rest_dtype": _VAE_AT_REST_DTYPE,
+        "_vae_compute_dtype": _VAE_COMPUTE_DTYPE,
+        "_vae_precision_policy": _VAE_PRECISION_POLICY,
         "_integrity": integrity,
         "_torch": torch,
         "_closed": False,
+        "_poisoned": False,
         "_seal": _CAPABILITY_SEAL,
     }
     for name, value in values.items():
@@ -487,7 +616,6 @@ def _build_preview_pipeline(
         raise InfrastructureError("preview pipeline loading failed")
     state.pipeline.scheduler = scheduler
     state.pipeline.to("cuda:0", torch.float16)
-    _normalize_vae_dtype(state.pipeline, torch)
     state.pipeline.load_ip_adapter(
         components["ip_adapter"].borrow_loader_path(),
         **_ip_adapter_kwargs(components["ip_adapter"].manifest.entrypoint),
@@ -502,17 +630,13 @@ def _build_preview_pipeline(
     return scheduler, _canonical_scheduler_config(scheduler.config), integrity
 
 
-def _normalize_vae_dtype(pipeline: Any, torch: Any) -> None:
-    vae = getattr(pipeline, "vae", None)
-    convert = getattr(vae, "to", None)
-    if not callable(convert):
-        raise InfrastructureError("preview VAE normalization failed")
-    try:
-        converted = convert(dtype=torch.float32)
-    except Exception as exc:
-        raise InfrastructureError("preview VAE normalization failed") from exc
-    if converted is not vae or getattr(vae, "dtype", None) is not torch.float32:
-        raise InfrastructureError("preview VAE normalization failed")
+def _poison_loaded_preview_pipeline(value: object) -> None:
+    if (
+        type(value) is not LoadedPreviewPipeline
+        or getattr(value, "_seal", None) is not _CAPABILITY_SEAL
+    ):
+        raise DomainError("invalid loaded preview pipeline capability")
+    object.__setattr__(value, "_poisoned", True)
 
 
 def load_preview_pipeline(

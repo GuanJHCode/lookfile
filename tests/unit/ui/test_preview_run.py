@@ -58,7 +58,9 @@ def _publication(
         (512, 512),
         "ENGINEERING_ONLY",
         "float16",
+        "float16",
         "float32",
+        "diffusers_force_upcast_roundtrip_v1",
     )
 
 
