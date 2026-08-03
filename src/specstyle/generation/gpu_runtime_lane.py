@@ -73,4 +73,24 @@ def acquire_gpu_runtime_lane() -> GpuRuntimeLaneLease:
         raise
 
 
-__all__ = ("GpuRuntimeLaneLease", "acquire_gpu_runtime_lane")
+def try_acquire_gpu_runtime_lane() -> GpuRuntimeLaneLease | None:
+    """Return a lease immediately, or ``None`` when another lifecycle owns it."""
+    if not _LANE.acquire(blocking=False):
+        return None
+    try:
+        lease = object.__new__(GpuRuntimeLaneLease)
+        lease._closed = False
+        lease._lock = threading.Lock()
+        lease._seal = _LEASE_SEAL
+        _validate_lease(lease, require_open=True)
+        return lease
+    except BaseException:
+        _LANE.release()
+        raise
+
+
+__all__ = (
+    "GpuRuntimeLaneLease",
+    "acquire_gpu_runtime_lane",
+    "try_acquire_gpu_runtime_lane",
+)

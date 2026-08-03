@@ -50,3 +50,19 @@ def test_runtime_lane_lease_is_idempotent_and_nontransferable() -> None:
 
     with acquire_gpu_runtime_lane():
         pass
+
+
+def test_runtime_lane_try_acquire_reports_busy_without_blocking() -> None:
+    from specstyle.generation.gpu_runtime_lane import (
+        acquire_gpu_runtime_lane,
+        try_acquire_gpu_runtime_lane,
+    )
+
+    first = acquire_gpu_runtime_lane()
+    try:
+        assert try_acquire_gpu_runtime_lane() is None
+    finally:
+        first.close()
+    second = try_acquire_gpu_runtime_lane()
+    assert second is not None
+    second.close()
