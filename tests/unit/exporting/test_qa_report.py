@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 
 import pytest
 
 from specstyle.domain.identifiers import RuleId, Sha256
 from specstyle.errors import DomainError
 from specstyle.exporting import qa_report
+from specstyle.generation.output_profile_contracts import (
+    production_output_profile_capabilities,
+)
+from specstyle.spec.compiler import compile_style_spec
+from tests.unit.spec.test_compiler import context, raw_spec
 
 
 def test_canonical_json_normalizes_negative_zero() -> None:
@@ -124,3 +130,21 @@ def test_build_qa_report_canonical_bytes_are_stable() -> None:
     )
     assert first == second
     qa_report.assert_canonical_round_trip(first)
+
+
+def test_graph_primitive_adds_render_contract_only_for_rendered_v2_graph() -> None:
+    legacy = compile_style_spec(raw_spec(), context()).production_graphs[0]
+    rendered = replace(
+        legacy,
+        render_contract=production_output_profile_capabilities()[0].render_contract,
+    )
+
+    assert "render_contract" not in qa_report.graph_primitive(legacy)
+    assert qa_report.graph_primitive(rendered)["render_contract"] == {
+        "background": [255, 255, 255],
+        "final_resolution": [1080, 1080],
+        "fit": "contain_pad",
+        "overlay": "disabled",
+        "resampling": "lanczos",
+        "sequence_semantics": "single_static",
+    }

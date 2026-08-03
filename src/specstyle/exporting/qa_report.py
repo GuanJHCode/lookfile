@@ -657,7 +657,7 @@ def _graph_primitive(graph: CompiledExecutionGraph) -> dict[str, Any]:
         type(item) is not int or isinstance(item, bool) for item in graph.resolution
     ):
         raise DomainError("export invariant violation")
-    return {
+    primitive = {
         "base_model": _model_primitive(graph.base_model),
         "batch_execution": graph.batch_execution,
         "controlnet": {
@@ -676,6 +676,17 @@ def _graph_primitive(graph: CompiledExecutionGraph) -> dict[str, Any]:
         "steps": graph.steps,
         "strength_mapping_pin": pin_primitive(graph.strength_mapping_pin),
     }
+    if graph.render_contract is not None:
+        contract = graph.render_contract
+        primitive["render_contract"] = {
+            "background": list(contract.background),
+            "final_resolution": list(contract.final_resolution),
+            "fit": contract.fit,
+            "overlay": contract.overlay,
+            "resampling": contract.resampling,
+            "sequence_semantics": contract.sequence_semantics,
+        }
+    return primitive
 
 
 def attempt_primitive(

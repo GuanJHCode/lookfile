@@ -207,6 +207,36 @@ def _context_document(
     }
 
 
+def _v2_xhs_context_document(evidence: dict[str, str]) -> dict[str, Any]:
+    document = _context_document(evidence, status="DRAFT")
+    document["schema_version"] = "specstyle.production.context.v2"
+    document["output_profiles"] = [
+        {
+            "profile": "xhs_grid",
+            "pin": {
+                "id": "specstyle-output-renderer-xhs-grid",
+                "revision": "v1",
+                "sha256": (
+                    "ef8ec7971a7d8b8b61133c029efca0443ac679173fac39e69dcff34eaf044669"
+                ),
+            },
+            "final_resolution": [1080, 1080],
+            "fit": "contain_pad",
+            "resampling": "lanczos",
+            "background": [255, 255, 255],
+            "overlay": "disabled",
+            "sequence_semantics": "single_static",
+        }
+    ]
+    document.pop("output_profile")
+    catalog = document["rule_catalog"]
+    for rule in catalog["l1_rules"]:
+        rule["supported_output_profiles"] = ["xhs_grid"]
+    catalog["l2_item_rule"]["supported_output_profiles"] = ["xhs_grid"]
+    catalog["l2_batch_rule"]["supported_output_profiles"] = ["background_sequence"]
+    return document
+
+
 def _write_roots(tmp_path: Path, *, status: str = "VALIDATED") -> tuple[Path, Path]:
     config_root, evidence_root = tmp_path / "config", tmp_path / "evidence"
     config_root.mkdir(mode=0o700)
@@ -398,6 +428,68 @@ def test_loads_verified_context_without_retaining_paths_or_evidence_bytes(
             loaded.canny,
         )
     )
+
+
+def test_loads_v2_xhs_renderer_contract_into_compiler_context(tmp_path: Path) -> None:
+    config_root, evidence_root = _write_roots(tmp_path)
+    document = _read_document(config_root)
+    evidence = document["l2_threshold_profile"]["evidence"]
+    _write_document(config_root, _v2_xhs_context_document(evidence))
+
+    loaded = _load(config_root, evidence_root)
+
+    assert loaded.schema_version == "specstyle.production.context.v2"
+    assert tuple(item.profile for item in loaded.output_profiles) == ("xhs_grid",)
+    capability = loaded.output_profiles[0]
+    assert capability.pin == ResourcePin(
+        "specstyle-output-renderer-xhs-grid",
+        "v1",
+        Sha256("ef8ec7971a7d8b8b61133c029efca0443ac679173fac39e69dcff34eaf044669"),
+    )
+    assert capability.render_contract.final_resolution == (1080, 1080)
+    assert capability.render_contract.fit == "contain_pad"
+    assert capability.render_contract.overlay == "disabled"
+    assert all(
+        rule.supported_output_profiles == ("xhs_grid",)
+        for rule in loaded.rule_catalog.rules[:-1]
+    )
+    assert loaded.rule_catalog.rules[-1].supported_output_profiles == (
+        "background_sequence",
+    )
+
+
+def test_v2_rejects_a_renderer_pin_not_implemented_by_this_revision(
+    tmp_path: Path,
+) -> None:
+    config_root, evidence_root = _write_roots(tmp_path)
+    document = _read_document(config_root)
+    evidence = document["l2_threshold_profile"]["evidence"]
+    document = _v2_xhs_context_document(evidence)
+    document["output_profiles"][0]["pin"]["sha256"] = "0" * 64
+    _write_document(config_root, document)
+
+    with pytest.raises(
+        DomainError, match="^invalid production output renderer contract$"
+    ):
+        _load(config_root, evidence_root)
+
+
+def test_v2_rejects_configured_output_without_complete_required_l1_coverage(
+    tmp_path: Path,
+) -> None:
+    config_root, evidence_root = _write_roots(tmp_path)
+    document = _read_document(config_root)
+    evidence = document["l2_threshold_profile"]["evidence"]
+    document = _v2_xhs_context_document(evidence)
+    document["rule_catalog"]["l1_rules"][0]["supported_output_profiles"] = [
+        "talking_head_cover"
+    ]
+    _write_document(config_root, document)
+
+    with pytest.raises(
+        DomainError, match="^production output lacks required L1 coverage$"
+    ):
+        _load(config_root, evidence_root)
 
 
 def test_loaded_l1_rule_ids_match_authoritative_binding_order(tmp_path: Path) -> None:
@@ -2023,6 +2115,33 @@ def test_factory_context_compiles_only_exact_runtime_graph_and_pins(
     )
     assert compiled.verification_plans[0].l3_status == "NOT_APPLICABLE"
     assert compiled.verification_plans[0].l3_reason == "NO_L3_CONFIG"
+
+
+def test_v2_compiler_graph_keeps_native_and_final_output_resolutions_separate(
+    tmp_path: Path,
+) -> None:
+    module = importlib.import_module("specstyle.production.context_config")
+    config_root, evidence_root = _write_roots(tmp_path)
+    document = _read_document(config_root)
+    evidence = document["l2_threshold_profile"]["evidence"]
+    _write_document(config_root, _v2_xhs_context_document(evidence))
+    environment, graph = _factory_environment(), _factory_graph()
+    preprocessing_version = "clip-preprocess-v1"
+    context = module.make_production_compiler_context_factory(
+        _load(config_root, evidence_root), environment, graph
+    )(preprocessing_version)
+    raw = _raw_for_factory(context, environment, graph, preprocessing_version)
+
+    compiled = compile_style_spec(raw, context)
+    production_graph = compiled.production_graphs[0]
+
+    assert production_graph.resolution == tuple(raw.profiles.production.resolution)
+    assert production_graph.render_contract is not None
+    assert production_graph.render_contract.final_resolution == (1080, 1080)
+    assert (
+        production_graph.output_profile_pin
+        == context.output_profile_capabilities[0].pin
+    )
 
 
 @pytest.mark.parametrize("mismatch", ("runtime", "model", "threshold"))

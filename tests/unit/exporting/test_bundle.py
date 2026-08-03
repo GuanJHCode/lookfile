@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 import os
 import stat
@@ -10,12 +11,17 @@ from pathlib import Path
 import pytest
 from PIL import Image
 
+from specstyle.domain.artifacts import ArtifactRef
 from specstyle.domain.enums import RepairStopReason, RuleStatus
 from specstyle.errors import DomainError
 from specstyle.exporting.bundle import ExportedFile, export_bundle
 from specstyle.exporting.manifest import ExportCohort, ExportItem, _prepare_export
 from specstyle.generation.fake_backend import FakeBackend
-from specstyle.generation.protocols import run_generation
+from specstyle.generation.output_profile_contracts import (
+    production_output_profile_capabilities,
+)
+from specstyle.generation.output_profiles import render_production_output
+from specstyle.generation.protocols import GeneratedArtifact, run_generation
 from specstyle.observability.hashing import hash_bytes
 from specstyle.repair.history import start_repair_history
 from specstyle.repair.loop import RepairTerminal
@@ -27,7 +33,6 @@ from tests.unit.exporting.test_manifest import (
     _export_request,
     _production_request,
 )
-
 # 复用 EXP-001A 的 frozen input 构造器；不修改 A 文件。
 
 
@@ -90,6 +95,54 @@ def _manual_review_request():
     )
     cohort = ExportCohort("xhs_grid", report, (item,))
     return _build_request((cohort,), _credits(request))
+
+
+def _rendered_v2_request():
+    legacy = _production_request()
+    capability = production_output_profile_capabilities()[0]
+    compiled = replace(
+        legacy.compiled_spec,
+        production_graphs=(
+            replace(
+                legacy.compiled_spec.production_graphs[0],
+                output_profile_pin=capability.pin,
+                render_contract=capability.render_contract,
+            ),
+        ),
+        verification_plans=(
+            replace(
+                legacy.compiled_spec.verification_plans[0],
+                output_profile_pin=capability.pin,
+            ),
+        ),
+    )
+    request = replace(legacy, compiled_spec=compiled)
+    native = run_generation(FakeBackend(), request)
+    content = render_production_output(native.content, capability)
+    artifact = GeneratedArtifact(
+        ArtifactRef(native.ref.artifact_id, hash_bytes(content)),
+        content,
+        native.request_hash,
+        native.generation_fingerprint,
+    )
+    plan = compiled.verification_plans[0]
+    report = VerificationReport(
+        (artifact.ref,),
+        plan.applicable_rule_definitions,
+        tuple(
+            RuleResult(rule.rule_id, RuleStatus.PASS, (artifact.ref.artifact_id,), None)
+            for rule in plan.applicable_rule_definitions
+        ),
+    )
+    history = start_repair_history(request, artifact, report)
+    item = ExportItem(
+        history,
+        _terminal(report, artifact, reason=RepairStopReason.PASS_ALL_REQUIRED),
+        None,
+    )
+    return _build_request(
+        (ExportCohort("xhs_grid", report, (item,)),), _credits(request)
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -344,6 +397,18 @@ def test_png_readback_resolution_mode_frames_metadata(tmp_path: Path) -> None:
             assert im.info == {}
             rel = png.relative_to(bundle_root).as_posix()
             assert (im.width, im.height) == res_by_path[rel]
+
+
+def test_rendered_v2_png_readback_uses_final_resolution(tmp_path: Path) -> None:
+    root_fd = _root_fd(tmp_path)
+    try:
+        export_bundle(_rendered_v2_request(), root_fd, "rendered_v2")
+    finally:
+        os.close(root_fd)
+
+    png = next((tmp_path / "rendered_v2" / "approved" / "xhs_grid").glob("*.png"))
+    with Image.open(png) as image:
+        assert image.size == (1080, 1080)
 
 
 # --------------------------------------------------------------------------- #

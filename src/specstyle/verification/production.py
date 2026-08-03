@@ -648,8 +648,10 @@ def _l1_results(
     dimensions_status = pixels_status = None
     if decoded is not None:
         artifact_id = artifact.ref.artifact_id
+        graph = verifier._canonical.request.graph
+        expected = graph.final_output_resolution
         dimensions_status = check_dimensions_decoded(
-            artifact_id, decoded, verifier._canonical.request.graph.resolution
+            artifact_id, decoded, expected
         ).status
         pixels_status = check_pixels_decoded(artifact_id, decoded).status
     results: dict[RuleId, RuleResult] = {}

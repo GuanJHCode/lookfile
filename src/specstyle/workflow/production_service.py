@@ -8,7 +8,7 @@ from enum import StrEnum
 import threading
 from typing import Any, Callable
 
-from specstyle.domain.artifacts import AssetRef
+from specstyle.domain.artifacts import ArtifactRef, AssetRef
 from specstyle.domain.enums import ArtifactStatus
 from specstyle.domain.identifiers import AttemptId, JobId
 from specstyle.errors import DomainError, InfrastructureError, _GpuOutOfMemoryError
@@ -19,6 +19,7 @@ from specstyle.generation.diffusers_loader import (
     load_production_pipeline,
 )
 from specstyle.generation.model_approval import VerifiedPipelineSupply
+from specstyle.generation.output_profiles import render_production_output
 from specstyle.generation.pipeline_factory import PipelineGraph
 from specstyle.generation.preprocess import PreparedImage
 from specstyle.generation.protocols import (
@@ -32,6 +33,7 @@ from specstyle.observability.environment import (
     EnvironmentSnapshot,
     hash_environment,
 )
+from specstyle.observability.hashing import hash_bytes
 from specstyle.repair.history import RepairHistory
 from specstyle.repair.loop import NextGeneration, RepairTerminal
 from specstyle.spec.compiled_models import (
@@ -40,6 +42,7 @@ from specstyle.spec.compiled_models import (
     CompiledVerificationPlan,
     CompilerContext,
     OutputProfile,
+    OutputProfileCapability,
 )
 from specstyle.spec.compiler import compile_style_spec
 from specstyle.spec.loader import load_style_spec_text
@@ -422,7 +425,24 @@ def _run_initial_generation(
             raise InfrastructureError("invalid generation backend")
         if cancel_event is not None:
             backend._bind_cancel_event(cancel_event)
-    return run_generation(backend, request)
+    artifact = run_generation(backend, request)
+    contract = request.graph.render_contract
+    if contract is None:
+        return artifact
+    capability = OutputProfileCapability(
+        request.graph.output_profile_pin,
+        request.output_profile,
+        ("product_instance",),
+        ("preview", "production"),
+        contract,
+    )
+    content = render_production_output(artifact.content, capability)
+    return GeneratedArtifact(
+        ArtifactRef(artifact.ref.artifact_id, hash_bytes(content)),
+        content,
+        artifact.request_hash,
+        artifact.generation_fingerprint,
+    )
 
 
 def _record_generation_fatal(

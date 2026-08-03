@@ -1161,13 +1161,48 @@ def _resolution_by_path(manifest_bytes: bytes) -> dict[str, tuple[int, int]]:
             graph = initial.get("graph")
             if type(path) is not str or type(graph) is not dict:
                 _hash_mismatch()
-            resolution = graph.get("resolution")
-            if type(resolution) is not list or len(resolution) != 2:
-                _hash_mismatch()
-            if type(resolution[0]) is not int or type(resolution[1]) is not int:
-                _hash_mismatch()
-            result[path] = (resolution[0], resolution[1])
+            result[path] = _final_graph_resolution(graph)
     return result
+
+
+def _final_graph_resolution(graph: dict[str, object]) -> tuple[int, int]:
+    resolution = graph.get("resolution")
+    if not _valid_resolution(resolution):
+        _hash_mismatch()
+    contract = graph.get("render_contract")
+    if contract is None:
+        return (resolution[0], resolution[1])
+    if type(contract) is not dict or set(contract) != {
+        "background",
+        "final_resolution",
+        "fit",
+        "overlay",
+        "resampling",
+        "sequence_semantics",
+    }:
+        _hash_mismatch()
+    background = contract["background"]
+    final = contract["final_resolution"]
+    if (
+        not _valid_resolution(final)
+        or type(background) is not list
+        or len(background) != 3
+        or any(type(item) is not int or not 0 <= item <= 255 for item in background)
+        or contract["fit"] not in ("contain_pad", "cover_center")
+        or contract["overlay"] != "disabled"
+        or contract["resampling"] != "lanczos"
+        or contract["sequence_semantics"] != "single_static"
+    ):
+        _hash_mismatch()
+    return (final[0], final[1])
+
+
+def _valid_resolution(value: object) -> bool:
+    return (
+        type(value) is list
+        and len(value) == 2
+        and all(type(item) is int and item > 0 for item in value)
+    )
 
 
 def _verify_inventory(staging_fd: int, expected: set[str]) -> None:

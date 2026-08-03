@@ -22,7 +22,7 @@ from specstyle.errors import DomainError, InfrastructureError
 from specstyle.generation.requests import RenderedPrompt
 from specstyle.generation.preprocess import PreprocessPlan, preprocess_image
 from specstyle.observability.hashing import hash_bytes
-from specstyle.spec.compiled_models import ResourcePin
+from specstyle.spec.compiled_models import OutputProfileCapability, ResourcePin
 from tests.unit.spec.test_compiler import raw_spec
 
 
@@ -227,7 +227,7 @@ def _write(path: Path, content: bytes) -> int:
     return os.open(path, os.O_RDONLY)
 
 
-def _context():
+def _context(profile: str = "xhs_grid"):
     module = importlib.import_module("specstyle.production.context_config")
     config = object.__new__(module.ProductionContextConfig)
     pin = ResourcePin("processor", "r1", hash_bytes(b"processor"))
@@ -236,6 +236,18 @@ def _context():
         "source_preprocess",
         SimpleNamespace(
             processor_pin=pin, resize_mode="contain_pad", background=(255, 255, 255)
+        ),
+    )
+    object.__setattr__(
+        config,
+        "output_profiles",
+        (
+            OutputProfileCapability(
+                ResourcePin(f"{profile}-output", "r1", hash_bytes(profile.encode())),
+                profile,
+                ("product_instance",),
+                ("preview", "production"),
+            ),
         ),
     )
     object.__setattr__(config, "_seal", module._CONFIG_SEAL)
@@ -295,6 +307,21 @@ def test_production_spec_preflight_returns_the_validated_batch_contract() -> Non
 
     data = raw_spec().model_dump(mode="json")
     data["repair"]["policy_version"] = "1.0"
+    summary = validate_production_job_spec_text(json.dumps(data))
+
+    assert summary == ProductionJobSpecSummary("preset", 1)
+
+
+def test_production_spec_preflight_accepts_one_nonlegacy_output_profile() -> None:
+    from specstyle.workflow.production_job_input import (
+        ProductionJobSpecSummary,
+        validate_production_job_spec_text,
+    )
+
+    data = raw_spec().model_dump(mode="json")
+    data["repair"]["policy_version"] = "1.0"
+    data["outputs"]["profiles"] = ["talking_head_cover"]
+
     summary = validate_production_job_spec_text(json.dumps(data))
 
     assert summary == ProductionJobSpecSummary("preset", 1)
@@ -447,6 +474,35 @@ def test_open_carries_a_nonzero_variation_into_the_request(tmp_path: Path) -> No
         issued = module.open_production_job_input(*args, variation_index=7)
         assert issued.request.variation_index == 7
         assert issued.style_assets(issued.request.style_references[0]) == normalized
+        issued.close()
+    finally:
+        for fd in reversed(fds):
+            os.close(fd)
+
+
+def test_open_derives_the_single_output_profile_from_the_spec(tmp_path: Path) -> None:
+    module = importlib.import_module("specstyle.workflow.production_job_input")
+    style = _png("blue")
+    normalized = _normalized_style(style)
+    data = json.loads(_spec(hash_bytes(normalized).value))
+    data["outputs"]["profiles"] = ["talking_head_cover"]
+    root = tmp_path / "cas"
+    root.mkdir(mode=0o700)
+    fds = (
+        _write(tmp_path / "source", _png("red")),
+        _write(tmp_path / "style", style),
+        _write(tmp_path / "spec", json.dumps(data, separators=(",", ":")).encode()),
+        os.open(root, os.O_RDONLY | os.O_DIRECTORY),
+    )
+    try:
+        issued = module.open_production_job_input(
+            *fds,
+            _load(_metadata()),
+            _context("talking_head_cover"),
+            JobId("job-talking"),
+            "bundle-talking",
+        )
+        assert issued.request.output_profile == "talking_head_cover"
         issued.close()
     finally:
         for fd in reversed(fds):

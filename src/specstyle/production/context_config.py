@@ -21,6 +21,11 @@ from specstyle.production._fd_ownership import (
     _duplicate_directory_fd,
 )
 from specstyle.production.config_io import _load_json_document_from_owned_root
+from specstyle.production.output_profile_config import (
+    copy_output_profile,
+    parse_legacy_output_profile,
+    parse_output_profiles_v2,
+)
 from specstyle.spec.compiled_models import (
     CompilerContext,
     EncoderCapability,
@@ -45,13 +50,14 @@ __all__ = (
     "make_production_compiler_context_factory",
 )
 
-_SCHEMA_VERSION = "specstyle.production.context.v1"
+_SCHEMA_V1 = "specstyle.production.context.v1"
+_SCHEMA_V2 = "specstyle.production.context.v2"
 _CONFIG_BYTES = 1024 * 1024
 _EVIDENCE_BYTES = 16 * 1024 * 1024
 _EVIDENCE_TOTAL_BYTES = 48 * 1024 * 1024
 _READ_BYTES = 1024 * 1024
 _CONFIG_SEAL = object()
-_TOP_KEYS = {
+_TOP_KEYS_V1 = {
     "schema_version",
     "compiler_pin",
     "model_support",
@@ -62,6 +68,7 @@ _TOP_KEYS = {
     "source_preprocess",
     "canny",
 }
+_TOP_KEYS_V2 = (_TOP_KEYS_V1 - {"output_profile"}) | {"output_profiles"}
 _PIN_KEYS = {"id", "revision", "sha256"}
 _MODEL_SUPPORT_KEYS = {"role", "supported_pipelines"}
 _MAPPING_KEYS = {"pin", "preset_id", "entries"}
@@ -79,6 +86,8 @@ _CATALOG_KEYS = {
 }
 _L1_RULE_KEYS = {"rule_id", "verifier_pin", "priority", "affected_by_actions"}
 _L2_RULE_KEYS = _L1_RULE_KEYS | {"metric_id"}
+_L1_RULE_V2_KEYS = _L1_RULE_KEYS | {"supported_output_profiles"}
+_L2_RULE_V2_KEYS = _L2_RULE_KEYS | {"supported_output_profiles"}
 _THRESHOLD_KEYS = {
     "pin",
     "logical_name",
@@ -174,7 +183,7 @@ class ProductionContextConfig:
     compiler_pin: ResourcePin
     model_support: tuple[_ModelSupport, ...]
     strength_mapping: StrengthMappingCapability
-    output_profile: OutputProfileCapability
+    output_profiles: tuple[OutputProfileCapability, ...]
     rule_catalog: RuleCatalogCapability
     l2_threshold_profile: _L2ThresholdProfile
     source_preprocess: _SourcePreprocess
@@ -183,6 +192,12 @@ class ProductionContextConfig:
 
     def __init__(self, *_args: object, **_kwargs: object) -> None:
         raise TypeError("production context configs are issued only by the loader")
+
+    @property
+    def output_profile(self) -> OutputProfileCapability:
+        if len(self.output_profiles) != 1:
+            raise DomainError("production context has multiple output profiles")
+        return self.output_profiles[0]
 
 
 def _exact(value: object, keys: set[str], label: str) -> dict[str, Any]:
@@ -202,9 +217,37 @@ def _actions(value: object) -> tuple[Identifier, ...]:
     return tuple(Identifier(item) for item in value)
 
 
-def _rule(value: object, *, kind: str, scope: RuleScope, outputs: tuple[str, ...]):
-    raw = _exact(
-        value, _L1_RULE_KEYS if kind == "L1_TECHNICAL" else _L2_RULE_KEYS, "rule"
+def _configured_outputs(value: object) -> tuple[str, ...]:
+    if type(value) is not list or not value:
+        raise DomainError("invalid production context rule outputs")
+    outputs = tuple(value)
+    allowed = ("xhs_grid", "talking_head_cover", "background_sequence")
+    if (
+        any(type(item) is not str or item not in allowed for item in outputs)
+        or len(set(outputs)) != len(outputs)
+        or outputs != tuple(item for item in allowed if item in outputs)
+    ):
+        raise DomainError("invalid production context rule outputs")
+    return outputs
+
+
+def _rule(
+    value: object,
+    *,
+    kind: str,
+    scope: RuleScope,
+    outputs: tuple[str, ...] | None,
+):
+    keys = (
+        (_L1_RULE_V2_KEYS if kind == "L1_TECHNICAL" else _L2_RULE_V2_KEYS)
+        if outputs is None
+        else (_L1_RULE_KEYS if kind == "L1_TECHNICAL" else _L2_RULE_KEYS)
+    )
+    raw = _exact(value, keys, "rule")
+    supported = (
+        _configured_outputs(raw["supported_output_profiles"])
+        if outputs is None
+        else outputs
     )
     metric = None if kind == "L1_TECHNICAL" else Identifier(raw["metric_id"])
     return RuleCapability(
@@ -214,7 +257,7 @@ def _rule(value: object, *, kind: str, scope: RuleScope, outputs: tuple[str, ...
         scope,
         "always_required" if kind == "L1_TECHNICAL" else "always_advisory",
         ("product_instance",),
-        outputs,
+        supported,
         _pin(raw["verifier_pin"]),
         "none" if metric is None else "l2",
         metric,
@@ -223,12 +266,18 @@ def _rule(value: object, *, kind: str, scope: RuleScope, outputs: tuple[str, ...
     )
 
 
-def _catalog(value: object) -> RuleCatalogCapability:
+def _catalog(value: object, schema_version: str) -> RuleCatalogCapability:
     raw = _exact(value, _CATALOG_KEYS, "rule catalog")
     if type(raw["l1_rules"]) is not list:
         raise DomainError("invalid production context rule catalog")
+    v2 = schema_version == _SCHEMA_V2
     l1 = tuple(
-        _rule(item, kind="L1_TECHNICAL", scope=RuleScope.ITEM, outputs=("xhs_grid",))
+        _rule(
+            item,
+            kind="L1_TECHNICAL",
+            scope=RuleScope.ITEM,
+            outputs=None if v2 else ("xhs_grid",),
+        )
         for item in raw["l1_rules"]
     )
     if tuple(rule.rule_id for rule in l1) != tuple(
@@ -239,7 +288,7 @@ def _catalog(value: object) -> RuleCatalogCapability:
         raw["l2_item_rule"],
         kind="L2_STYLE_FIDELITY",
         scope=RuleScope.ITEM,
-        outputs=("xhs_grid",),
+        outputs=None if v2 else ("xhs_grid",),
     )
     if item.metric_id != Identifier(_L2_METRIC):
         raise DomainError("invalid production L2 item metric")
@@ -247,7 +296,7 @@ def _catalog(value: object) -> RuleCatalogCapability:
         raw["l2_batch_rule"],
         kind="L2_BATCH_CONSISTENCY",
         scope=RuleScope.BATCH,
-        outputs=("background_sequence",),
+        outputs=None if v2 else ("background_sequence",),
     )
     return RuleCatalogCapability(
         raw["ruleset_version"], _pin(raw["pin"]), l1 + (item, batch)
@@ -308,13 +357,6 @@ def _model_support(value: object) -> tuple[_ModelSupport, ...]:
     if tuple(item.role for item in supported) != _MODEL_ROLES:
         raise DomainError("invalid production model support")
     return supported
-
-
-def _output(value: object) -> OutputProfileCapability:
-    raw = _exact(value, {"pin"}, "output")
-    return OutputProfileCapability(
-        _pin(raw["pin"]), "xhs_grid", ("product_instance",), ("preview", "production")
-    )
 
 
 def _source(value: object) -> _SourcePreprocess:
@@ -456,13 +498,27 @@ def _issue(document: dict[str, Any]) -> ProductionContextConfig:
     if threshold.style_pack_id != mapping.preset_id:
         raise DomainError("invalid production threshold style pack")
     issued = object.__new__(ProductionContextConfig)
+    schema_version = document["schema_version"]
+    outputs = (
+        (parse_legacy_output_profile(document["output_profile"]),)
+        if schema_version == _SCHEMA_V1
+        else parse_output_profiles_v2(document["output_profiles"])
+    )
+    catalog = _catalog(document["rule_catalog"], schema_version)
+    profiles = {item.profile for item in outputs}
+    if any(
+        rule.level is RuleLevel.L1
+        and not profiles.issubset(rule.supported_output_profiles)
+        for rule in catalog.rules
+    ):
+        raise DomainError("production output lacks required L1 coverage")
     values = (
         ("schema_version", document["schema_version"]),
         ("compiler_pin", _pin(document["compiler_pin"])),
         ("model_support", _model_support(document["model_support"])),
         ("strength_mapping", mapping),
-        ("output_profile", _output(document["output_profile"])),
-        ("rule_catalog", _catalog(document["rule_catalog"])),
+        ("output_profiles", outputs),
+        ("rule_catalog", catalog),
         ("l2_threshold_profile", threshold),
         ("source_preprocess", _source(document["source_preprocess"])),
         ("canny", _canny(document["canny"])),
@@ -502,9 +558,16 @@ def load_production_context_config(
             owned_config_root_fd, "context.json", _CONFIG_BYTES, owned
         )
         try:
-            document = _exact(document, _TOP_KEYS, "document")
-            if document["schema_version"] != _SCHEMA_VERSION:
+            if type(document) is not dict:
+                raise DomainError("invalid production context document")
+            schema_version = document.get("schema_version")
+            if schema_version not in (_SCHEMA_V1, _SCHEMA_V2):
                 raise DomainError("invalid production context schema")
+            document = _exact(
+                document,
+                _TOP_KEYS_V1 if schema_version == _SCHEMA_V1 else _TOP_KEYS_V2,
+                "document",
+            )
             issued = _issue(document)
         except DomainError:
             raise
@@ -540,15 +603,6 @@ def _copy_mapping(value: StrengthMappingCapability) -> StrengthMappingCapability
             )
             for item in value.entries
         ),
-    )
-
-
-def _copy_output(value: OutputProfileCapability) -> OutputProfileCapability:
-    return OutputProfileCapability(
-        _copy_pin(value.pin),
-        str(value.profile),
-        tuple(str(item) for item in value.supported_domains),
-        tuple(str(item) for item in value.supported_generation_profiles),
     )
 
 
@@ -710,7 +764,7 @@ def _context(
             ),
         ),
         (_copy_mapping(config.strength_mapping),),
-        (_copy_output(config.output_profile),),
+        tuple(copy_output_profile(item) for item in config.output_profiles),
         (_copy_catalog(config.rule_catalog),),
         (_copy_threshold(config.l2_threshold_profile, encoder_pin),),
         (),

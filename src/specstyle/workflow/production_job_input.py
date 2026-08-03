@@ -404,7 +404,7 @@ def _assert_plain(value: object) -> None:
 
 def _validate_spec(raw: object) -> tuple[object, str, tuple[int, int]]:
     if (
-        raw.outputs.profiles != ("xhs_grid",)
+        len(raw.outputs.profiles) != 1
         or len(raw.assets.style_references) != 1
         or raw.repair.policy_version != "1.0"
         or raw.repair.max_rounds != 1
@@ -671,6 +671,11 @@ def open_production_job_input(
         raw, spec_text, resolution, source_ref, source, style_ref, style_content = (
             _load_materials(source_fd, style_fd, spec_fd, metadata, context_config)
         )
+        output_profile = raw.outputs.profiles[0]
+        if output_profile not in tuple(
+            item.profile for item in context_config.output_profiles
+        ):
+            raise _domain()
         _store_style(
             style_asset_root_fd, style_ref.sha256.value, style_content, resolution
         )
@@ -683,7 +688,7 @@ def open_production_job_input(
             source,
             (style_ref,),
             metadata.prompt,
-            "xhs_grid",
+            output_profile,
             variation_index,
             bundle_name,
         )

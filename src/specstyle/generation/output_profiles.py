@@ -5,10 +5,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from io import BytesIO
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 from specstyle.errors import DomainError
+from specstyle.generation.output_profile_contracts import (
+    production_output_profile_capabilities,
+)
 from specstyle.observability.hashing import hash_bytes
+from specstyle.spec.compiled_models import OutputProfileCapability
 
 OutputProfileName = str  # xhs_grid | talking_head_cover | background_sequence
 
@@ -70,3 +74,65 @@ def render_output_profile(
 
 def profile_content_hash(png: bytes) -> str:
     return hash_bytes(png).value
+
+
+def _implemented_capability(value: object) -> OutputProfileCapability:
+    if type(value) is not OutputProfileCapability:
+        raise DomainError("invalid output renderer contract")
+    matched = tuple(
+        item
+        for item in production_output_profile_capabilities()
+        if item.profile == value.profile
+    )
+    if matched != (value,) or value.render_contract is None:
+        raise DomainError("invalid output renderer contract")
+    return matched[0]
+
+
+def _decode_source(content: object) -> Image.Image:
+    if type(content) is not bytes or not content:
+        raise DomainError("invalid source image")
+    try:
+        image = Image.open(BytesIO(content))
+        image.load()
+    except (OSError, ValueError):
+        raise DomainError("invalid source image") from None
+    if image.mode != "RGB" or getattr(image, "n_frames", 1) != 1 or image.info:
+        image.close()
+        raise DomainError("invalid source image")
+    return image
+
+
+def _render_image(
+    image: Image.Image, capability: OutputProfileCapability
+) -> Image.Image:
+    contract = capability.render_contract
+    if contract is None:  # pragma: no cover - guarded by _implemented_capability
+        raise DomainError("invalid output renderer contract")
+    size = contract.final_resolution
+    if contract.fit == "contain_pad":
+        resized = ImageOps.contain(image, size, Image.Resampling.LANCZOS)
+        output = Image.new("RGB", size, contract.background)
+        offset = ((size[0] - resized.width) // 2, (size[1] - resized.height) // 2)
+        output.paste(resized, offset)
+        resized.close()
+        return output
+    return ImageOps.fit(image, size, Image.Resampling.LANCZOS, centering=(0.5, 0.5))
+
+
+def render_production_output(
+    source_png: bytes, capability: OutputProfileCapability, /
+) -> bytes:
+    """Render one final Production artifact under an exact built-in contract."""
+    capability = _implemented_capability(capability)
+    source = _decode_source(source_png)
+    output = None
+    try:
+        output = _render_image(source, capability)
+        encoded = BytesIO()
+        output.save(encoded, format="PNG", optimize=False, compress_level=9)
+        return encoded.getvalue()
+    finally:
+        if output is not None:
+            output.close()
+        source.close()

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+import importlib
 from pathlib import Path
 
 import pytest
@@ -105,6 +107,46 @@ def test_output_profiles_sizes_and_deterministic() -> None:
         assert a == b
         img = Image.open(BytesIO(a))
         assert img.size == layout.size
+
+
+def test_pinned_xhs_renderer_contains_without_stretch_or_overlay() -> None:
+    from io import BytesIO
+
+    from PIL import Image
+
+    module = importlib.import_module("specstyle.generation.output_profiles")
+    assert hasattr(module, "render_production_output")
+    contracts = importlib.import_module("specstyle.generation.output_profile_contracts")
+    capability = contracts.production_output_profile_capabilities()[0]
+    source = BytesIO()
+    Image.new("RGB", (80, 40), (200, 10, 20)).save(source, format="PNG")
+
+    first = module.render_production_output(source.getvalue(), capability)
+    second = module.render_production_output(source.getvalue(), capability)
+
+    assert first == second
+    rendered = Image.open(BytesIO(first))
+    assert rendered.mode == "RGB"
+    assert rendered.size == (1080, 1080)
+    assert rendered.info == {}
+    assert rendered.getpixel((540, 540)) == (200, 10, 20)
+    assert rendered.getpixel((0, 0)) == (255, 255, 255)
+
+
+def test_production_renderer_rejects_a_forged_capability_pin() -> None:
+    from io import BytesIO
+
+    from PIL import Image
+
+    module = importlib.import_module("specstyle.generation.output_profiles")
+    contracts = importlib.import_module("specstyle.generation.output_profile_contracts")
+    capability = contracts.production_output_profile_capabilities()[0]
+    forged = replace(capability, pin=replace(capability.pin, sha256=_sha("0")))
+    source = BytesIO()
+    Image.new("RGB", (64, 64), (10, 20, 30)).save(source, format="PNG")
+
+    with pytest.raises(DomainError, match="^invalid output renderer contract$"):
+        module.render_production_output(source.getvalue(), forged)
 
 
 def test_diffusers_backend_rejects_unsealed_pipeline_injection() -> None:

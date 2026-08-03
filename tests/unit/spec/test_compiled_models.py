@@ -20,6 +20,7 @@ from specstyle.spec.compiled_models import (
     L3PluginCapability,
     ModelCapability,
     OutputProfileCapability,
+    OutputRenderContract,
     ResourcePin,
     RuleCapability,
     RuleCatalogCapability,
@@ -123,6 +124,17 @@ def _binding(metric_id: Identifier = Identifier("metric")) -> CompiledThresholdB
     )
 
 
+def _render_contract() -> OutputRenderContract:
+    return OutputRenderContract(
+        (1080, 1080),
+        "contain_pad",
+        "lanczos",
+        (255, 255, 255),
+        "disabled",
+        "single_static",
+    )
+
+
 def _compiled_rule(
     *,
     definition: RuleDefinition | None = None,
@@ -196,6 +208,33 @@ def test_scalar_contracts_reject_coercion_and_nonfinite_values(
     for value in bad_values:
         with pytest.raises(DomainError):
             dataclasses.replace(instance, **{field: value})
+
+
+@pytest.mark.parametrize(
+    ("field", "bad_values"),
+    (
+        ("final_resolution", ([], (1080,), (1080, 0), (True, 1080))),
+        ("background", ([], (255, 255), (255, 255, 256), (False, 255, 255))),
+        ("fit", ("stretch", None)),
+        ("resampling", ("bicubic", None)),
+        ("overlay", ("enabled", None)),
+        ("sequence_semantics", ("multi", None)),
+    ),
+)
+def test_output_render_contract_rejects_invalid_fields(
+    field: str, bad_values: tuple[object, ...]
+) -> None:
+    for value in bad_values:
+        with pytest.raises(DomainError):
+            dataclasses.replace(_render_contract(), **{field: value})
+
+
+def test_output_profile_rejects_noncontract_renderer_binding() -> None:
+    capability = OutputProfileCapability(
+        _pin(), "xhs_grid", ("product_instance",), ("production",)
+    )
+    with pytest.raises(DomainError):
+        dataclasses.replace(capability, render_contract=object())
 
 
 @pytest.mark.parametrize(
@@ -468,6 +507,7 @@ def test_all_input_dataclasses_are_frozen_slotted_and_reject_unknown_keywords() 
         EncoderCapability,
         StrengthMappingEntry,
         StrengthMappingCapability,
+        OutputRenderContract,
         OutputProfileCapability,
         ThresholdMetricCapability,
         ThresholdProfileCapability,
@@ -484,7 +524,7 @@ def test_all_input_dataclasses_are_frozen_slotted_and_reject_unknown_keywords() 
         assert "unexpected" not in inspect.signature(cls).parameters
 
 
-def test_public_contract_declares_exactly_twenty_one_frozen_slotted_dataclasses() -> (
+def test_public_contract_declares_exactly_twenty_two_frozen_slotted_dataclasses() -> (
     None
 ):
     """Would fail if SPEC-003 added a mutable public model outside the frozen contract."""
@@ -497,6 +537,7 @@ def test_public_contract_declares_exactly_twenty_one_frozen_slotted_dataclasses(
         "EncoderCapability",
         "StrengthMappingEntry",
         "StrengthMappingCapability",
+        "OutputRenderContract",
         "OutputProfileCapability",
         "ThresholdMetricCapability",
         "ThresholdProfileCapability",

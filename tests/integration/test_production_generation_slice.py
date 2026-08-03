@@ -27,6 +27,9 @@ from specstyle.generation.image_evidence import (
     _build_processor_provenance,
     _derive_preprocessing_version,
 )
+from specstyle.generation.output_profile_contracts import (
+    production_output_profile_capabilities,
+)
 from specstyle.generation.preprocess import (
     PreprocessPlan,
     PreparedImage,
@@ -76,6 +79,7 @@ def _compiler_inputs(
     *,
     applicable_batch: bool = False,
     mismatch: str | None = None,
+    rendered_output: bool = False,
 ) -> tuple[str, CompilerContext, tuple[ProductionL1RuleBinding, ...]]:
     provenance = _build_processor_provenance(
         _Transformers, _CLIPImageProcessor(), _Transformers.__version__
@@ -98,6 +102,11 @@ def _compiler_inputs(
         "stop_after_no_improvement": 1,
     }
     compiler_context, raw = _apply_compiler_mismatch(compiler_context, raw, mismatch)
+    if rendered_output:
+        compiler_context = replace(
+            compiler_context,
+            output_profile_capabilities=production_output_profile_capabilities(),
+        )
     if applicable_batch:
         compiler_context = _add_applicable_batch_rule(compiler_context)
     bindings = production_l1_rule_bindings()
@@ -241,13 +250,20 @@ def _open_runtime(
         os.close(root_fd)
 
 
+@pytest.mark.parametrize(
+    ("rendered_output", "expected_size"),
+    ((False, (1024, 1024)), (True, (1080, 1080))),
+)
 def test_real_initial_attempt_reaches_terminal_with_exact_durable_audit_history(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path,
+    monkeypatch,
+    rendered_output: bool,
+    expected_size: tuple[int, int],
 ) -> None:
     style_contents = (_png("red"), _png("blue"))
     supply, pipeline_graph = _supply(tmp_path / "weights")
     spec_text, compiler_context, allowlist = _compiler_inputs(
-        pipeline_graph, style_contents
+        pipeline_graph, style_contents, rendered_output=rendered_output
     )
     style_references = tuple(
         AssetRef(AssetId(f"style-{index}"), hash_bytes(content))
@@ -296,6 +312,8 @@ def test_real_initial_attempt_reaches_terminal_with_exact_durable_audit_history(
         assert result.verification_plan.output_profile == "xhs_grid"
         assert result.request.attempt_id.value == "job-success-a0-xhs_grid-0"
         assert result.artifact.content.startswith(b"\x89PNG")
+        with Image.open(BytesIO(result.artifact.content)) as rendered:
+            assert rendered.size == expected_size
         assert result.artifact.request_hash == result.request.request_hash
         assert result.report.artifacts == (result.artifact.ref,)
         assert (

@@ -597,6 +597,7 @@ def _graph(
         raw.generation.controlnet_scale,
         raw.generation.seed_policy,
         raw.generation.batch_execution,
+        output.render_contract,
     )
 
 

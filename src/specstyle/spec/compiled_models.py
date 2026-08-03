@@ -214,15 +214,52 @@ class StrengthMappingCapability:
 
 
 @dataclass(frozen=True, slots=True)
+class OutputRenderContract:
+    final_resolution: tuple[int, int]
+    fit: Literal["contain_pad", "cover_center"]
+    resampling: Literal["lanczos"]
+    background: tuple[int, int, int]
+    overlay: Literal["disabled"]
+    sequence_semantics: Literal["single_static"]
+
+    def __post_init__(self) -> None:
+        resolution = _tuple(
+            self.final_resolution, "final output resolution", nonempty=True
+        )
+        background = _tuple(self.background, "output background", nonempty=True)
+        if (
+            len(resolution) != 2
+            or any(type(item) is not int or item < 1 for item in resolution)
+            or len(background) != 3
+            or any(type(item) is not int or not 0 <= item <= 255 for item in background)
+        ):
+            raise DomainError("invalid output render contract")
+        _choice(self.fit, {"contain_pad", "cover_center"}, "output fit")
+        _choice(self.resampling, {"lanczos"}, "output resampling")
+        _choice(self.overlay, {"disabled"}, "output overlay")
+        _choice(
+            self.sequence_semantics,
+            {"single_static"},
+            "output sequence semantics",
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class OutputProfileCapability:
     pin: ResourcePin
     profile: OutputProfile
     supported_domains: tuple[DomainProfile, ...]
     supported_generation_profiles: tuple[GenerationProfile, ...]
+    render_contract: OutputRenderContract | None = None
 
     def __post_init__(self) -> None:
         if type(self.pin) is not ResourcePin:
             raise DomainError("output pin must be ResourcePin")
+        if (
+            self.render_contract is not None
+            and type(self.render_contract) is not OutputRenderContract
+        ):
+            raise DomainError("output render contract must be OutputRenderContract")
         _choice(self.profile, _OUTPUTS, "output profile")
         for values, name, choices in (
             (self.supported_domains, "domains", _DOMAINS),
@@ -609,6 +646,7 @@ class CompiledExecutionGraph:
     controlnet_scale: float
     seed_policy: Literal["per_asset_deterministic"]
     batch_execution: Literal["sequential"]
+    render_contract: OutputRenderContract | None = None
 
     def __post_init__(self) -> None:
         _choice(
@@ -617,6 +655,11 @@ class CompiledExecutionGraph:
         _choice(self.output_profile, _OUTPUTS, "output profile")
         if type(self.output_profile_pin) is not ResourcePin:
             raise DomainError("output profile pin must be ResourcePin")
+        if (
+            self.render_contract is not None
+            and type(self.render_contract) is not OutputRenderContract
+        ):
+            raise DomainError("graph render contract must be OutputRenderContract")
         _choice(self.pipeline, _PIPELINES, "pipeline")
         resolution = _tuple(self.resolution, "resolution", nonempty=True)
         if len(resolution) != 2 or any(
@@ -658,6 +701,12 @@ class CompiledExecutionGraph:
             _finite(value, name, unit=True)
         _choice(self.seed_policy, {"per_asset_deterministic"}, "seed policy")
         _choice(self.batch_execution, {"sequential"}, "batch execution")
+
+    @property
+    def final_output_resolution(self) -> tuple[int, int]:
+        if self.render_contract is None:
+            return self.resolution
+        return self.render_contract.final_resolution
 
 
 @dataclass(frozen=True, slots=True)
@@ -788,6 +837,11 @@ def _primitive(value: object) -> object:
             item.name: _primitive(getattr(value, item.name))
             for item in dataclasses.fields(value)
             if item.init
+            and not (
+                type(value) is CompiledExecutionGraph
+                and item.name == "render_contract"
+                and value.render_contract is None
+            )
         }
     if isinstance(value, tuple):
         return [_primitive(item) for item in value]

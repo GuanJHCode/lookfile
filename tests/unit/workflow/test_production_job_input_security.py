@@ -17,7 +17,7 @@ from specstyle.domain.identifiers import AssetId, JobId
 from specstyle.errors import DomainError, InfrastructureError
 from specstyle.generation.preprocess import PreprocessPlan, preprocess_image
 from specstyle.observability.hashing import hash_bytes
-from specstyle.spec.compiled_models import ResourcePin
+from specstyle.spec.compiled_models import OutputProfileCapability, ResourcePin
 from tests.unit.spec.test_compiler import raw_spec
 
 
@@ -128,6 +128,18 @@ def _context():
         "source_preprocess",
         SimpleNamespace(
             processor_pin=pin, resize_mode="contain_pad", background=(255, 255, 255)
+        ),
+    )
+    object.__setattr__(
+        config,
+        "output_profiles",
+        (
+            OutputProfileCapability(
+                ResourcePin("xhs-output", "r1", hash_bytes(b"xhs-output")),
+                "xhs_grid",
+                ("product_instance",),
+                ("preview", "production"),
+            ),
         ),
     )
     object.__setattr__(config, "_seal", module._CONFIG_SEAL)
