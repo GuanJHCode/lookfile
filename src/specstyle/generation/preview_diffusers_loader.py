@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import gc
 import importlib
+import math
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -253,8 +254,13 @@ def _lora_layer_state(
                 scaling = tuple(sorted(layer.scaling.items()))
             except Exception as exc:
                 raise DomainError("invalid loaded preview pipeline capability") from exc
-            if merged != (_LORA_ADAPTER_NAME,) or scaling != (
-                (_LORA_ADAPTER_NAME, _LORA_FUSE_SCALE),
+            if (
+                merged != (_LORA_ADAPTER_NAME,)
+                or len(scaling) != 1
+                or scaling[0][0] != _LORA_ADAPTER_NAME
+                or type(scaling[0][1]) is not float
+                or not math.isfinite(scaling[0][1])
+                or scaling[0][1] <= 0.0
             ):
                 raise DomainError("invalid loaded preview pipeline capability")
             captured.append(

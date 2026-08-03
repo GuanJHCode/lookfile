@@ -407,6 +407,77 @@ def test_loader_applies_exact_lcm_scheduler_adapter_and_fuse_contract(
     supply.close()
 
 
+def test_loader_snapshots_pinned_peft_layer_scaling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from specstyle.generation.preview_diffusers_loader import load_preview_pipeline
+    from specstyle.generation.preview_execution import bind_preview_execution
+
+    real_fuse = _PreviewPipeline.fuse_lora
+
+    def fuse_with_peft_scaling(pipeline: _PreviewPipeline, **kwargs: object) -> None:
+        real_fuse(pipeline, **kwargs)
+        pipeline.unet.layer.scaling = {"specstyle_lcm": 0.125}
+
+    monkeypatch.setattr(_PreviewPipeline, "fuse_lora", fuse_with_peft_scaling)
+    supply, adapter, graph, request = _runtime(tmp_path)
+    diffusers = _PreviewDiffusers()
+    loaded = load_preview_pipeline(
+        supply,
+        adapter,
+        graph,
+        _environment(),
+        torch_module=_Torch(),
+        diffusers_module=diffusers,
+        peft_module=_Peft(),
+    )
+    pipeline = diffusers.issued_pipelines[0]
+
+    bind_preview_execution(loaded, request)
+    pipeline.unet.layer.scaling["specstyle_lcm"] = 0.25
+    with pytest.raises(DomainError, match="capability"):
+        bind_preview_execution(loaded, request)
+
+    loaded.close()
+    adapter.close()
+    supply.close()
+
+
+@pytest.mark.parametrize(
+    "invalid_scaling",
+    (0.0, -0.125, float("inf"), float("nan"), True, 1),
+)
+def test_loader_rejects_invalid_peft_layer_scaling(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    invalid_scaling: object,
+) -> None:
+    from specstyle.generation.preview_diffusers_loader import load_preview_pipeline
+
+    real_fuse = _PreviewPipeline.fuse_lora
+
+    def fuse_with_invalid_scaling(pipeline: _PreviewPipeline, **kwargs: object) -> None:
+        real_fuse(pipeline, **kwargs)
+        pipeline.unet.layer.scaling = {"specstyle_lcm": invalid_scaling}
+
+    monkeypatch.setattr(_PreviewPipeline, "fuse_lora", fuse_with_invalid_scaling)
+    supply, adapter, graph, _ = _runtime(tmp_path)
+
+    with pytest.raises(InfrastructureError, match="preview pipeline loading failed"):
+        load_preview_pipeline(
+            supply,
+            adapter,
+            graph,
+            _environment(),
+            torch_module=_Torch(),
+            diffusers_module=_PreviewDiffusers(),
+            peft_module=_Peft(),
+        )
+
+    adapter.close()
+    supply.close()
+
+
 def test_loader_rejects_non_preview_graph_and_mismatched_adapter(
     tmp_path: Path,
 ) -> None:
