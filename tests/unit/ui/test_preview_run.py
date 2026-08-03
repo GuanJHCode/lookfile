@@ -49,7 +49,14 @@ def _publication(
         f"{run_id}-{display_digest or digest[:16]}.png",
         ArtifactId(f"preview-{'b' * 64}"),
         Sha256(digest),
+        Sha256("d" * 64),
         Sha256("c" * 64),
+        "specstyle.preview.evidence.v2",
+        0,
+        "specstyle.seed.v1",
+        1,
+        (512, 512),
+        "ENGINEERING_ONLY",
     )
 
 

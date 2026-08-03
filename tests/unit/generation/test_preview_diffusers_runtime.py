@@ -586,7 +586,16 @@ def test_execution_binding_is_distinct_and_binds_four_models_and_runtime(
     material = json.loads(binding.material_json)
 
     assert binding.compiled_request_fingerprint != binding.execution_fingerprint
-    assert material["schema_version"] == "specstyle.preview.execution.v1"
+    assert material["schema_version"] == "specstyle.preview.execution.v2"
+    compiled = material["compiled_request"]
+    assert compiled["schema_version"] == "specstyle.preview.compiled-request.v2"
+    assert compiled["run_id"] == request.job_id.value
+    assert compiled["variation_index"] == request.variation_index
+    assert compiled["seed"] == {
+        "algorithm": request.seed.algorithm,
+        "value": request.seed.seed,
+    }
+    assert compiled["resolution"] == list(request.graph.resolution)
     assert [item["descriptor"]["role"] for item in material["models"]] == [
         "base",
         "ip_adapter",

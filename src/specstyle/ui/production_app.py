@@ -20,6 +20,10 @@ from specstyle.ui.preview_run import (
     bind_unavailable_preview_services,
     reconcile_preview_ui_display,
 )
+from specstyle.ui.preview_wall import (
+    bind_preview_wall_services,
+    bind_unavailable_preview_wall_services,
+)
 from specstyle.ui.preview_ui_inputs import PreviewUiRuntimePaths
 from specstyle.ui.production_run import (
     ProductionUiRuntimePaths,
@@ -207,10 +211,14 @@ def bind_optional_preview_services(
         return services, None
     try:
         reconcile_preview_ui_display(preview_paths)
-        return bind_preview_run_one_services(services, preview_paths), preview_paths
+        preview = bind_preview_run_one_services(services, preview_paths)
+        return bind_preview_wall_services(preview, preview_paths), preview_paths
     except Exception:
         return (
-            bind_unavailable_preview_services(services, "PREVIEW_UNAVAILABLE"),
+            bind_unavailable_preview_wall_services(
+                bind_unavailable_preview_services(services, "PREVIEW_UNAVAILABLE"),
+                "PREVIEW_UNAVAILABLE",
+            ),
             None,
         )
 

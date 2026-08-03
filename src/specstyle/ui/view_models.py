@@ -110,3 +110,31 @@ class PreviewRunUiView:
     verification: str
     repair: str
     export: str
+
+
+@dataclass(frozen=True, slots=True)
+class PreviewWallItemUiView:
+    variation_index: int
+    attempted: bool
+    run_id: str
+    status: str
+    reason_code: str
+    seed: int | None
+    content_sha256: str | None
+    execution_fingerprint: str | None
+    display_image: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class PreviewWallUiView:
+    wall_id: str
+    status: str
+    message: str
+    profile_label: str
+    evidence_class: str
+    items: tuple[PreviewWallItemUiView, ...]
+    display_images: tuple[str, ...]
+    evidence_tsv: str
+    verification: str
+    repair: str
+    export: str

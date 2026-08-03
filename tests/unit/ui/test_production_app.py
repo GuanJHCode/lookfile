@@ -303,6 +303,15 @@ def test_preview_bootstrap_failure_degrades_without_blocking_production(
             else pytest.fail("invalid fallback")
         ),
     )
+    monkeypatch.setattr(
+        production_app,
+        "bind_unavailable_preview_wall_services",
+        lambda candidate, reason: (
+            candidate
+            if candidate is fallback and reason == "PREVIEW_UNAVAILABLE"
+            else pytest.fail("invalid wall fallback")
+        ),
+    )
 
     result, exposed_paths = production_app.bind_optional_preview_services(
         base, preview_paths

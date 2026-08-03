@@ -19,7 +19,14 @@ def _publication(run_id: str) -> PreviewEvidencePublication:
         f"{run_id}-{'a' * 16}.png",
         ArtifactId(f"preview-{'b' * 64}"),
         Sha256("a" * 64),
+        Sha256("d" * 64),
         Sha256("c" * 64),
+        "specstyle.preview.evidence.v2",
+        0,
+        "specstyle.seed.v1",
+        1,
+        (512, 512),
+        "ENGINEERING_ONLY",
     )
 
 
@@ -48,6 +55,21 @@ def _fds(tmp_path: Path):
     return PreviewRunOneFds(*roots, *files), roots + files
 
 
+class _Session:
+    def __init__(self, module: object, execute: object) -> None:
+        self.module = module
+        self.execute = execute
+
+    def run_item(self, run_id: str, variation_index: int):
+        publication = self.execute((), run_id, variation_index)
+        return self.module.PreviewRunOneResult(
+            run_id, self.module.PreviewRunStatus.COMPLETED, "OK", publication
+        )
+
+    def close(self) -> bool:
+        return False
+
+
 def test_busy_is_immediate_and_does_not_consume_reservation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -70,10 +92,13 @@ def test_busy_is_immediate_and_does_not_consume_reservation(
     assert result.publication is None
     assert result.verification == result.repair == result.export == "NOT_RUN"
 
+    def execute(_owned: object, run_id: str, _variation: int):
+        return _publication(run_id)
+
     monkeypatch.setattr(
         module,
-        "_execute_preview",
-        lambda _owned, run_id, _variation: _publication(run_id),
+        "open_preview_runtime_session",
+        lambda _fds: _Session(module, execute),
     )
     completed = module.run_preview_one(fds, reservation)
     assert completed.status is module.PreviewRunStatus.COMPLETED
@@ -100,7 +125,11 @@ def test_completed_becomes_visible_only_after_publication_and_cleanup(
         events.append("published")
         return _publication(run_id)
 
-    monkeypatch.setattr(module, "_execute_preview", execute)
+    monkeypatch.setattr(
+        module,
+        "open_preview_runtime_session",
+        lambda _fds: _Session(module, execute),
+    )
     result = module.run_preview_one(fds, module.reserve_preview_run_one(2))
     events.append("returned")
     assert result.status is module.PreviewRunStatus.COMPLETED
@@ -132,7 +161,11 @@ def test_failures_are_explicit_never_approved_and_release_lane(
     def fail(*_args: object):
         raise module._PreviewRunFailure(module.PreviewRunStatus(status), reason)
 
-    monkeypatch.setattr(module, "_execute_preview", fail)
+    monkeypatch.setattr(
+        module,
+        "open_preview_runtime_session",
+        lambda _fds: _Session(module, fail),
+    )
     result = module.run_preview_one(fds, module.reserve_preview_run_one())
     assert result.status.value == status
     assert result.reason_code == reason
@@ -190,7 +223,7 @@ def test_persist_failure_closes_all_runtime_resources_before_lane_release(
     result = module.run_preview_one(fds, module.reserve_preview_run_one())
     assert result.status is module.PreviewRunStatus.FAILED
     assert result.reason_code == "PERSIST_FAILED"
-    assert events == ["close:pipeline", "close:input", "close:adapter", "close:supply"]
+    assert events == ["close:input", "close:pipeline", "close:adapter", "close:supply"]
     next_lease = try_acquire_gpu_runtime_lane()
     assert next_lease is not None
     next_lease.close()
@@ -248,7 +281,7 @@ def test_cleanup_failure_closes_remaining_resources_and_releases_lane(
     result = module.run_preview_one(fds, module.reserve_preview_run_one())
     assert result.status is module.PreviewRunStatus.FAILED
     assert result.reason_code == "CLEANUP_FAILED"
-    assert events == ["close:pipeline", "close:input", "close:adapter", "close:supply"]
+    assert events == ["close:input", "close:pipeline", "close:adapter", "close:supply"]
     next_lease = try_acquire_gpu_runtime_lane()
     assert next_lease is not None
     next_lease.close()
@@ -302,5 +335,33 @@ def test_missing_lcm_context_capability_isolated_as_unavailable(
     assert result.status is module.PreviewRunStatus.UNAVAILABLE
     assert result.reason_code == "PREVIEW_LCM_CAPABILITY_MISSING"
     assert result.publication is None
+    for descriptor in descriptors:
+        os.close(descriptor)
+
+
+def test_runtime_session_is_idempotently_closed_and_rejects_reuse(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import specstyle.workflow.preview_run_one as module
+
+    fds, descriptors = _fds(tmp_path)
+
+    class Resource:
+        def close(self) -> None:
+            pass
+
+    preflight = module._PreviewPreflight(
+        object(), object(), object(), Resource(), Resource(), object()
+    )
+    monkeypatch.setattr(module, "_open_preflight", lambda _owned: preflight)
+    monkeypatch.setattr(module, "_load_runtime", lambda _preflight: Resource())
+    session = module.open_preview_runtime_session(fds)
+
+    assert session.close() is False
+    assert session.close() is False
+    with pytest.raises(DomainError, match="closed"):
+        session.run_item("preview-closed", 0)
+    with pytest.raises(DomainError, match="input"):
+        module.open_preview_runtime_session(object())  # type: ignore[arg-type]
     for descriptor in descriptors:
         os.close(descriptor)

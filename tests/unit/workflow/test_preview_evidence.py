@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+from dataclasses import replace
 
 import pytest
 
@@ -10,7 +11,8 @@ from specstyle.errors import DomainError, InfrastructureError
 from specstyle.observability.hashing import hash_bytes
 
 
-def _artifact(tmp_path: Path):
+def _artifact(tmp_path: Path, run_id: str = "preview-job"):
+    from specstyle.domain.identifiers import AttemptId, JobId
     from specstyle.generation.preview_diffusers_loader import load_preview_pipeline
     from specstyle.generation.preview_execution import (
         bind_preview_execution,
@@ -26,6 +28,11 @@ def _artifact(tmp_path: Path):
     from tests.unit.generation.test_diffusers_loader import _environment
 
     supply, adapter, graph, request = _runtime(tmp_path / "models")
+    request = replace(
+        request,
+        job_id=JobId(run_id),
+        attempt_id=AttemptId(f"{run_id}-a0"),
+    )
     loaded = load_preview_pipeline(
         supply,
         adapter,
@@ -62,7 +69,7 @@ def test_preview_evidence_atomically_publishes_private_pair_then_display(
 ) -> None:
     from specstyle.workflow.preview_evidence import publish_preview_evidence
 
-    artifact = _artifact(tmp_path)
+    artifact = _artifact(tmp_path, "preview-run-1")
     private_fd, display_fd, private, display = _roots(tmp_path)
     try:
         published = publish_preview_evidence(
@@ -79,8 +86,17 @@ def test_preview_evidence_atomically_publishes_private_pair_then_display(
     ]
     record = json.loads((evidence / "record.json").read_text(encoding="utf-8"))
     display_bytes = (display / published.display_name).read_bytes()
-    assert record["schema_version"] == "specstyle.preview.evidence.v1"
+    assert record["schema_version"] == "specstyle.preview.evidence.v2"
     assert record["run_id"] == "preview-run-1"
+    assert record["evidence_class"] == "ENGINEERING_ONLY"
+    assert record["generation"] == {
+        "variation_index": 0,
+        "seed": {
+            "algorithm": "specstyle.seed.v1",
+            "value": published.seed,
+        },
+        "resolution": [512, 512],
+    }
     assert record["artifact"]["content_sha256"] == hash_bytes(display_bytes).value
     assert record["artifact"]["execution_fingerprint"] == (
         artifact.execution_fingerprint.value
@@ -92,6 +108,10 @@ def test_preview_evidence_atomically_publishes_private_pair_then_display(
     }
     assert "APPROVED" not in (evidence / "record.json").read_text()
     assert published.content_sha256 == hash_bytes(display_bytes)
+    assert published.schema_version == "specstyle.preview.evidence.v2"
+    assert published.variation_index == 0
+    assert published.seed_algorithm == "specstyle.seed.v1"
+    assert published.resolution == (512, 512)
 
 
 def test_display_failure_never_returns_completed_publication(
@@ -99,7 +119,7 @@ def test_display_failure_never_returns_completed_publication(
 ) -> None:
     import specstyle.workflow.preview_evidence as module
 
-    artifact = _artifact(tmp_path)
+    artifact = _artifact(tmp_path, "preview-run-display-fail")
     private_fd, display_fd, private, display = _roots(tmp_path)
     monkeypatch.setattr(
         module,
@@ -120,6 +140,140 @@ def test_display_failure_never_returns_completed_publication(
     assert list(display.iterdir()) == []
 
 
+def test_preview_evidence_rejects_cross_run_artifact_republication(
+    tmp_path: Path,
+) -> None:
+    from specstyle.workflow.preview_evidence import publish_preview_evidence
+
+    artifact = _artifact(tmp_path, "preview-original-run")
+    private_fd, display_fd, _private, _display = _roots(tmp_path)
+    try:
+        with pytest.raises(DomainError, match="run binding"):
+            publish_preview_evidence(
+                private_fd, display_fd, "preview-different-run", artifact
+            )
+    finally:
+        os.close(display_fd)
+        os.close(private_fd)
+
+
+def test_stored_v2_publication_is_reverified_before_wall_use(
+    tmp_path: Path,
+) -> None:
+    from specstyle.workflow.preview_evidence import (
+        publish_preview_evidence,
+        verify_preview_evidence_publication,
+    )
+
+    run_id = "preview-verified-record"
+    artifact = _artifact(tmp_path, run_id)
+    private_fd, display_fd, private, _display = _roots(tmp_path)
+    try:
+        publication = publish_preview_evidence(private_fd, display_fd, run_id, artifact)
+        verify_preview_evidence_publication(private_fd, publication)
+        record_path = private / run_id / "record.json"
+        record = json.loads(record_path.read_text())
+        record["generation"]["seed"]["value"] += 1
+        from specstyle.exporting.qa_report import canonical_json_bytes
+
+        record_path.write_bytes(canonical_json_bytes(record))
+        with pytest.raises(DomainError, match="publication mismatch"):
+            verify_preview_evidence_publication(private_fd, publication)
+    finally:
+        os.close(display_fd)
+        os.close(private_fd)
+
+
+@pytest.mark.parametrize("corruption", ("extra_file", "noncanonical_record"))
+def test_stored_v2_publication_rejects_record_structure_corruption(
+    tmp_path: Path, corruption: str
+) -> None:
+    from specstyle.workflow.preview_evidence import (
+        publish_preview_evidence,
+        verify_preview_evidence_publication,
+    )
+
+    run_id = "preview-record-corruption"
+    artifact = _artifact(tmp_path, run_id)
+    private_fd, display_fd, private, _display = _roots(tmp_path)
+    try:
+        publication = publish_preview_evidence(private_fd, display_fd, run_id, artifact)
+        evidence = private / run_id
+        if corruption == "extra_file":
+            (evidence / "extra").write_bytes(b"unexpected")
+        else:
+            record_path = evidence / "record.json"
+            record = json.loads(record_path.read_text())
+            record_path.write_text(json.dumps(record, indent=2))
+        with pytest.raises(DomainError, match="record"):
+            verify_preview_evidence_publication(private_fd, publication)
+    finally:
+        os.close(display_fd)
+        os.close(private_fd)
+
+
+def test_stored_v2_publication_rejects_compiled_fingerprint_tamper(
+    tmp_path: Path,
+) -> None:
+    from specstyle.exporting.qa_report import canonical_json_bytes
+    from specstyle.workflow.preview_evidence import (
+        publish_preview_evidence,
+        verify_preview_evidence_publication,
+    )
+
+    run_id = "preview-compiled-fingerprint"
+    artifact = _artifact(tmp_path, run_id)
+    private_fd, display_fd, private, _display = _roots(tmp_path)
+    try:
+        publication = publish_preview_evidence(private_fd, display_fd, run_id, artifact)
+        record_path = private / run_id / "record.json"
+        record = json.loads(record_path.read_text())
+        record["artifact"]["compiled_request_fingerprint"] = "c" * 64
+        record_path.write_bytes(canonical_json_bytes(record))
+        with pytest.raises(DomainError, match="publication mismatch"):
+            verify_preview_evidence_publication(private_fd, publication)
+    finally:
+        os.close(display_fd)
+        os.close(private_fd)
+
+
+def test_stored_v2_publication_rejects_invalid_call(tmp_path: Path) -> None:
+    from specstyle.workflow.preview_evidence import verify_preview_evidence_publication
+
+    private_fd, display_fd, _private, _display = _roots(tmp_path)
+    try:
+        with pytest.raises(DomainError):
+            verify_preview_evidence_publication(private_fd, object())  # type: ignore[arg-type]
+    finally:
+        os.close(display_fd)
+        os.close(private_fd)
+
+
+def test_preview_evidence_rejects_tampered_generation_binding(
+    tmp_path: Path,
+) -> None:
+    from specstyle.exporting.qa_report import canonical_json_bytes
+    from specstyle.workflow.preview_evidence import publish_preview_evidence
+
+    artifact = _artifact(tmp_path, "preview-tampered-generation")
+    material = json.loads(artifact.binding.material_json)
+    material["compiled_request"]["variation_index"] = 1
+    object.__setattr__(
+        artifact.binding,
+        "material_json",
+        canonical_json_bytes(material).decode("utf-8"),
+    )
+    private_fd, display_fd, _private, _display = _roots(tmp_path)
+    try:
+        with pytest.raises(DomainError, match="execution binding"):
+            publish_preview_evidence(
+                private_fd, display_fd, "preview-tampered-generation", artifact
+            )
+    finally:
+        os.close(display_fd)
+        os.close(private_fd)
+
+
 def test_preview_evidence_is_no_replace_and_display_orphans_are_removed(
     tmp_path: Path,
 ) -> None:
@@ -128,7 +282,7 @@ def test_preview_evidence_is_no_replace_and_display_orphans_are_removed(
         reconcile_preview_display,
     )
 
-    artifact = _artifact(tmp_path)
+    artifact = _artifact(tmp_path, "preview-run-stable")
     private_fd, display_fd, _private, display = _roots(tmp_path)
     try:
         published = publish_preview_evidence(
@@ -147,6 +301,34 @@ def test_preview_evidence_is_no_replace_and_display_orphans_are_removed(
         os.close(private_fd)
     assert removed == ("orphan.png",)
     assert not orphan.exists()
+    assert (display / published.display_name).is_file()
+
+
+def test_reconcile_keeps_legacy_v1_preview_evidence(tmp_path: Path) -> None:
+    from specstyle.exporting.qa_report import canonical_json_bytes
+    from specstyle.workflow.preview_evidence import (
+        publish_preview_evidence,
+        reconcile_preview_display,
+    )
+
+    artifact = _artifact(tmp_path, "preview-legacy-v1")
+    private_fd, display_fd, private, display = _roots(tmp_path)
+    try:
+        published = publish_preview_evidence(
+            private_fd, display_fd, "preview-legacy-v1", artifact
+        )
+        record_path = private / published.evidence_name / "record.json"
+        record = json.loads(record_path.read_text())
+        record["schema_version"] = "specstyle.preview.evidence.v1"
+        record.pop("evidence_class")
+        record.pop("generation")
+        record_path.write_bytes(canonical_json_bytes(record))
+
+        removed = reconcile_preview_display(private_fd, display_fd)
+    finally:
+        os.close(display_fd)
+        os.close(private_fd)
+    assert removed == ()
     assert (display / published.display_name).is_file()
 
 

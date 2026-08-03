@@ -194,13 +194,48 @@ def _valid_binding_material(binding: PreviewExecutionBinding, material: object) 
     compiled = material["compiled_request"]
     return (
         _canonical_json(material) == binding.material_json
-        and material["schema_version"] == "specstyle.preview.execution.v1"
+        and material["schema_version"] == "specstyle.preview.execution.v2"
+        and _valid_compiled_material(compiled)
         and material["compiled_request_fingerprint"]
         == binding.compiled_request_fingerprint.value
         and _fingerprint(_canonical_json(compiled))
         == binding.compiled_request_fingerprint
         and _fingerprint(binding.material_json) == binding.execution_fingerprint
         and binding.execution_fingerprint != binding.compiled_request_fingerprint
+    )
+
+
+def _valid_compiled_material(value: object) -> bool:
+    if type(value) is not dict or set(value) != {
+        "schema_version",
+        "request_sha256",
+        "generation_fingerprint",
+        "compiled_spec_sha256",
+        "run_id",
+        "variation_index",
+        "seed",
+        "resolution",
+        "graph",
+    }:
+        return False
+    seed = value["seed"]
+    resolution = value["resolution"]
+    graph = value["graph"]
+    return (
+        value["schema_version"] == "specstyle.preview.compiled-request.v2"
+        and type(value["run_id"]) is str
+        and value["run_id"].startswith("preview-")
+        and type(value["variation_index"]) is int
+        and 0 <= value["variation_index"] < 2**31
+        and type(seed) is dict
+        and seed.get("algorithm") == "specstyle.seed.v1"
+        and type(seed.get("value")) is int
+        and 0 <= seed["value"] < 2**63
+        and type(resolution) is list
+        and len(resolution) == 2
+        and all(type(item) is int and item > 0 for item in resolution)
+        and type(graph) is dict
+        and graph.get("resolution") == resolution
     )
 
 
@@ -311,15 +346,22 @@ def bind_preview_execution(loaded: object, request: object) -> PreviewExecutionB
     """Freeze every request, supply, scheduler, fuse and runtime input before GPU use."""
     request = _validate_preview_request(loaded, request)
     compiled_material = {
-        "schema_version": "specstyle.preview.compiled-request.v1",
+        "schema_version": "specstyle.preview.compiled-request.v2",
         "request_sha256": request.request_hash.value,
         "generation_fingerprint": request.generation_fingerprint.value,
         "compiled_spec_sha256": request.compiled_spec.compiled_spec_hash.value,
+        "run_id": request.job_id.value,
+        "variation_index": request.variation_index,
+        "seed": {
+            "algorithm": request.seed.algorithm,
+            "value": request.seed.seed,
+        },
+        "resolution": list(request.graph.resolution),
         "graph": graph_primitive(request.graph),
     }
     compiled_fingerprint = _fingerprint(_canonical_json(compiled_material))
     material = {
-        "schema_version": "specstyle.preview.execution.v1",
+        "schema_version": "specstyle.preview.execution.v2",
         "compiled_request_fingerprint": compiled_fingerprint.value,
         "compiled_request": compiled_material,
         "models": json.loads(loaded._model_bindings_json),

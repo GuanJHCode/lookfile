@@ -258,6 +258,7 @@ def bind_production_run_one_services(
         run_production_batch=run_batch,
         get_preview_readiness=base.get_preview_readiness,
         run_preview_job=base.run_preview_job,
+        run_preview_wall=base.run_preview_wall,
     )
 
 

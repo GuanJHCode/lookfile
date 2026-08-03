@@ -458,35 +458,107 @@ def _publish_artifact(
         raise _PreviewRunFailure(PreviewRunStatus.FAILED, "PERSIST_FAILED") from None
 
 
-def _execute_preview(
-    owned: tuple[int, ...], run_id: str, variation_index: int
-) -> PreviewEvidencePublication:
-    preflight = job_input = loaded = None
-    failure: _PreviewRunFailure | None = None
-    publication: PreviewEvidencePublication | None = None
+_SESSION_SEAL = object()
+
+
+class _PreviewRuntimeSession:
+    __slots__ = ("_closed", "_loaded", "_lock", "_owned", "_preflight", "_seal")
+
+    def __init__(self, *_: object, **__: object) -> None:
+        raise TypeError("preview runtime sessions are issued only by open")
+
+    def run_item(self, run_id: str, variation_index: int) -> PreviewRunOneResult:
+        _validate_session(self, require_open=True)
+        return _execute_preview(self, run_id, variation_index)
+
+    def close(self) -> bool:
+        _validate_session(self, require_open=False)
+        with self._lock:
+            if self._closed:
+                return False
+            self._closed = True
+        failed = _close_resources(
+            (
+                self._loaded,
+                self._preflight.preview_adapter,
+                self._preflight.production_supply,
+            )
+        )
+        _close_descriptors(list(self._owned))
+        return failed
+
+
+def _validate_session(value: object, *, require_open: bool) -> None:
+    if (
+        type(value) is not _PreviewRuntimeSession
+        or getattr(value, "_seal", None) is not _SESSION_SEAL
+        or type(getattr(value, "_owned", None)) is not tuple
+        or type(getattr(value, "_preflight", None)) is not _PreviewPreflight
+        or type(getattr(value, "_closed", None)) is not bool
+    ):
+        raise DomainError("invalid preview runtime session")
+    if require_open and value._closed:
+        raise DomainError("preview runtime session is closed")
+
+
+def open_preview_runtime_session(fds: PreviewRunOneFds) -> _PreviewRuntimeSession:
+    if type(fds) is not PreviewRunOneFds:
+        raise DomainError("invalid preview run-one input")
+    owned: tuple[int, ...] = ()
+    preflight = loaded = None
     try:
+        owned = _owned_descriptors(fds)
         preflight = _open_preflight(owned)
-        job_input = _open_input(owned, preflight, variation_index)
-        request = _compile_request(run_id, job_input, preflight)
         loaded = _load_runtime(preflight)
-        artifact = _generate_artifact(loaded, job_input, request)
-        publication = _publish_artifact(owned, run_id, artifact)
-    except _PreviewRunFailure as error:
-        failure = error
-    finally:
+        issued = object.__new__(_PreviewRuntimeSession)
+        issued._owned = owned
+        issued._preflight = preflight
+        issued._loaded = loaded
+        issued._closed = False
+        issued._lock = threading.Lock()
+        issued._seal = _SESSION_SEAL
+        _validate_session(issued, require_open=True)
+        return issued
+    except BaseException:
         resources = (
             loaded,
-            job_input,
             None if preflight is None else preflight.preview_adapter,
             None if preflight is None else preflight.production_supply,
         )
-        if _close_resources(resources) and failure is None:
+        _close_resources(resources)
+        _close_descriptors(list(owned))
+        raise
+
+
+def _execute_preview(
+    session: _PreviewRuntimeSession, run_id: str, variation_index: int
+) -> PreviewRunOneResult:
+    _validate_session(session, require_open=True)
+    if (
+        type(run_id) is not str
+        or not run_id.startswith("preview-")
+        or type(variation_index) is not int
+        or not 0 <= variation_index < 2**31
+    ):
+        raise DomainError("invalid preview runtime item")
+    job_input = None
+    failure: _PreviewRunFailure | None = None
+    publication: PreviewEvidencePublication | None = None
+    try:
+        job_input = _open_input(session._owned, session._preflight, variation_index)
+        request = _compile_request(run_id, job_input, session._preflight)
+        artifact = _generate_artifact(session._loaded, job_input, request)
+        publication = _publish_artifact(session._owned, run_id, artifact)
+    except _PreviewRunFailure as error:
+        failure = error
+    finally:
+        if _close_resources((job_input,)) and failure is None:
             failure = _PreviewRunFailure(PreviewRunStatus.FAILED, "CLEANUP_FAILED")
     if failure is not None:
-        raise failure
+        return _result(run_id, failure.status, failure.reason_code)
     if type(publication) is not PreviewEvidencePublication:
-        raise _PreviewRunFailure(PreviewRunStatus.FAILED, "INTERNAL_FAILURE")
-    return publication
+        return _result(run_id, PreviewRunStatus.FAILED, "INTERNAL_FAILURE")
+    return _result(run_id, PreviewRunStatus.COMPLETED, "OK", publication)
 
 
 def _result(
@@ -510,15 +582,26 @@ def run_preview_one(
     lane = try_acquire_gpu_runtime_lane()
     if lane is None:
         return _result(reservation.run_id, PreviewRunStatus.BUSY, "GPU_BUSY")
-    owned: tuple[int, ...] = ()
+    session: _PreviewRuntimeSession | None = None
+    result: PreviewRunOneResult | None = None
+    cleanup_failed = False
     try:
         run_id, variation_index = reservation._consume()
         try:
-            owned = _owned_descriptors(fds)
-            publication = _execute_preview(owned, run_id, variation_index)
-            return _result(run_id, PreviewRunStatus.COMPLETED, "OK", publication)
+            session = open_preview_runtime_session(fds)
+            result = session.run_item(run_id, variation_index)
         except _PreviewRunFailure as error:
-            return _result(run_id, error.status, error.reason_code)
+            result = _result(run_id, error.status, error.reason_code)
     finally:
-        _close_descriptors(list(owned))
+        if session is not None:
+            cleanup_failed = session.close()
         lane.close()
+    if (
+        cleanup_failed
+        and result is not None
+        and result.status is PreviewRunStatus.COMPLETED
+    ):
+        return _result(result.run_id, PreviewRunStatus.FAILED, "CLEANUP_FAILED")
+    if result is None:
+        return _result(run_id, PreviewRunStatus.FAILED, "INTERNAL_FAILURE")
+    return result

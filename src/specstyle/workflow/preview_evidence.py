@@ -42,6 +42,7 @@ __all__ = (
     "PreviewEvidencePublication",
     "publish_preview_evidence",
     "reconcile_preview_display",
+    "verify_preview_evidence_publication",
 )
 
 _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}", re.ASCII)
@@ -64,7 +65,14 @@ class PreviewEvidencePublication:
     display_name: str
     artifact_id: ArtifactId
     content_sha256: Sha256
+    compiled_request_fingerprint: Sha256
     execution_fingerprint: Sha256
+    schema_version: str
+    variation_index: int
+    seed_algorithm: str
+    seed: int
+    resolution: tuple[int, int]
+    evidence_class: str
 
     def __post_init__(self) -> None:
         if (
@@ -74,7 +82,18 @@ class PreviewEvidencePublication:
             or _DISPLAY.fullmatch(self.display_name) is None
             or type(self.artifact_id) is not ArtifactId
             or type(self.content_sha256) is not Sha256
+            or type(self.compiled_request_fingerprint) is not Sha256
             or type(self.execution_fingerprint) is not Sha256
+            or self.schema_version != "specstyle.preview.evidence.v2"
+            or type(self.variation_index) is not int
+            or not 0 <= self.variation_index < 2**31
+            or self.seed_algorithm != "specstyle.seed.v1"
+            or type(self.seed) is not int
+            or not 0 <= self.seed < 2**63
+            or type(self.resolution) is not tuple
+            or len(self.resolution) != 2
+            or any(type(item) is not int or item <= 0 for item in self.resolution)
+            or self.evidence_class != "ENGINEERING_ONLY"
         ):
             raise _domain()
 
@@ -120,14 +139,20 @@ def _png_size(content: bytes) -> tuple[int, int]:
 
 def _artifact_material(
     artifact: object,
-) -> tuple[PreviewGeneratedArtifact, dict[str, object]]:
+) -> tuple[PreviewGeneratedArtifact, dict[str, object], dict[str, object]]:
     if type(artifact) is not PreviewGeneratedArtifact:
         raise _domain()
     _validate_execution_binding(artifact.binding)
     try:
         material = json.loads(artifact.binding.material_json)
-        graph = material["compiled_request"]["graph"]
+        compiled = material["compiled_request"]
+        graph = compiled["graph"]
         resolution = tuple(graph["resolution"])
+        generation = {
+            "variation_index": compiled["variation_index"],
+            "seed": compiled["seed"],
+            "resolution": list(compiled["resolution"]),
+        }
     except (KeyError, TypeError, ValueError, json.JSONDecodeError):
         raise _domain() from None
     if (
@@ -137,19 +162,22 @@ def _artifact_material(
         or hash_bytes(artifact.content) != artifact.content_sha256
     ):
         raise _domain()
-    return artifact, material
+    return artifact, material, generation
 
 
 def _record(
     run_id: str,
     display_name: str,
     artifact: PreviewGeneratedArtifact,
+    generation: dict[str, object],
 ) -> bytes:
     return canonical_json_bytes(
         {
-            "schema_version": "specstyle.preview.evidence.v1",
+            "schema_version": "specstyle.preview.evidence.v2",
             "run_id": run_id,
             "profile": "preview",
+            "evidence_class": "ENGINEERING_ONLY",
+            "generation": generation,
             "artifact": {
                 "artifact_id": artifact.artifact_id.value,
                 "file": "artifact.png",
@@ -259,7 +287,9 @@ def publish_preview_evidence(
 ) -> PreviewEvidencePublication:
     if type(run_id) is not str or _NAME.fullmatch(run_id) is None:
         raise _domain()
-    artifact, _material = _artifact_material(artifact)
+    artifact, material, generation = _artifact_material(artifact)
+    if material["compiled_request"]["run_id"] != run_id:
+        raise _domain("preview evidence run binding mismatch")
     display_name = f"{run_id}-{artifact.content_sha256.value[:16]}.png"
     private_fd = display_fd = -1
     try:
@@ -267,7 +297,7 @@ def publish_preview_evidence(
         display_fd, display_dev, display_identity = _duplicate_root(display_root_fd)
         if private_identity == display_identity:
             raise _domain()
-        record = _record(run_id, display_name, artifact)
+        record = _record(run_id, display_name, artifact, generation)
         _publish_private(private_fd, private_dev, run_id, artifact, record)
         _publish_display(display_fd, display_dev, display_name, artifact)
         return PreviewEvidencePublication(
@@ -275,11 +305,117 @@ def publish_preview_evidence(
             display_name,
             artifact.artifact_id,
             artifact.content_sha256,
+            artifact.binding.compiled_request_fingerprint,
             artifact.execution_fingerprint,
+            "specstyle.preview.evidence.v2",
+            generation["variation_index"],
+            generation["seed"]["algorithm"],
+            generation["seed"]["value"],
+            tuple(generation["resolution"]),
+            "ENGINEERING_ONLY",
         )
     finally:
         close_owned(display_fd, sys.exception())
         close_owned(private_fd, sys.exception())
+
+
+def _verify_stored_publication(
+    root_fd: int,
+    root_dev: int,
+    publication: PreviewEvidencePublication,
+) -> None:
+    opened = open_directory(
+        root_fd, publication.evidence_name, root_dev, missing_ok=True
+    )
+    if opened is None:
+        raise _infra("preview evidence record unavailable")
+    directory_fd = opened[0]
+    try:
+        if set(directory_names(directory_fd)) != {"artifact.png", "record.json"}:
+            raise _domain("invalid preview evidence record")
+        record_file = read_file(directory_fd, "record.json", 1, _RECORD_BYTES, root_dev)
+        artifact_file = read_file(directory_fd, "artifact.png", 1, _PNG_BYTES, root_dev)
+        if record_file is None or artifact_file is None:
+            raise _infra("preview evidence record unavailable")
+        raw = _strict_json(record_file.data)
+        if canonical_json_bytes(raw) != record_file.data:
+            raise _domain("invalid preview evidence record")
+        _match_publication_record(raw, artifact_file.data, publication)
+    except (CorruptStore, StoreIO, OSError):
+        raise _infra("preview evidence record unavailable") from None
+    finally:
+        close_owned(directory_fd, sys.exception())
+
+
+def _match_publication_record(
+    raw: dict[str, object], content: bytes, publication: PreviewEvidencePublication
+) -> None:
+    expected_top = {
+        "schema_version",
+        "run_id",
+        "profile",
+        "evidence_class",
+        "generation",
+        "artifact",
+        "planes",
+    }
+    artifact = raw.get("artifact")
+    if (
+        set(raw) != expected_top
+        or raw.get("schema_version") != publication.schema_version
+        or raw.get("run_id") != publication.evidence_name
+        or raw.get("profile") != "preview"
+        or raw.get("evidence_class") != publication.evidence_class
+        or raw.get("planes")
+        != {"verification": "NOT_RUN", "repair": "NOT_RUN", "export": "NOT_RUN"}
+        or not _valid_v2(raw)
+        or type(artifact) is not dict
+        or set(artifact)
+        != {
+            "artifact_id",
+            "file",
+            "display_file",
+            "content_sha256",
+            "compiled_request_fingerprint",
+            "execution_fingerprint",
+        }
+    ):
+        raise _domain("invalid preview evidence record")
+    generation = raw["generation"]
+    expected_generation = {
+        "variation_index": publication.variation_index,
+        "seed": {
+            "algorithm": publication.seed_algorithm,
+            "value": publication.seed,
+        },
+        "resolution": list(publication.resolution),
+    }
+    if (
+        generation != expected_generation
+        or artifact["artifact_id"] != publication.artifact_id.value
+        or artifact["file"] != "artifact.png"
+        or artifact["display_file"] != publication.display_name
+        or artifact["content_sha256"] != publication.content_sha256.value
+        or artifact["compiled_request_fingerprint"]
+        != publication.compiled_request_fingerprint.value
+        or artifact["execution_fingerprint"] != publication.execution_fingerprint.value
+        or hash_bytes(content) != publication.content_sha256
+        or _png_size(content) != publication.resolution
+    ):
+        raise _domain("preview evidence publication mismatch")
+
+
+def verify_preview_evidence_publication(
+    evidence_root_fd: int, publication: PreviewEvidencePublication, /
+) -> None:
+    if type(publication) is not PreviewEvidencePublication:
+        raise _domain()
+    root_fd = -1
+    try:
+        root_fd, root_dev, _identity = _duplicate_root(evidence_root_fd)
+        _verify_stored_publication(root_fd, root_dev, publication)
+    finally:
+        close_owned(root_fd, sys.exception())
 
 
 def _valid_record(root_fd: int, root_dev: int, name: str) -> tuple[str, Sha256] | None:
@@ -297,12 +433,18 @@ def _valid_record(root_fd: int, root_dev: int, name: str) -> tuple[str, Sha256] 
         if record_file is None or artifact_file is None:
             return None
         raw = _strict_json(record_file.data)
+        version = raw.get("schema_version")
         if (
-            raw.get("schema_version") != "specstyle.preview.evidence.v1"
+            version
+            not in {
+                "specstyle.preview.evidence.v1",
+                "specstyle.preview.evidence.v2",
+            }
             or raw.get("run_id") != name
             or raw.get("profile") != "preview"
             or raw.get("planes")
             != {"verification": "NOT_RUN", "repair": "NOT_RUN", "export": "NOT_RUN"}
+            or (version == "specstyle.preview.evidence.v2" and not _valid_v2(raw))
         ):
             return None
         artifact = raw.get("artifact")
@@ -321,6 +463,30 @@ def _valid_record(root_fd: int, root_dev: int, name: str) -> tuple[str, Sha256] 
         return None
     finally:
         close_owned(directory_fd, sys.exception())
+
+
+def _valid_v2(raw: dict[str, object]) -> bool:
+    generation = raw.get("generation")
+    if (
+        raw.get("evidence_class") != "ENGINEERING_ONLY"
+        or type(generation) is not dict
+        or set(generation) != {"variation_index", "seed", "resolution"}
+    ):
+        return False
+    seed = generation["seed"]
+    resolution = generation["resolution"]
+    return (
+        type(generation["variation_index"]) is int
+        and 0 <= generation["variation_index"] < 2**31
+        and type(seed) is dict
+        and set(seed) == {"algorithm", "value"}
+        and seed["algorithm"] == "specstyle.seed.v1"
+        and type(seed["value"]) is int
+        and 0 <= seed["value"] < 2**63
+        and type(resolution) is list
+        and len(resolution) == 2
+        and all(type(item) is int and item > 0 for item in resolution)
+    )
 
 
 def _remove_display_file(root_fd: int, root_dev: int, name: str) -> bool:
