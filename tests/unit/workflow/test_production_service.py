@@ -353,6 +353,7 @@ def test_prepare_export_builds_one_approved_xhs_item_without_expanding_public_ap
         ("output_profile", _HostileStr("xhs_grid")),
         ("variation_index", True),
         ("variation_index", -1),
+        ("variation_index", 2**31),
         ("variation_index", _HostileInt(0)),
         ("bundle_name", "bad/name"),
         ("bundle_name", _HostileStr("bundle-1")),

@@ -52,6 +52,7 @@ def _state(request: GenerationRequest) -> RepairStateKey:
     if (
         type(parameters) is not GenerationParameters
         or type(request.variation_index) is not int
+        or not 0 <= request.variation_index < 2**31
     ):
         raise DomainError("invalid repair history")
     return (
@@ -68,7 +69,11 @@ def _state_key(value: RepairStateKey) -> tuple[str, str, str, int]:
     if type(value) is not tuple or len(value) != 2:
         raise DomainError("invalid repair history")
     parameters, variation = value
-    if type(parameters) is not GenerationParameters or type(variation) is not int:
+    if (
+        type(parameters) is not GenerationParameters
+        or type(variation) is not int
+        or not 0 <= variation < 2**31
+    ):
         raise DomainError("invalid repair history")
     parameters = GenerationParameters(
         parameters.ip_adapter_scale,
@@ -256,7 +261,10 @@ def _check_initial(
     defaults = GenerationParameters(
         graph.ip_adapter_scale, graph.img2img_strength, graph.controlnet_scale
     )
-    if _state_key(_state(request)) != _state_key((defaults, 0)):
+    parameters, variation_index = _state(request)
+    if not 0 <= variation_index < 2**31 or _state_key(
+        (parameters, variation_index)
+    ) != _state_key((defaults, variation_index)):
         raise DomainError("invalid initial repair attempt")
     if (
         artifact.request_hash.value != request.request_hash.value

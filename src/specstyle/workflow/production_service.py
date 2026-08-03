@@ -184,7 +184,7 @@ class ProductionJobRequest:
             or type(self.output_profile) is not str
             or self.output_profile not in _OUTPUT_PROFILES
             or type(self.variation_index) is not int
-            or self.variation_index < 0
+            or not 0 <= self.variation_index < 2**31
             or type(self.bundle_name) is not str
         ):
             raise DomainError("invalid production job request")

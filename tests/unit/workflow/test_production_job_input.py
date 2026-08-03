@@ -26,6 +26,10 @@ from specstyle.spec.compiled_models import ResourcePin
 from tests.unit.spec.test_compiler import raw_spec
 
 
+class _HostileInt(int):
+    pass
+
+
 class _StyleResolver:
     def __init__(self, content: dict[str, bytes]) -> None:
         self._content = content
@@ -371,6 +375,47 @@ def test_open_refuses_a_normalized_style_hash_mismatch_before_cas_write(
         with pytest.raises(DomainError, match="^invalid production job input$"):
             module.open_production_job_input(*args)
         assert list(root.iterdir()) == []
+    finally:
+        for fd in reversed(fds):
+            os.close(fd)
+
+
+@pytest.mark.parametrize("variation_index", (True, _HostileInt(0), -1, 2**31))
+def test_open_rejects_variation_before_material_load_or_cas_write(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    variation_index: object,
+) -> None:
+    module = importlib.import_module("specstyle.workflow.production_job_input")
+    root, fds, args = _open_with_spec(module, tmp_path, _spec("0" * 64))
+    called: list[str] = []
+    monkeypatch.setattr(module, "_load_materials", lambda *_args: called.append("load"))
+    monkeypatch.setattr(module, "_store_style", lambda *_args: called.append("store"))
+    try:
+        with pytest.raises(DomainError, match="^invalid production job input$"):
+            module.open_production_job_input(
+                *args,
+                variation_index=variation_index,  # type: ignore[arg-type]
+            )
+        assert called == []
+        assert list(root.iterdir()) == []
+    finally:
+        for fd in reversed(fds):
+            os.close(fd)
+
+
+def test_open_carries_a_nonzero_variation_into_the_request(tmp_path: Path) -> None:
+    module = importlib.import_module("specstyle.workflow.production_job_input")
+    style = _png("blue")
+    normalized = _normalized_style(style)
+    _root, fds, args = _open_with_spec(
+        module, tmp_path, _spec(hash_bytes(normalized).value)
+    )
+    try:
+        issued = module.open_production_job_input(*args, variation_index=7)
+        assert issued.request.variation_index == 7
+        assert issued.style_assets(issued.request.style_references[0]) == normalized
+        issued.close()
     finally:
         for fd in reversed(fds):
             os.close(fd)

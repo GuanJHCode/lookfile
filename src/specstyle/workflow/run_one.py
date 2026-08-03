@@ -79,24 +79,32 @@ class ProductionRunOneFds:
 
 
 class ProductionRunOneReservation:
-    __slots__ = ("_token", "_consumed", "_job_id", "_lock")
+    __slots__ = ("_token", "_consumed", "_job_id", "_variation_index", "_lock")
 
-    def __init__(self, token: object, job_id: JobId, /) -> None:
+    def __init__(self, token: object, job_id: JobId, variation_index: int, /) -> None:
         if token is not _RESERVATION_TOKEN:
             raise TypeError("production run-one reservations are issued only by reserve")
         self._token, self._consumed, self._job_id = token, False, job_id
+        self._variation_index = _validate_variation_index(variation_index)
         self._lock = threading.Lock()
 
     @property
     def job_id(self) -> JobId:
         return self._job_id
 
-    def _consume(self) -> JobId:
+    @property
+    def variation_index(self) -> int:
+        return _validate_variation_index(self._variation_index)
+
+    def _consume(self) -> tuple[JobId, int]:
         with self._lock:
             if self._consumed:
                 raise _invalid()
+            if type(self._job_id) is not JobId:
+                raise _invalid()
+            variation_index = _validate_variation_index(self._variation_index)
             self._consumed = True
-            return self._job_id
+            return JobId(self._job_id.value), variation_index
 
     def __copy__(self) -> ProductionRunOneReservation:
         raise TypeError("production run-one reservations cannot be copied")
@@ -111,10 +119,21 @@ class ProductionRunOneReservation:
 _RESERVATION_TOKEN = object()
 
 
-def reserve_production_run_one() -> ProductionRunOneReservation:
+def _validate_variation_index(value: object) -> int:
+    if type(value) is not int or not 0 <= value < 2**31:
+        raise _invalid()
+    return value
+
+
+def reserve_production_run_one(
+    variation_index: int = 0,
+) -> ProductionRunOneReservation:
     """Reserve a stable job identity before opening the heavyweight runtime."""
+    variation_index = _validate_variation_index(variation_index)
     job_id = JobId(f"run-one-{uuid.uuid4().hex}")
-    return ProductionRunOneReservation(_RESERVATION_TOKEN, JobId(job_id.value))
+    return ProductionRunOneReservation(
+        _RESERVATION_TOKEN, JobId(job_id.value), variation_index
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -241,7 +260,7 @@ class ProductionRunOneExecution:
                  traceback: TracebackType | None, /) -> None:
         try:
             self.close()
-        except ProductionRunOneCleanupError as cleanup:
+        except ProductionRunOneCleanupError:
             if exc is None:
                 raise
             exc.add_note("production run-one cleanup failed")
@@ -306,7 +325,7 @@ def _close_descriptors(descriptors: list[int]) -> None:
 
 
 def _open_resources(
-    owned: tuple[int, ...], job_id: JobId
+    owned: tuple[int, ...], job_id: JobId, variation_index: int
 ) -> tuple[Any, ProductionJobInput, Any, JobStore]:
     # Lazy: CannyControlInputBuilder pulls OpenCV; keep run_one importable without cv2.
     from specstyle.generation.canny import CannyControlInputBuilder
@@ -326,6 +345,7 @@ def _open_resources(
     job_input = open_production_job_input(
         source, style, spec, styles, input_metadata, context, job_id,
         f"bundle-{job_id.value}",
+        variation_index=variation_index,
     )
     runtime = open_production_runtime(
         supply, supply_config.graph, environment, factory, job_input.style_assets,
@@ -353,14 +373,19 @@ def _close_open_failure(resources: tuple[Any, ...], export_fd: int | None) -> No
 def open_production_run_one(
     fds: ProductionRunOneFds, reservation: ProductionRunOneReservation, /
 ) -> ProductionRunOneExecution:
-    if type(fds) is not ProductionRunOneFds or type(reservation) is not ProductionRunOneReservation:
+    if (
+        type(fds) is not ProductionRunOneFds
+        or type(reservation) is not ProductionRunOneReservation
+    ):
         raise _invalid()
-    job_id = reservation._consume()
+    job_id, variation_index = reservation._consume()
     owned = _owned_descriptors(fds)
     export_fd: int | None = None
     runtime = job_input = supply = store = None
     try:
-        runtime, job_input, supply, store = _open_resources(owned, job_id)
+        runtime, job_input, supply, store = _open_resources(
+            owned, job_id, variation_index
+        )
         export_fd = owned[6]
         owned = (*owned[:6], *owned[7:])
         return ProductionRunOneExecution(

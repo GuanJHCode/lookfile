@@ -42,8 +42,8 @@ class _AlwaysEqualFloat(float):
         return True
 
 
-def _initial() -> tuple[object, object, object]:
-    request = _repair_request()
+def _initial(*, variation_index: int = 0) -> tuple[object, object, object]:
+    request = _repair_request(variation_index=variation_index)
     artifact = run_generation(FakeBackend(), request)
     plan = request.compiled_spec.verification_plans[0]
     report = VerificationReport(
@@ -87,6 +87,16 @@ def test_history_starts_with_a_frozen_exact_initial_attempt() -> None:
     )
     with pytest.raises(FrozenInstanceError):
         history.rounds = 2  # type: ignore[misc]
+
+
+def test_history_accepts_a_nonzero_initial_variation_and_derived_seed() -> None:
+    request, artifact, report = _initial(variation_index=7)
+
+    history = start_repair_history(request, artifact, report)
+
+    assert history.current_request.variation_index == 7
+    assert history.current_request.seed == request.seed
+    assert history.current_request.seed != _repair_request().seed
 
 
 @pytest.mark.parametrize("replacement", (ArtifactId("other"), "forged"))

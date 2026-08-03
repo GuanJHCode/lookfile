@@ -9,6 +9,11 @@ from types import SimpleNamespace
 import pytest
 
 from specstyle.domain.identifiers import JobId
+from specstyle.errors import DomainError
+
+
+class _HostileInt(int):
+    pass
 
 
 def test_fds_have_the_frozen_11_descriptor_boundary() -> None:
@@ -98,9 +103,28 @@ def test_reservation_is_fresh_and_cannot_be_serialized() -> None:
     reservation = reserve_production_run_one()
 
     assert type(reservation.job_id) is JobId
+    assert reservation.variation_index == 0
     for operation in (copy.copy, copy.deepcopy, pickle.dumps):
         with pytest.raises(TypeError):
             operation(reservation)
+
+
+@pytest.mark.parametrize("variation_index", (True, _HostileInt(0), -1, 2**31))
+def test_reservation_rejects_noncanonical_variation(variation_index: object) -> None:
+    from specstyle.workflow.run_one import reserve_production_run_one
+
+    with pytest.raises(DomainError, match="^invalid production run-one input$"):
+        reserve_production_run_one(variation_index)  # type: ignore[arg-type]
+
+
+def test_reservation_revalidates_variation_when_consumed() -> None:
+    from specstyle.workflow.run_one import reserve_production_run_one
+
+    reservation = reserve_production_run_one(7)
+    reservation._variation_index = True
+
+    with pytest.raises(DomainError, match="^invalid production run-one input$"):
+        reservation._consume()
 
 
 def test_open_duplicates_borrowed_fds_and_uses_the_shared_config_root(
@@ -157,7 +181,12 @@ def test_open_duplicates_borrowed_fds_and_uses_the_shared_config_root(
     monkeypatch.setattr(module, "capture_environment", lambda: object())
     monkeypatch.setattr(module, "make_production_compiler_context_factory", lambda *_args: object())
     monkeypatch.setattr(module.JobStore, "from_root_fd", lambda _fd: store)
-    monkeypatch.setattr(module, "open_production_job_input", lambda *_args: input_value)
+
+    def open_job_input(*_args: object, **kwargs: object) -> object:
+        seen["variation_index"] = kwargs.get("variation_index")
+        return input_value
+
+    monkeypatch.setattr(module, "open_production_job_input", open_job_input)
     monkeypatch.setattr(module, "open_production_runtime", lambda *_args: runtime)
     # Avoid importing real canny/cv2: stub the lazy import path inside _open_resources.
     import types
@@ -169,10 +198,11 @@ def test_open_duplicates_borrowed_fds_and_uses_the_shared_config_root(
 
     try:
         execution = module.open_production_run_one(
-            fds, module.reserve_production_run_one()
+            fds, module.reserve_production_run_one(7)
         )
         assert type(execution.job_id) is JobId
         assert seen["context"][0] == seen["supply_config"]
+        assert seen["variation_index"] == 7
         execution.close()
         assert closed == ["runtime", "input", "supply", "store"]
     finally:

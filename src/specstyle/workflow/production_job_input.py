@@ -564,14 +564,20 @@ def _validate_metadata_strings(metadata: ProductionJobInputMetadata) -> None:
 
 
 def _validate_open_inputs(
-    metadata: object, context_config: object, job_id: object, bundle_name: object
-) -> tuple[ProductionJobInputMetadata, ProductionContextConfig, JobId, str]:
+    metadata: object,
+    context_config: object,
+    job_id: object,
+    bundle_name: object,
+    variation_index: object,
+) -> tuple[ProductionJobInputMetadata, ProductionContextConfig, JobId, str, int]:
     if (
         type(metadata) is not ProductionJobInputMetadata
         or type(context_config) is not ProductionContextConfig
         or getattr(context_config, "_seal", None) is not _CONFIG_SEAL
         or type(job_id) is not JobId
         or type(bundle_name) is not str
+        or type(variation_index) is not int
+        or not 0 <= variation_index < 2**31
     ):
         raise _domain()
     _validate_metadata_strings(metadata)
@@ -579,7 +585,7 @@ def _validate_open_inputs(
     _assert_plain(bundle_name)
     if _BUNDLE.fullmatch(bundle_name) is None:
         raise _domain()
-    return metadata, context_config, job_id, bundle_name
+    return metadata, context_config, job_id, bundle_name, variation_index
 
 
 def _load_materials(
@@ -623,11 +629,15 @@ def open_production_job_input(
     job_id: JobId,
     bundle_name: str,
     /,
+    *,
+    variation_index: int = 0,
 ) -> ProductionJobInput:
     resolver: ContentAddressedStyleResolver | None = None
     try:
-        metadata, context_config, job_id, bundle_name = _validate_open_inputs(
-            metadata, context_config, job_id, bundle_name
+        metadata, context_config, job_id, bundle_name, variation_index = (
+            _validate_open_inputs(
+                metadata, context_config, job_id, bundle_name, variation_index
+            )
         )
         raw, spec_text, resolution, source_ref, source, style_ref, style_content = (
             _load_materials(source_fd, style_fd, spec_fd, metadata, context_config)
@@ -645,7 +655,7 @@ def open_production_job_input(
             (style_ref,),
             metadata.prompt,
             "xhs_grid",
-            0,
+            variation_index,
             bundle_name,
         )
         return _issue(request, _credits(source_ref, style_ref, metadata, raw), resolver)
