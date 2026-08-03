@@ -4,6 +4,9 @@ import copy
 from dataclasses import fields
 import os
 import pickle
+import sys
+import threading
+import types
 from types import SimpleNamespace
 
 import pytest
@@ -218,3 +221,297 @@ def test_open_duplicates_borrowed_fds_and_uses_the_shared_config_root(
                 os.close(descriptor)
             except OSError:
                 pass
+
+
+def _run_one_fds(tmp_path):
+    from specstyle.workflow.run_one import ProductionRunOneFds
+
+    root_paths = []
+    for index in range(7):
+        path = tmp_path / f"lane-root-{index}"
+        path.mkdir()
+        root_paths.append(path)
+    file_paths = []
+    for index in range(4):
+        path = tmp_path / f"lane-file-{index}.bin"
+        path.write_bytes(b"x")
+        file_paths.append(path)
+    roots = [os.open(path, os.O_RDONLY | os.O_DIRECTORY) for path in root_paths]
+    files = [os.open(path, os.O_RDONLY) for path in file_paths]
+    return ProductionRunOneFds(*roots, *files), (*roots, *files)
+
+
+def _contend_for_runtime_lane():
+    from specstyle.generation.gpu_runtime_lane import acquire_gpu_runtime_lane
+
+    started = threading.Event()
+    acquired = threading.Event()
+
+    def contend() -> None:
+        started.set()
+        with acquire_gpu_runtime_lane():
+            acquired.set()
+
+    thread = threading.Thread(target=contend, daemon=True)
+    thread.start()
+    assert started.wait(1.0)
+    return acquired, thread
+
+
+def test_production_execution_holds_runtime_lane_until_all_resources_close(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    import specstyle.workflow.run_one as module
+
+    fds, borrowed = _run_one_fds(tmp_path)
+    closed: list[str] = []
+
+    class Resource:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def close(self) -> None:
+            closed.append(self.name)
+
+    monkeypatch.setattr(
+        module,
+        "_open_resources",
+        lambda *_args: (
+            Resource("runtime"),
+            Resource("input"),
+            Resource("supply"),
+            Resource("store"),
+        ),
+    )
+    execution = module.open_production_run_one(fds, module.reserve_production_run_one())
+    acquired, thread = _contend_for_runtime_lane()
+    try:
+        assert not acquired.wait(0.1)
+        execution.close()
+        assert closed == ["runtime", "input", "supply", "store"]
+        assert acquired.wait(1.0)
+    finally:
+        execution.close()
+        for descriptor in borrowed:
+            os.close(descriptor)
+    thread.join(1.0)
+    assert not thread.is_alive()
+
+
+def test_production_open_failure_releases_runtime_lane(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    import specstyle.workflow.run_one as module
+    from specstyle.generation.gpu_runtime_lane import acquire_gpu_runtime_lane
+
+    fds, borrowed = _run_one_fds(tmp_path)
+
+    def fail(*_args: object) -> object:
+        raise RuntimeError("load failed")
+
+    monkeypatch.setattr(module, "_open_resources", fail)
+    try:
+        with pytest.raises(RuntimeError, match="load failed"):
+            module.open_production_run_one(fds, module.reserve_production_run_one())
+        with acquire_gpu_runtime_lane():
+            pass
+    finally:
+        for descriptor in borrowed:
+            os.close(descriptor)
+
+
+def test_production_cleanup_failure_still_releases_runtime_lane(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    import specstyle.workflow.run_one as module
+    from specstyle.generation.gpu_runtime_lane import acquire_gpu_runtime_lane
+
+    fds, borrowed = _run_one_fds(tmp_path)
+
+    class Resource:
+        def __init__(self, fail: bool = False) -> None:
+            self.fail = fail
+
+        def close(self) -> None:
+            if self.fail:
+                raise RuntimeError("cleanup failed")
+
+    monkeypatch.setattr(
+        module,
+        "_open_resources",
+        lambda *_args: (Resource(True), Resource(), Resource(), Resource()),
+    )
+    execution = module.open_production_run_one(fds, module.reserve_production_run_one())
+    try:
+        with pytest.raises(module.ProductionRunOneCleanupError):
+            execution.close()
+        with acquire_gpu_runtime_lane():
+            pass
+    finally:
+        execution.close()
+        for descriptor in borrowed:
+            os.close(descriptor)
+
+
+def test_runtime_lane_releases_only_after_blocked_resource_close_finishes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    import specstyle.workflow.run_one as module
+
+    fds, borrowed = _run_one_fds(tmp_path)
+    close_entered = threading.Event()
+    allow_close = threading.Event()
+
+    class Resource:
+        def __init__(self, blocking: bool = False) -> None:
+            self.blocking = blocking
+
+        def close(self) -> None:
+            if self.blocking:
+                close_entered.set()
+                assert allow_close.wait(1.0)
+
+    monkeypatch.setattr(
+        module,
+        "_open_resources",
+        lambda *_args: (Resource(True), Resource(), Resource(), Resource()),
+    )
+    execution = module.open_production_run_one(fds, module.reserve_production_run_one())
+    close_thread = threading.Thread(target=execution.close, daemon=True)
+    close_thread.start()
+    assert close_entered.wait(1.0)
+    acquired, contender = _contend_for_runtime_lane()
+    try:
+        assert not acquired.wait(0.1)
+        allow_close.set()
+        close_thread.join(1.0)
+        assert not close_thread.is_alive()
+        assert acquired.wait(1.0)
+    finally:
+        allow_close.set()
+        execution.close()
+        for descriptor in borrowed:
+            os.close(descriptor)
+    contender.join(1.0)
+    assert not contender.is_alive()
+
+
+def test_partial_open_failure_closes_resources_before_releasing_runtime_lane(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    import specstyle.workflow.run_one as module
+
+    fds, borrowed = _run_one_fds(tmp_path)
+    closed: list[str] = []
+    close_entered = threading.Event()
+    allow_close = threading.Event()
+    failure: list[BaseException] = []
+
+    class Resource:
+        def __init__(self, name: str, blocking: bool = False) -> None:
+            self.name = name
+            self.blocking = blocking
+
+        def close(self) -> None:
+            closed.append(self.name)
+            if self.blocking:
+                close_entered.set()
+                assert allow_close.wait(1.0)
+
+    supply = Resource("supply")
+    store = Resource("store")
+    job_input = Resource("input", True)
+    job_input.style_assets = object()
+    context = SimpleNamespace(canny=object())
+    supply_config = SimpleNamespace(graph=object(), manifests=(), approvals=())
+    monkeypatch.setattr(
+        module, "load_production_job_input_metadata", lambda _fd: object()
+    )
+    monkeypatch.setattr(
+        module, "load_production_context_config", lambda *_args: context
+    )
+    monkeypatch.setattr(
+        module, "load_production_supply_config", lambda _fd: supply_config
+    )
+    monkeypatch.setattr(module, "verify_pipeline_supply", lambda *_args: supply)
+    monkeypatch.setattr(module, "capture_environment", lambda: object())
+    monkeypatch.setattr(
+        module, "make_production_compiler_context_factory", lambda *_args: object()
+    )
+    monkeypatch.setattr(module.JobStore, "from_root_fd", lambda _fd: store)
+    monkeypatch.setattr(
+        module, "open_production_job_input", lambda *_args, **_kw: job_input
+    )
+
+    def fail_runtime(*_args: object) -> object:
+        raise RuntimeError("runtime load failed")
+
+    monkeypatch.setattr(module, "open_production_runtime", fail_runtime)
+    canny_stub = types.ModuleType("specstyle.generation.canny")
+    canny_stub.CannyControlInputBuilder = lambda _config: object()  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "specstyle.generation.canny", canny_stub)
+
+    def open_failed() -> None:
+        try:
+            module.open_production_run_one(fds, module.reserve_production_run_one())
+        except BaseException as error:
+            failure.append(error)
+
+    open_thread = threading.Thread(target=open_failed, daemon=True)
+    open_thread.start()
+    assert close_entered.wait(1.0)
+    acquired, contender = _contend_for_runtime_lane()
+    try:
+        assert not acquired.wait(0.1)
+        allow_close.set()
+        open_thread.join(1.0)
+        assert not open_thread.is_alive()
+        assert closed == ["input", "supply", "store"]
+        assert len(failure) == 1
+        assert str(failure[0]) == "runtime load failed"
+        assert acquired.wait(1.0)
+    finally:
+        allow_close.set()
+        for descriptor in borrowed:
+            os.close(descriptor)
+    contender.join(1.0)
+    assert not contender.is_alive()
+
+
+def test_export_fd_close_failure_reports_cleanup_and_releases_runtime_lane(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    import specstyle.workflow.run_one as module
+    from specstyle.generation.gpu_runtime_lane import acquire_gpu_runtime_lane
+
+    fds, borrowed = _run_one_fds(tmp_path)
+
+    class Resource:
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(
+        module,
+        "_open_resources",
+        lambda *_args: (Resource(), Resource(), Resource(), Resource()),
+    )
+    execution = module.open_production_run_one(fds, module.reserve_production_run_one())
+    export_fd = execution._export_root_fd
+    real_close = os.close
+
+    def close_with_reported_failure(fd: int) -> None:
+        real_close(fd)
+        if fd == export_fd:
+            raise OSError("reported close failure")
+
+    monkeypatch.setattr(module.os, "close", close_with_reported_failure)
+    try:
+        with pytest.raises(module.ProductionRunOneCleanupError):
+            execution.close()
+        with acquire_gpu_runtime_lane():
+            pass
+    finally:
+        monkeypatch.setattr(module.os, "close", real_close)
+        execution.close()
+        for descriptor in borrowed:
+            real_close(descriptor)
