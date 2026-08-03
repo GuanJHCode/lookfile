@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import fcntl
 import os
 import stat
@@ -181,6 +181,12 @@ class ProductionRunOneExecution:
             expected = self._job_store.load(self._job_id)
             if export_result.job_state != expected:
                 raise _unavailable()
+            # run() returns pre-export job_state (APPROVED); export_result is COMPLETED.
+            # Align both sides of the public result on the post-export JobStore state.
+            if job_result.job_state != export_result.job_state:
+                if job_result.job_state.job.job_id != export_result.job_state.job.job_id:
+                    raise _unavailable()
+                job_result = replace(job_result, job_state=export_result.job_state)
             result = ProductionRunOneResult(job_result, export_result)
             with self._lock:
                 self._result = result

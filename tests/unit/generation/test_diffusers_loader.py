@@ -325,8 +325,15 @@ def test_loads_local_safetensors_with_torch_dtype_and_sealed_capability(
     assert type(loaded).__name__ == "LoadedPipeline"
     assert diffusers.control_calls[0][1]["torch_dtype"] is torch.float16
     assert "dtype" not in diffusers.control_calls[0][1]
+    assert "subfolder" not in diffusers.control_calls[0][1]
+    assert "subfolder" not in diffusers.pipeline_calls[0][1]
     assert diffusers.pipeline_calls[0][1]["torch_dtype"] is torch.float16
     assert diffusers.pipeline_calls[0][1]["local_files_only"] is True
+    # /proc/self/fd/N + subfolder breaks pipeline load_config; join instead.
+    control_root = diffusers.control_calls[0][0][0]
+    pipeline_root = diffusers.pipeline_calls[0][0][0]
+    assert type(control_root) is str and control_root.endswith("/pipeline")
+    assert type(pipeline_root) is str and pipeline_root.endswith("/pipeline")
     assert not hasattr(loaded, "pipeline")
     borrowed = loaded.borrow_pipeline()
     assert borrowed.to_calls == [("cuda:0", torch.float16)]

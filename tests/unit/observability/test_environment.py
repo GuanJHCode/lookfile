@@ -466,6 +466,39 @@ def test_default_probe_uses_versions_from_imported_packages(
     assert probe.hip_version() == "7.2.1"
 
 
+class _TorchVersionLike(str):
+    """Mimic torch.torch_version.TorchVersion: str subclass with distinct type."""
+
+
+def test_default_probe_coerces_torchversion_like_objects_to_plain_str(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    modules = {
+        "torch": SimpleNamespace(
+            __version__=_TorchVersionLike("2.9.1+gitff65f5b"),
+            version=SimpleNamespace(hip=_TorchVersionLike("7.2.53211-e1a6bc5663")),
+        ),
+        "diffusers": SimpleNamespace(__version__="0.39.0"),
+    }
+    monkeypatch.setattr(
+        environment_module.importlib, "import_module", lambda name: modules[name]
+    )
+    probe = DefaultEnvironmentProbe()
+    pytorch = probe.pytorch_version()
+    hip = probe.hip_version()
+    assert type(pytorch) is str
+    assert type(hip) is str
+    assert pytorch == "2.9.1+gitff65f5b"
+    assert hip == "7.2.53211-e1a6bc5663"
+    snapshot = capture_environment(probe)
+    assert snapshot.pytorch_version == TextObservation(
+        "AVAILABLE", "2.9.1+gitff65f5b", None
+    )
+    assert snapshot.hip_version == TextObservation(
+        "AVAILABLE", "7.2.53211-e1a6bc5663", None
+    )
+
+
 def test_capture_environment_isolates_imported_package_version_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

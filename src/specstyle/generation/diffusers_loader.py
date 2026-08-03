@@ -192,7 +192,19 @@ def load_pipeline(
     raise DomainError("legacy production loader disabled; verified supply required")
 
 
-def _require_text(observation: object, expected: str) -> None:
+def _plain_expected_text(value: object) -> object:
+    """Normalize TorchVersion-like package versions to plain str for comparison."""
+    if value is None or type(value) is str:
+        return value
+    try:
+        text = str(value)
+    except Exception:
+        return value
+    return text if type(text) is str else value
+
+
+def _require_text(observation: object, expected: object) -> None:
+    expected = _plain_expected_text(expected)
     if (
         getattr(observation, "status", None) != "AVAILABLE"
         or getattr(observation, "value", None) != expected
@@ -208,7 +220,7 @@ def _validate_environment(environment: object, torch: Any, diffusers: Any) -> Sh
     _require_text(environment.hip_version, getattr(torch.version, "hip", None))
     _require_text(environment.pytorch_version, getattr(torch, "__version__", None))
     _require_text(environment.diffusers_version, _DIFFUSERS_VERSION)
-    if getattr(diffusers, "__version__", None) != _DIFFUSERS_VERSION:
+    if _plain_expected_text(getattr(diffusers, "__version__", None)) != _DIFFUSERS_VERSION:
         raise DomainError("production environment mismatch")
     devices = environment.hip_devices
     if getattr(devices, "status", None) != "AVAILABLE" or not devices.devices:
@@ -274,6 +286,28 @@ def _pretrained_kwargs(entrypoint: Any, torch: Any) -> dict[str, Any]:
     }
     if entrypoint.variant is not None:
         kwargs["variant"] = entrypoint.variant
+    return kwargs
+
+
+def _joined_component_root(component_path: str, entrypoint: Any) -> str:
+    """Join verified component fd path with entrypoint subfolder.
+
+    Diffusers pipeline ``load_config`` fails for ``/proc/self/fd/N`` + ``subfolder=``
+    (it looks for ``model_index.json`` on the fd root). Joining works for both
+    ControlNet model loads and full SDXL pipelines.
+    """
+    if type(component_path) is not str or not component_path:
+        raise InfrastructureError("pipeline loading failed")
+    subfolder = getattr(entrypoint, "subfolder", None)
+    if type(subfolder) is not str or not subfolder:
+        raise InfrastructureError("pipeline loading failed")
+    return f"{component_path.rstrip('/')}/{subfolder}"
+
+
+def _pretrained_load_kwargs(entrypoint: Any, torch: Any) -> dict[str, Any]:
+    """Kwargs for from_pretrained after the subfolder is joined into the root path."""
+    kwargs = _pretrained_kwargs(entrypoint, torch)
+    kwargs.pop("subfolder", None)
     return kwargs
 
 
@@ -504,14 +538,20 @@ def _load_production_pipeline_under_lease(
     pipeline = None
     failure: InfrastructureError | None = None
     try:
+        control_entrypoint = components["controlnet"].manifest.entrypoint
+        base_entrypoint = components["base"].manifest.entrypoint
         control = diffusers.ControlNetModel.from_pretrained(
-            components["controlnet"].borrow_loader_path(),
-            **_pretrained_kwargs(components["controlnet"].manifest.entrypoint, torch),
+            _joined_component_root(
+                components["controlnet"].borrow_loader_path(), control_entrypoint
+            ),
+            **_pretrained_load_kwargs(control_entrypoint, torch),
         )
         pipeline = diffusers.StableDiffusionXLControlNetImg2ImgPipeline.from_pretrained(
-            components["base"].borrow_loader_path(),
+            _joined_component_root(
+                components["base"].borrow_loader_path(), base_entrypoint
+            ),
             controlnet=control,
-            **_pretrained_kwargs(components["base"].manifest.entrypoint, torch),
+            **_pretrained_load_kwargs(base_entrypoint, torch),
         )
         pipeline.scheduler = diffusers.EulerDiscreteScheduler.from_config(
             pipeline.scheduler.config

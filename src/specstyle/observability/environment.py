@@ -95,6 +95,19 @@ def _safe_text(value: object) -> str:
     return value
 
 
+def _plain_text(value: object) -> str | None:
+    """Normalize package version objects (e.g. torch.TorchVersion) to plain str."""
+    if value is None:
+        return None
+    if type(value) is str:
+        return value
+    try:
+        text = str(value)
+    except Exception:
+        return None
+    return text if type(text) is str else None
+
+
 def _safe_integer(value: object) -> int:
     if type(value) is not int or value < 0:
         raise DomainError("invalid environment integer")
@@ -255,13 +268,14 @@ class DefaultEnvironmentProbe:
         return _read_rocm_release()
 
     def pytorch_version(self) -> str | None:
-        return importlib.import_module("torch").__version__
+        # torch may return TorchVersion (str subclass); snapshot requires plain str.
+        return _plain_text(importlib.import_module("torch").__version__)
 
     def diffusers_version(self) -> str | None:
-        return importlib.import_module("diffusers").__version__
+        return _plain_text(importlib.import_module("diffusers").__version__)
 
     def hip_version(self) -> str | None:
-        return importlib.import_module("torch").version.hip
+        return _plain_text(importlib.import_module("torch").version.hip)
 
     def device_count(self) -> int:
         cuda = importlib.import_module("torch").cuda

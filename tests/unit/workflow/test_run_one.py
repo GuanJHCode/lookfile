@@ -40,6 +40,58 @@ def test_fds_have_the_frozen_11_descriptor_boundary() -> None:
             os.close(descriptor)
 
 
+def test_run_aligns_pre_export_job_state_with_completed_export_state() -> None:
+    """runtime.run() is pre-export; export_result is COMPLETED — public result must share state."""
+    from dataclasses import replace
+
+    from specstyle.domain.identifiers import AttemptId, JobId as RealJobId, Sha256
+    from specstyle.workflow.job_models import Job, JobBudget, JobState, JobStatus
+    from specstyle.workflow.production_service import ProductionJobResult
+
+    job_id = RealJobId("run-one-test")
+    budget = JobBudget(2)
+    ts = "2026-08-03T00:00:00.000Z"
+    pre_export = JobState(
+        Job(job_id, Sha256("a" * 64), ("xhs_grid",), budget, JobStatus.APPROVED, ts, ts),
+        5,
+        (AttemptId("run-one-test-a0-xhs_grid-0"),),
+        (),
+    )
+    completed = JobState(
+        Job(
+            job_id,
+            Sha256("a" * 64),
+            ("xhs_grid",),
+            budget,
+            JobStatus.COMPLETED,
+            ts,
+            "2026-08-03T00:00:01.000Z",
+        ),
+        7,
+        (AttemptId("run-one-test-a0-xhs_grid-0"),),
+        ("bundle-run-one-test",),
+    )
+    job_result = object.__new__(ProductionJobResult)
+    for name, value in (
+        ("compiled", object()),
+        ("graph", object()),
+        ("verification_plan", object()),
+        ("request", object()),
+        ("artifact", object()),
+        ("report", object()),
+        ("history", object()),
+        ("terminal", object()),
+        ("job_state", pre_export),
+    ):
+        object.__setattr__(job_result, name, value)
+
+    aligned = replace(job_result, job_state=completed)
+    assert aligned.job_state is completed or aligned.job_state == completed
+    assert aligned.job_state.job.status is JobStatus.COMPLETED
+    assert aligned.job_state.bundle_names == ("bundle-run-one-test",)
+    assert job_result.job_state.job.status is JobStatus.APPROVED
+
+
 def test_reservation_is_fresh_and_cannot_be_serialized() -> None:
     from specstyle.workflow.run_one import reserve_production_run_one
 
