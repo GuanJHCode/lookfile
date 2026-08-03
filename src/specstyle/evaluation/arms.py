@@ -1,4 +1,4 @@
-"""Equal-budget five-arm evaluation runner (EVAL-002)."""
+"""TEST_ONLY callback runner; formal evidence uses protocol/evidence modules."""
 
 from __future__ import annotations
 
@@ -6,9 +6,14 @@ from dataclasses import dataclass
 from typing import Literal
 
 from specstyle.errors import DomainError
+from specstyle.evaluation.protocol import FORMAL_ARMS
 
 ArmId = Literal[
-    "A_single", "B_random_retry", "C_best_of_k", "D_repair_no_guard", "E_full"
+    "A_single_pass",
+    "B_random_retry",
+    "C_verifier_best_of_k",
+    "D_directed_no_guardrail",
+    "E_full_specstyle",
 ]
 
 
@@ -28,7 +33,7 @@ class ArmBudget:
 @dataclass(frozen=True, slots=True)
 class InputRecord:
     input_id: str
-    usable: bool  # human_usable only if True after arm
+    usable: bool  # TEST_ONLY; never accepted as a formal human label.
     generations_used: int
     terminal: str
 
@@ -49,6 +54,7 @@ class ArmResult:
 
 
 def assign_arm(input_id: str, arms: tuple[ArmId, ...]) -> ArmId:
+    """TEST_ONLY deterministic helper; formal evaluation runs every input in all arms."""
     if type(input_id) is not str or not input_id or type(arms) is not tuple or not arms:
         raise DomainError("invalid arm assignment")
     idx = sum(ord(c) for c in input_id) % len(arms)
@@ -61,7 +67,7 @@ def run_equal_budget_arms(
     *,
     arm_executor: object,
 ) -> tuple[ArmResult, ...]:
-    """Execute five arms with identical max generation budget.
+    """Execute a TEST_ONLY callback harness with one maximum generation budget.
 
     arm_executor(arm, input_id, budget) -> InputRecord
     """
@@ -69,13 +75,7 @@ def run_equal_budget_arms(
         raise DomainError("empty evaluation inputs")
     if not callable(arm_executor):
         raise DomainError("invalid arm executor")
-    arms: tuple[ArmId, ...] = (
-        "A_single",
-        "B_random_retry",
-        "C_best_of_k",
-        "D_repair_no_guard",
-        "E_full",
-    )
+    arms: tuple[ArmId, ...] = FORMAL_ARMS  # type: ignore[assignment]
     results: list[ArmResult] = []
     for arm in arms:
         records: list[InputRecord] = []
