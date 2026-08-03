@@ -197,3 +197,95 @@ def test_amd_launcher_is_a_thin_production_entrypoint() -> None:
     text = launcher.read_text(encoding="ascii")
     assert "specstyle.ui.production_app import main" in text
     assert "launch_production_ui_smoke" not in text
+
+
+def test_preview_bootstrap_failure_degrades_without_blocking_production(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from specstyle.ui import production_app
+
+    runtime = tmp_path / "runtime"
+    _trusted_roots(runtime)
+    paths = production_app.production_runtime_paths(runtime)
+    (runtime / "preview-config").mkdir(mode=0o700)
+    preview_paths = production_app.preview_runtime_paths(runtime)
+    base = object()
+    fallback = object()
+    monkeypatch.setattr(
+        production_app, "load_production_ui_compiler_context", lambda *_args: object()
+    )
+    monkeypatch.setattr(production_app, "build_default_services", lambda _: base)
+    monkeypatch.setattr(
+        production_app, "bind_production_run_one_services", lambda *_args: base
+    )
+    monkeypatch.setattr(
+        production_app,
+        "bind_preview_run_one_services",
+        lambda *_args: (_ for _ in ()).throw(DomainError("bad preview")),
+    )
+    monkeypatch.setattr(
+        production_app, "reconcile_preview_ui_display", lambda _paths: ()
+    )
+    monkeypatch.setattr(
+        production_app,
+        "bind_unavailable_preview_services",
+        lambda candidate, reason: (
+            fallback
+            if candidate is base and reason == "PREVIEW_UNAVAILABLE"
+            else pytest.fail("invalid fallback")
+        ),
+    )
+
+    result, exposed_paths = production_app.bind_optional_preview_services(
+        base, preview_paths
+    )
+
+    assert result is fallback
+    assert exposed_paths is None
+    allowed, blocked = production_app._gradio_paths(paths, preview_paths, exposed_paths)
+    assert str(preview_paths.display_root) not in allowed
+    assert str(preview_paths.preview_config_root) in blocked
+    assert str(preview_paths.evidence_root) in blocked
+    assert str(preview_paths.staging_root) in blocked
+    assert str(preview_paths.display_root) in blocked
+
+
+def test_launch_allowlists_preview_display_and_blocks_private_preview_roots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from specstyle.ui import production_app
+
+    runtime = tmp_path / "runtime"
+    _trusted_roots(runtime)
+    (runtime / "preview-config").mkdir(mode=0o700)
+    captured: dict[str, object] = {}
+
+    services = object()
+
+    def bind(base: object, preview_paths: object | None) -> tuple[object, object]:
+        assert base is services
+        captured["preview_paths"] = preview_paths
+        return base, preview_paths
+
+    monkeypatch.setattr(
+        production_app, "build_production_ui_services", lambda _paths: services
+    )
+    monkeypatch.setattr(production_app, "bind_optional_preview_services", bind)
+    monkeypatch.setattr(
+        production_app,
+        "launch_app",
+        lambda _services, **kwargs: captured.update(kwargs),
+    )
+
+    production_app.launch_production_ui(runtime, environ={})
+
+    preview = captured["preview_paths"]
+    assert preview is not None
+    assert captured["allowed_paths"] == [
+        str(runtime / "jobs" / "ui-production" / "export"),
+        str(preview.display_root),
+    ]
+    assert str(preview.preview_config_root) in captured["blocked_paths"]
+    assert str(preview.evidence_root) in captured["blocked_paths"]
+    assert str(preview.staging_root) in captured["blocked_paths"]
+    assert str(preview.display_root) not in captured["blocked_paths"]

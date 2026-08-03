@@ -26,6 +26,8 @@ from specstyle.ui.view_models import (
     JobStatusView,
     ProductionBatchUiView,
     ProductionRunUiView,
+    PreviewReadinessUiView,
+    PreviewRunUiView,
     QaRuleView,
     RepairStepView,
     ReplayView,
@@ -76,6 +78,10 @@ class UiServices:
             ProductionBatchUiView,
         ]
         | None
+    ) = None
+    get_preview_readiness: Callable[[], PreviewReadinessUiView] | None = None
+    run_preview_job: (
+        Callable[[object, object, object, str, str], PreviewRunUiView] | None
     ) = None
 
 
@@ -156,6 +162,8 @@ def bind_job_result_services(
         run_replay=replay,
         run_production_job=base.run_production_job,
         run_production_batch=base.run_production_batch,
+        get_preview_readiness=base.get_preview_readiness,
+        run_preview_job=base.run_preview_job,
     )
 
 
@@ -317,6 +325,39 @@ def create_app(services: UiServices) -> Any:
             view.evidence_tsv,
         )
 
+    def on_preview_readiness() -> str:
+        if services.get_preview_readiness is None:
+            return "UNAVAILABLE\tPREVIEW_UNAVAILABLE"
+        view = services.get_preview_readiness()
+        return f"{view.status}\t{view.message}"
+
+    def on_run_preview(
+        source_file: object,
+        style_file: object,
+        spec_file: object,
+        positive_prompt: str,
+        negative_prompt: str,
+    ) -> tuple[str, list[str], str]:
+        if services.run_preview_job is None:
+            return "\tUNAVAILABLE\tprofile=preview\tPREVIEW_UNAVAILABLE", [], ""
+        view = services.run_preview_job(
+            source_file,
+            style_file,
+            spec_file,
+            positive_prompt or "",
+            negative_prompt or "",
+        )
+        status = (
+            f"{view.run_id}\t{view.status}\tprofile={view.profile_label}\t"
+            f"{view.message}"
+        )
+        evidence = (
+            f"execution_fingerprint={view.execution_fingerprint or ''}\t"
+            f"verification={view.verification}\trepair={view.repair}\t"
+            f"export={view.export}"
+        )
+        return status, list(view.display_images), evidence
+
     with gr.Blocks(title="SpecStyle") as demo:
         gr.Markdown("# SpecStyle StyleOps")
         with gr.Tab("Spec (UI-001)"):
@@ -324,6 +365,33 @@ def create_app(services: UiServices) -> Any:
             compile_out = gr.Textbox(label="Compile result")
             gr.Button("Compile").click(
                 on_compile, inputs=[spec_in], outputs=[compile_out]
+            )
+        with gr.Tab("Preview"):
+            preview_source = gr.File(label="Preview source image")
+            preview_style = gr.File(label="Preview style reference")
+            preview_spec = gr.File(label="Preview spec")
+            preview_positive = gr.Textbox(label="Preview positive prompt")
+            preview_negative = gr.Textbox(label="Preview negative prompt")
+            preview_readiness = gr.Textbox(label="Preview readiness")
+            gr.Button("Refresh preview readiness").click(
+                on_preview_readiness,
+                outputs=[preview_readiness],
+                **_production_event_options("control"),
+            )
+            preview_status = gr.Textbox(label="Preview run status")
+            preview_gallery = gr.Gallery(label="Preview output")
+            preview_evidence = gr.Textbox(label="Preview execution evidence")
+            gr.Button("Run preview").click(
+                on_run_preview,
+                inputs=[
+                    preview_source,
+                    preview_style,
+                    preview_spec,
+                    preview_positive,
+                    preview_negative,
+                ],
+                outputs=[preview_status, preview_gallery, preview_evidence],
+                **_production_event_options("run"),
             )
         with gr.Tab("Job / QA (UI-002)"):
             source_file = gr.File(label="Source image")
@@ -458,6 +526,8 @@ __all__ = [
     "JobStatusView",
     "ProductionBatchUiView",
     "ProductionRunUiView",
+    "PreviewReadinessUiView",
+    "PreviewRunUiView",
     "QaRuleView",
     "RepairStepView",
     "ReplayView",

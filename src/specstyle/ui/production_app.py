@@ -11,6 +11,12 @@ from typing import Any
 
 from specstyle.errors import DomainError, InfrastructureError
 from specstyle.ui.app import UiServices, build_default_services, launch_app
+from specstyle.ui.preview_run import (
+    bind_preview_run_one_services,
+    bind_unavailable_preview_services,
+    reconcile_preview_ui_display,
+)
+from specstyle.ui.preview_ui_inputs import PreviewUiRuntimePaths
 from specstyle.ui.production_run import (
     ProductionUiRuntimePaths,
     bind_production_run_one_services,
@@ -20,9 +26,11 @@ from specstyle.workflow.production_bootstrap import (
 )
 
 __all__ = (
+    "bind_optional_preview_services",
     "build_production_ui_services",
     "launch_production_ui",
     "main",
+    "preview_runtime_paths",
     "production_runtime_paths",
 )
 
@@ -96,6 +104,46 @@ def production_runtime_paths(runtime_root: Path, /) -> ProductionUiRuntimePaths:
     )
 
 
+def preview_runtime_paths(runtime_root: Path, /) -> PreviewUiRuntimePaths:
+    root = Path(runtime_root)
+    _trusted_directory(root, "runtime root")
+    config = root / "config"
+    context_evidence = root / "evidence"
+    preview_config = root / "preview-config"
+    models = root / "models"
+    for path, label in (
+        (config, "config"),
+        (context_evidence, "evidence"),
+        (preview_config, "preview config"),
+        (models, "models"),
+    ):
+        _trusted_directory(path, label)
+    jobs = _mutable_parent(root / "jobs")
+    product = _private_directory(jobs / "ui-preview")
+    evidence, display, styles = (
+        _private_directory(product / name) for name in ("evidence", "display", "styles")
+    )
+    temporary = _mutable_parent(root / "tmp")
+    staging = _private_directory(temporary / "ui-preview")
+    return PreviewUiRuntimePaths(
+        config,
+        context_evidence,
+        preview_config,
+        models,
+        evidence,
+        display,
+        styles,
+        staging,
+    )
+
+
+def _optional_preview_runtime_paths(runtime_root: Path) -> PreviewUiRuntimePaths | None:
+    try:
+        return preview_runtime_paths(runtime_root)
+    except (DomainError, InfrastructureError):
+        return None
+
+
 def _open_directory(path: Path) -> int:
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
     if hasattr(os, "O_CLOEXEC"):
@@ -137,6 +185,23 @@ def build_production_ui_services(paths: ProductionUiRuntimePaths, /) -> UiServic
         _close_descriptors(descriptors, primary)
 
 
+def bind_optional_preview_services(
+    services: UiServices,
+    preview_paths: PreviewUiRuntimePaths | None,
+    /,
+) -> tuple[UiServices, PreviewUiRuntimePaths | None]:
+    if preview_paths is None:
+        return services, None
+    try:
+        reconcile_preview_ui_display(preview_paths)
+        return bind_preview_run_one_services(services, preview_paths), preview_paths
+    except Exception:
+        return (
+            bind_unavailable_preview_services(services, "PREVIEW_UNAVAILABLE"),
+            None,
+        )
+
+
 def _credential(value: object, label: str, minimum: int) -> str:
     if (
         type(value) is not str
@@ -158,6 +223,41 @@ def _authentication(host: str, environ: Mapping[str, str]) -> tuple[str, str] | 
     return _credential(username, "username", 3), _credential(password, "password", 16)
 
 
+def _gradio_paths(
+    paths: ProductionUiRuntimePaths,
+    preview_paths: PreviewUiRuntimePaths | None,
+    exposed_preview_paths: PreviewUiRuntimePaths | None,
+) -> tuple[list[str], list[str]]:
+    allowed = [str(paths.export_root)]
+    blocked = [
+        str(path)
+        for path in (
+            paths.config_root,
+            paths.evidence_root,
+            paths.model_root,
+            paths.state_root,
+            paths.artifact_root,
+            paths.style_asset_root,
+            paths.staging_root,
+        )
+    ]
+    if exposed_preview_paths is not None:
+        allowed.append(str(exposed_preview_paths.display_root))
+    if preview_paths is not None:
+        blocked.extend(
+            str(path)
+            for path in (
+                preview_paths.preview_config_root,
+                preview_paths.evidence_root,
+                preview_paths.style_asset_root,
+                preview_paths.staging_root,
+            )
+        )
+        if exposed_preview_paths is None:
+            blocked.append(str(preview_paths.display_root))
+    return allowed, blocked
+
+
 def launch_production_ui(
     runtime_root: Path,
     /,
@@ -172,26 +272,18 @@ def launch_production_ui(
         raise DomainError("invalid production UI port")
     auth = _authentication(host, os.environ if environ is None else environ)
     paths = production_runtime_paths(runtime_root)
-    services = build_production_ui_services(paths)
-    blocked = [
-        str(path)
-        for path in (
-            paths.config_root,
-            paths.evidence_root,
-            paths.model_root,
-            paths.state_root,
-            paths.artifact_root,
-            paths.style_asset_root,
-            paths.staging_root,
-        )
-    ]
+    preview_paths = _optional_preview_runtime_paths(runtime_root)
+    services, exposed_preview_paths = bind_optional_preview_services(
+        build_production_ui_services(paths), preview_paths
+    )
+    allowed, blocked = _gradio_paths(paths, preview_paths, exposed_preview_paths)
     return launch_app(
         services,
         server_name=host,
         server_port=port,
         share=False,
         auth=auth,
-        allowed_paths=[str(paths.export_root)],
+        allowed_paths=allowed,
         blocked_paths=blocked,
         max_file_size="32mb",
         show_error=False,

@@ -91,3 +91,22 @@ class ProductionBatchUiView:
     approved_images: tuple[str, ...]
     rejected_images: tuple[str, ...]
     evidence_tsv: str
+
+
+@dataclass(frozen=True, slots=True)
+class PreviewReadinessUiView:
+    status: str
+    message: str
+
+
+@dataclass(frozen=True, slots=True)
+class PreviewRunUiView:
+    run_id: str
+    status: str
+    message: str
+    profile_label: str
+    display_images: tuple[str, ...]
+    execution_fingerprint: str | None
+    verification: str
+    repair: str
+    export: str
