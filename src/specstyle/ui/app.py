@@ -45,7 +45,13 @@ class UiServices:
     get_qa_table: Callable[[], str] | None = None
     get_repair_timeline: Callable[[], str] | None = None
     get_export_summary: Callable[[], str] | None = None
-    run_replay: Callable[[], str] | None = None
+    run_replay: (
+        Callable[
+            [object, object, object, str, str, str | None, str | None, str | None, str],
+            str,
+        ]
+        | None
+    ) = None
     run_production_job: (
         Callable[
             [object, object, object, str, str, str | None, str | None, str | None, str],
@@ -134,7 +140,7 @@ def bind_job_result_services(
             f"sha={view.bundle_sha256}"
         )
 
-    def replay() -> str:
+    def replay(*_args: object) -> str:
         if replay_assessment is None:
             return "no replay"
         view = present_replay(replay_assessment)  # type: ignore[arg-type]
@@ -209,10 +215,30 @@ def create_app(services: UiServices) -> Any:
             return "no export"
         return services.get_export_summary()
 
-    def on_replay() -> str:
+    def on_replay(
+        source_file: object,
+        style_file: object,
+        spec_file: object,
+        positive_prompt: str,
+        negative_prompt: str,
+        source_url: str,
+        license_: str,
+        attribution: str,
+        consent: str,
+    ) -> str:
         if services.run_replay is None:
             return "no replay"
-        return services.run_replay()
+        return services.run_replay(
+            source_file,
+            style_file,
+            spec_file,
+            positive_prompt or "",
+            negative_prompt or "",
+            source_url or None,
+            license_ or None,
+            attribution or None,
+            consent,
+        )
 
     def on_run_production(
         source_file: object,
@@ -399,8 +425,19 @@ def create_app(services: UiServices) -> Any:
             replay_out = gr.Textbox(label="Replay assessment")
             gr.Button("Replay").click(
                 on_replay,
+                inputs=[
+                    source_file,
+                    style_file,
+                    production_spec,
+                    positive_prompt,
+                    negative_prompt,
+                    source_url,
+                    license_,
+                    attribution,
+                    consent,
+                ],
                 outputs=[replay_out],
-                **_production_event_options("control"),
+                **_production_event_options("run"),
             )
     return _enable_production_queue(demo)
 

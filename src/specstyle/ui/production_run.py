@@ -9,17 +9,19 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-import hashlib
-import json
-import os
 from pathlib import Path
-import shutil
-import stat
-import tempfile
 
 from specstyle.errors import DomainError, InfrastructureError
-from specstyle.domain.identifiers import JobId
+from specstyle.domain.identifiers import JobId, Sha256
 from specstyle.ui.app import UiServices
+from specstyle.ui.production_ui_inputs import (
+    OpenProductionUiFds as _OpenFds,
+    ProductionUiRuntimePaths,
+    StagedInputs as _StagedInputs,
+    UiRunInputError as _UiRunInputError,
+    cleanup_staging as _cleanup_staging,
+    stage_inputs as _stage_inputs,
+)
 from specstyle.ui.production_ui_projection import (
     batch_busy as _batch_busy,
     batch_failure as _batch_failure,
@@ -48,13 +50,27 @@ from specstyle.ui.view_models import (
 from specstyle.workflow.run_one import (
     ProductionRunOneCleanupError,
     ProductionRunOneFds,
+    ProductionRunOneResult,
     open_production_run_one,
     reserve_production_run_one,
 )
 from specstyle.workflow.job_store import JobStore
-from specstyle.workflow.production_job_input import (
-    validate_production_job_spec_text,
+from specstyle.workflow.production_replay import (
+    ProductionReplayAssessment,
+    ProductionReplayEvidence,
+    assess_production_replay,
+    capture_production_replay_evidence,
 )
+
+
+def _capture_replay_evidence(
+    result: object, form_fingerprint: Sha256
+) -> ProductionReplayEvidence:
+    if type(result) is not ProductionRunOneResult:
+        raise DomainError("invalid production replay evidence") from None
+    return capture_production_replay_evidence(
+        result.job_result, result.export_result.bundle, form_fingerprint
+    )
 
 
 def _read_persisted_job_status(state_root: Path, job_id: str) -> str | None:
@@ -71,40 +87,16 @@ def _read_persisted_job_status(state_root: Path, job_id: str) -> str | None:
         store.close()
 
 
-_METADATA_VERSION = "specstyle.production.job_input.v1"
-_PROMPT_TEMPLATE_ID = "ui-prompt-template"
-_PROMPT_TEMPLATE_REVISION = "v1"
-_PROMPT_TEMPLATE_SHA256 = (
-    "52e3054077274103b29878dc23626312ed3c4b27d4596579635d1af7bb90f84e"
-)
+@dataclass(frozen=True, slots=True)
+class _SingleRunOutcome:
+    projection: ProductionTerminalProjection
+    replay_evidence: ProductionReplayEvidence | None
 
 
 @dataclass(frozen=True, slots=True)
-class ProductionUiRuntimePaths:
-    config_root: Path
-    evidence_root: Path
-    model_root: Path
-    state_root: Path
-    artifact_root: Path
-    style_asset_root: Path
-    export_root: Path
-    staging_root: Path
-
-    def __post_init__(self) -> None:
-        values = tuple(Path(getattr(self, field)) for field in self.__slots__)
-        for field, value in zip(self.__slots__, values, strict=True):
-            if not value.is_dir():
-                raise DomainError(f"{field} unavailable")
-            object.__setattr__(self, field, value)
-        identities = tuple(
-            (value.stat().st_dev, value.stat().st_ino) for value in values
-        )
-        if len(set(identities)) != len(values):
-            raise DomainError("production runtime roots must be distinct")
-
-
-class _UiRunInputError(DomainError):
-    pass
+class _ReplayRunOutcome:
+    message: str
+    projection: ProductionTerminalProjection | None
 
 
 def _safe_message(value: object) -> str:
@@ -141,7 +133,7 @@ def bind_production_run_one_services(
         if token is None:
             return _busy()
         try:
-            projection = _run(
+            outcome = _run(
                 paths,
                 reserve,
                 open_run_one,
@@ -157,8 +149,12 @@ def bind_production_run_one_services(
                 ui_state,
                 token,
             )
-            ui_state.finish(token, projection)
-            return projection.run_view
+            ui_state.finish(
+                token,
+                outcome.projection,
+                replay_baseline=outcome.replay_evidence,
+            )
+            return outcome.projection.run_view
         except BaseException:
             ui_state.abandon(token)
             raise
@@ -205,6 +201,51 @@ def bind_production_run_one_services(
             ui_state.abandon(token)
             raise
 
+    def run_replay(
+        source: object,
+        style: object,
+        spec: object,
+        positive: str,
+        negative: str,
+        source_url: str | None,
+        license_: str | None,
+        attribution: str | None,
+        consent: str,
+    ) -> str:
+        token = ui_state.try_begin("replay", 1)
+        if token is None:
+            return "replay busy: production run active"
+        try:
+            baseline = ui_state.replay_baseline(token)
+            if baseline is None:
+                ui_state.abandon(token)
+                return "replay unavailable: run one successful production job first"
+            outcome = _run_replay(
+                paths,
+                reserve,
+                open_run_one,
+                source,
+                style,
+                spec,
+                positive,
+                negative,
+                source_url,
+                license_,
+                attribution,
+                consent,
+                baseline,
+                ui_state,
+                token,
+            )
+            if outcome.projection is None:
+                ui_state.abandon(token)
+            else:
+                ui_state.finish(token, outcome.projection)
+            return outcome.message
+        except BaseException:
+            ui_state.abandon(token)
+            raise
+
     return UiServices(
         base.compile_spec,
         get_job_status=ui_state.get_job_status,
@@ -212,7 +253,7 @@ def bind_production_run_one_services(
         get_qa_table=ui_state.get_qa_table,
         get_repair_timeline=ui_state.get_repair_timeline,
         get_export_summary=ui_state.get_export_summary,
-        run_replay=ui_state.run_replay,
+        run_replay=run_replay,
         run_production_job=run,
         run_production_batch=run_batch,
     )
@@ -233,7 +274,7 @@ def _run(
     consent: str,
     ui_state: ProductionUiState,
     token: int,
-) -> ProductionTerminalProjection:
+) -> _SingleRunOutcome:
     job_id = ""
     staged: _StagedInputs | None = None
     try:
@@ -254,18 +295,133 @@ def _run(
         job_id = getattr(getattr(reservation, "job_id", None), "value", "")
         ui_state.set_phase(token, "RESERVED", job_id=job_id)
         if ui_state.is_cancel_requested(token):
-            return _failure_projection(_cancelled(job_id))
+            return _SingleRunOutcome(_failure_projection(_cancelled(job_id)), None)
         ui_state.set_phase(token, "OPENING", job_id=job_id)
         return _execute(paths, staged, reservation, open_run_one, ui_state, token)
     except _UiRunInputError as exc:
-        return _failure_projection(_failure(job_id, _safe_message(exc)))
+        return _SingleRunOutcome(
+            _failure_projection(_failure(job_id, _safe_message(exc))), None
+        )
     except (DomainError, InfrastructureError) as exc:
-        return _failure_projection(_failure(job_id, _safe_message(exc)))
+        return _SingleRunOutcome(
+            _failure_projection(_failure(job_id, _safe_message(exc))), None
+        )
     except Exception:
-        return _failure_projection(_failure(job_id, "internal error"))
+        return _SingleRunOutcome(
+            _failure_projection(_failure(job_id, "internal error")), None
+        )
     finally:
         if staged is not None:
             _cleanup_staging(staged.directory)
+
+
+def _run_replay(
+    paths: ProductionUiRuntimePaths,
+    reserve: Callable[..., object],
+    open_run_one: Callable[[ProductionRunOneFds, object], object],
+    source: object,
+    style: object,
+    spec: object,
+    positive: str,
+    negative: str,
+    source_url: str | None,
+    license_: str | None,
+    attribution: str | None,
+    consent: str,
+    baseline: ProductionReplayEvidence,
+    ui_state: ProductionUiState,
+    token: int,
+) -> _ReplayRunOutcome:
+    job_id = ""
+    staged: _StagedInputs | None = None
+    try:
+        ui_state.set_phase(token, "STAGING")
+        staged = _stage_inputs(
+            paths,
+            source,
+            style,
+            spec,
+            positive,
+            negative,
+            source_url,
+            license_,
+            attribution,
+            consent,
+        )
+        if staged.form_fingerprint != baseline.form_fingerprint:
+            return _ReplayRunOutcome(
+                "REJECTED\tsame_input\tinput_form_fingerprint_mismatch", None
+            )
+        reservation = reserve(baseline.variation_index)
+        job_id = getattr(getattr(reservation, "job_id", None), "value", "")
+        ui_state.set_phase(token, "RESERVED", job_id=job_id)
+        if ui_state.is_cancel_requested(token):
+            projection = _failure_projection(_cancelled(job_id))
+            return _ReplayRunOutcome(
+                "UNVERIFIABLE\tsame_input\treplay_cancelled", projection
+            )
+        ui_state.set_phase(token, "OPENING", job_id=job_id)
+        outcome = _execute(paths, staged, reservation, open_run_one, ui_state, token)
+        return _assess_replay_outcome(baseline, outcome)
+    except _UiRunInputError as exc:
+        message = _safe_message(exc)
+        return _ReplayRunOutcome(f"REJECTED\tsame_input\tinput_error={message}", None)
+    except (DomainError, InfrastructureError) as exc:
+        return _replay_failure(job_id, _safe_message(exc))
+    except Exception:
+        return _replay_failure(job_id, "internal error")
+    finally:
+        if staged is not None:
+            _cleanup_staging(staged.directory)
+
+
+def _assess_replay_outcome(
+    baseline: ProductionReplayEvidence, outcome: _SingleRunOutcome
+) -> _ReplayRunOutcome:
+    candidate = outcome.replay_evidence
+    if candidate is None:
+        status = outcome.projection.run_view.status
+        message = f"UNVERIFIABLE\tsame_input\treplay_evidence_unavailable={status}"
+        return _ReplayRunOutcome(message, outcome.projection)
+    assessment = assess_production_replay(baseline, candidate)
+    return _ReplayRunOutcome(
+        _format_replay_assessment(baseline, candidate, assessment),
+        outcome.projection,
+    )
+
+
+def _replay_failure(job_id: str, message: str) -> _ReplayRunOutcome:
+    projection = _failure_projection(_failure(job_id, message)) if job_id else None
+    text = f"UNVERIFIABLE\tsame_input\treplay_failed={message}"
+    return _ReplayRunOutcome(text, projection)
+
+
+def _format_replay_assessment(
+    baseline: ProductionReplayEvidence,
+    candidate: ProductionReplayEvidence,
+    assessment: ProductionReplayAssessment,
+) -> str:
+    metrics = ",".join(
+        f"{item.level}:{item.rule_id}={item.delta:.12g}/{item.tolerance:.12g}"
+        for item in assessment.metrics
+    )
+    reasons = ",".join(assessment.reasons) or "none"
+    return "\t".join(
+        (
+            assessment.status,
+            assessment.mode,
+            f"baseline_job={baseline.job_id}",
+            f"replay_job={candidate.job_id}",
+            f"baseline_bundle={baseline.bundle_name}",
+            f"replay_bundle={candidate.bundle_name}",
+            "artifact_hash_equal="
+            + ("YES" if assessment.artifact_hash_equal else "NO"),
+            "pixel_exact_required=NO",
+            f"metrics={metrics or 'none'}",
+            f"l3={assessment.l3_status}",
+            f"reasons={reasons}",
+        )
+    )
 
 
 def _run_batch(
@@ -488,148 +644,6 @@ def _execute_batch_item(
         )
 
 
-@dataclass(frozen=True, slots=True)
-class _StagedInputs:
-    directory: Path
-    source: Path
-    style: Path
-    spec: Path
-    metadata: Path
-    max_rounds: int
-
-
-def _stage_inputs(
-    paths: ProductionUiRuntimePaths,
-    source: object,
-    style: object,
-    spec: object,
-    positive: str,
-    negative: str,
-    source_url: str | None,
-    license_: str | None,
-    attribution: str | None,
-    consent: str,
-) -> _StagedInputs:
-    source_path = _upload_path(source, "source")
-    style_path = _upload_path(style, "style")
-    spec_path = _upload_path(spec, "spec")
-    staged = Path(tempfile.mkdtemp(prefix="ui-run-", dir=paths.staging_root))
-    try:
-        staged.chmod(0o700)
-        source_dst = _copy_upload(source_path, staged / "source.bin")
-        style_dst = _copy_upload(style_path, staged / "style.bin")
-        spec_dst = _copy_upload(spec_path, staged / "spec.json")
-        metadata, max_rounds = _metadata(
-            source_dst,
-            style_dst,
-            spec_dst,
-            positive,
-            negative,
-            source_url,
-            license_,
-            attribution,
-            consent,
-        )
-        metadata_dst = _write_private(staged / "metadata.json", metadata)
-        return _StagedInputs(
-            staged, source_dst, style_dst, spec_dst, metadata_dst, max_rounds
-        )
-    except BaseException:
-        _cleanup_staging(staged)
-        raise
-
-
-def _upload_path(value: object, label: str) -> Path:
-    raw = value
-    if raw is None:
-        raise _UiRunInputError(f"{label} upload required")
-    if not isinstance(raw, str):
-        raw = getattr(raw, "name", None)
-    if not isinstance(raw, str) or not raw:
-        raise _UiRunInputError(f"{label} upload required")
-    path = Path(str(raw))
-    if not path.is_file():
-        raise _UiRunInputError(f"{label} upload required")
-    return path
-
-
-def _cleanup_staging(path: Path) -> None:
-    shutil.rmtree(path, ignore_errors=True)
-
-
-def _copy_upload(source: Path, target: Path) -> Path:
-    with source.open("rb") as input_file:
-        fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        try:
-            with os.fdopen(fd, "wb") as output:
-                fd = -1
-                shutil.copyfileobj(input_file, output, length=1024 * 1024)
-        except BaseException:
-            if fd >= 0:
-                os.close(fd)
-            raise
-    target.chmod(0o600)
-    return target
-
-
-def _metadata(
-    source: Path,
-    style: Path,
-    spec: Path,
-    positive: str,
-    negative: str,
-    source_url: str | None,
-    license_: str | None,
-    attribution: str | None,
-    consent: str,
-) -> tuple[bytes, int]:
-    summary = validate_production_job_spec_text(spec.read_text(encoding="utf-8"))
-    data = {
-        "schema_version": _METADATA_VERSION,
-        "source": {
-            "asset_id": _asset_id("source", source),
-            "credit": {
-                "source_url": source_url or None,
-                "license": license_ or None,
-                "attribution": attribution or None,
-                "consent": consent,
-            },
-        },
-        "style": {"asset_id": _asset_id("style", style)},
-        "prompt": {
-            "template_pin": {
-                "id": _PROMPT_TEMPLATE_ID,
-                "revision": _PROMPT_TEMPLATE_REVISION,
-                "sha256": _PROMPT_TEMPLATE_SHA256,
-            },
-            "preset_id": summary.preset_id,
-            "positive": positive,
-            "negative": negative,
-        },
-    }
-    encoded = json.dumps(data, separators=(",", ":"), sort_keys=False).encode("utf-8")
-    return encoded, summary.max_rounds
-
-
-def _asset_id(prefix: str, path: Path) -> str:
-    digest = hashlib.sha256(path.read_bytes()).hexdigest()
-    return f"{prefix}-{digest[:16]}"
-
-
-def _write_private(path: Path, content: bytes) -> Path:
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    try:
-        with os.fdopen(fd, "wb") as output:
-            fd = -1
-            output.write(content)
-    except BaseException:
-        if fd >= 0:
-            os.close(fd)
-        raise
-    path.chmod(0o600)
-    return path
-
-
 def _execute(
     paths: ProductionUiRuntimePaths,
     staged: _StagedInputs,
@@ -637,7 +651,7 @@ def _execute(
     open_run_one: Callable[[ProductionRunOneFds, object], object],
     ui_state: ProductionUiState,
     token: int,
-) -> ProductionTerminalProjection:
+) -> _SingleRunOutcome:
     job_id = getattr(getattr(reservation, "job_id", None), "value", "")
     with _OpenFds(paths, staged) as fds:
         execution = open_run_one(fds, reservation)
@@ -660,7 +674,7 @@ def _execute(
                 projection = _projection_with_message(
                     projection, "production run cancelled; cleanup failed"
                 )
-            return projection
+            return _SingleRunOutcome(projection, None)
         raise
     ui_state.set_phase(token, "RESULT_READY", job_id=job_id)
     cleanup_result, cleanup_error = _close_single_execution(ui_state, token, execution)
@@ -670,7 +684,9 @@ def _execute(
         except Exception:
             persisted = None
         if persisted is not None:
-            return _status_projection(job_id, persisted, cleanup_error)
+            return _SingleRunOutcome(
+                _status_projection(job_id, persisted, cleanup_error), None
+            )
         raise InfrastructureError(cleanup_error)
     result = cleanup_result if cleanup_result is not None else result
     projection = _terminal_projection(paths.export_root, result, job_id)
@@ -678,7 +694,18 @@ def _execute(
         projection = _projection_with_message(
             projection, "production run completed; cleanup failed"
         )
-    return projection
+    return _SingleRunOutcome(
+        projection, _try_capture_replay_evidence(result, staged.form_fingerprint)
+    )
+
+
+def _try_capture_replay_evidence(
+    result: object, form_fingerprint: Sha256
+) -> ProductionReplayEvidence | None:
+    try:
+        return _capture_replay_evidence(result, form_fingerprint)
+    except Exception:
+        return None
 
 
 def _close_single_execution(
@@ -691,49 +718,3 @@ def _close_single_execution(
     except Exception:
         return None, "internal cleanup error"
     return None, None
-
-
-class _OpenFds:
-    def __init__(self, paths: ProductionUiRuntimePaths, staged: _StagedInputs) -> None:
-        self._paths = paths
-        self._staged = staged
-        self._fds: list[int] = []
-
-    def __enter__(self) -> ProductionRunOneFds:
-        try:
-            for path in _root_paths(self._paths):
-                self._fds.append(os.open(path, os.O_RDONLY | os.O_DIRECTORY))
-            for path in (
-                self._staged.source,
-                self._staged.style,
-                self._staged.spec,
-                self._staged.metadata,
-            ):
-                self._assert_private_file(path)
-                self._fds.append(os.open(path, os.O_RDONLY))
-            return ProductionRunOneFds(*self._fds)
-        except BaseException:
-            self.__exit__(None, None, None)
-            raise
-
-    def __exit__(self, *_args: object) -> None:
-        while self._fds:
-            os.close(self._fds.pop())
-
-    @staticmethod
-    def _assert_private_file(path: Path) -> None:
-        info = path.stat()
-        if not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600:
-            raise DomainError("invalid staged production input")
-
-
-def _root_paths(paths: ProductionUiRuntimePaths) -> tuple[Path, ...]:
-    return (
-        paths.config_root,
-        paths.evidence_root,
-        paths.model_root,
-        paths.state_root,
-        paths.artifact_root,
-        paths.style_asset_root,
-        paths.export_root,
-    )

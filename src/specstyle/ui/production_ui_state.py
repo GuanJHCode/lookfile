@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 import threading
 
 from specstyle.ui.view_models import JobStatusView, ProductionRunUiView
+from specstyle.workflow.production_replay import ProductionReplayEvidence
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,10 +44,15 @@ class ProductionUiState:
         self._next_token = 0
         self._active: _ActiveInvocation | None = None
         self._terminal: ProductionTerminalProjection | None = None
+        self._replay_baseline: ProductionReplayEvidence | None = None
         self._status_reader = status_reader
 
     def try_begin(self, kind: str, total: int) -> int | None:
-        if kind not in ("single", "batch") or type(total) is not int or total < 1:
+        if (
+            kind not in ("single", "batch", "replay")
+            or type(total) is not int
+            or total < 1
+        ):
             raise TypeError("invalid production invocation")
         if not self._single_flight.acquire(blocking=False):
             return None
@@ -115,14 +121,36 @@ class ProductionUiState:
                 return "cancel requested"
             return self._cancel_execution(execution)
 
-    def finish(self, token: int, projection: ProductionTerminalProjection) -> None:
+    def finish(
+        self,
+        token: int,
+        projection: ProductionTerminalProjection,
+        *,
+        replay_baseline: ProductionReplayEvidence | None = None,
+    ) -> None:
         if type(projection) is not ProductionTerminalProjection:
             raise TypeError("invalid production terminal projection")
+        if (
+            replay_baseline is not None
+            and type(replay_baseline) is not ProductionReplayEvidence
+        ):
+            raise TypeError("invalid production replay baseline")
         with self._state_lock:
-            self._matching(token)
+            active = self._matching(token)
+            if replay_baseline is not None:
+                if active.kind != "single":
+                    raise TypeError("invalid production replay baseline")
+                self._replay_baseline = replay_baseline
             self._terminal = projection
             self._active = None
         self._single_flight.release()
+
+    def replay_baseline(self, token: int) -> ProductionReplayEvidence | None:
+        with self._state_lock:
+            active = self._matching(token)
+            if active.kind != "replay":
+                raise RuntimeError("invalid production replay invocation")
+            return self._replay_baseline
 
     def abandon(self, token: int) -> None:
         release = False
@@ -221,10 +249,6 @@ class ProductionUiState:
             return (
                 "no export" if self._terminal is None else self._terminal.export_summary
             )
-
-    @staticmethod
-    def run_replay() -> str:
-        return "replay unavailable: a second-material semantic replay run is required"
 
     def _matching(self, token: int) -> _ActiveInvocation:
         if self._active is None or self._active.token != token:

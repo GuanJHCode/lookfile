@@ -55,8 +55,16 @@ def test_production_binding_replaces_placeholder_state_handlers(
     assert services.get_repair_timeline() == "no repair"
     assert services.get_export_summary() == "no export"
     assert (
-        services.run_replay()
-        == "replay unavailable: a second-material semantic replay run is required"
+        services.run_replay(
+            *_uploads(tmp_path),
+            "positive",
+            "",
+            None,
+            None,
+            None,
+            "not_applicable",
+        )
+        == "replay unavailable: run one successful production job first"
     )
 
 
