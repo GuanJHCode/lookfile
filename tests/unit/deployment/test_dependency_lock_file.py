@@ -34,6 +34,7 @@ def test_checked_in_runtime_lock_never_contains_torch_packages() -> None:
     }
 
     assert names.isdisjoint({"torch", "torchvision", "torchaudio", "pytorch"})
+    assert "peft" in names
 
 
 def test_ruff_configuration_matches_the_runtime_lock() -> None:

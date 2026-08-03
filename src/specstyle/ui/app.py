@@ -26,6 +26,9 @@ from specstyle.ui.view_models import (
     JobStatusView,
     ProductionBatchUiView,
     ProductionRunUiView,
+    PreviewReadinessUiView,
+    PreviewRunUiView,
+    PreviewWallUiView,
     QaRuleView,
     RepairStepView,
     ReplayView,
@@ -76,6 +79,13 @@ class UiServices:
             ProductionBatchUiView,
         ]
         | None
+    ) = None
+    get_preview_readiness: Callable[[], PreviewReadinessUiView] | None = None
+    run_preview_job: (
+        Callable[[object, object, object, str, str], PreviewRunUiView] | None
+    ) = None
+    run_preview_wall: (
+        Callable[[object, object, object, str, str, int], PreviewWallUiView] | None
     ) = None
 
 
@@ -156,6 +166,9 @@ def bind_job_result_services(
         run_replay=replay,
         run_production_job=base.run_production_job,
         run_production_batch=base.run_production_batch,
+        get_preview_readiness=base.get_preview_readiness,
+        run_preview_job=base.run_preview_job,
+        run_preview_wall=base.run_preview_wall,
     )
 
 
@@ -317,6 +330,70 @@ def create_app(services: UiServices) -> Any:
             view.evidence_tsv,
         )
 
+    def on_preview_readiness() -> str:
+        if services.get_preview_readiness is None:
+            return "UNAVAILABLE\tPREVIEW_UNAVAILABLE"
+        view = services.get_preview_readiness()
+        return f"{view.status}\t{view.message}"
+
+    def on_run_preview(
+        source_file: object,
+        style_file: object,
+        spec_file: object,
+        positive_prompt: str,
+        negative_prompt: str,
+    ) -> tuple[str, list[str], str]:
+        if services.run_preview_job is None:
+            return "\tUNAVAILABLE\tprofile=preview\tPREVIEW_UNAVAILABLE", [], ""
+        view = services.run_preview_job(
+            source_file,
+            style_file,
+            spec_file,
+            positive_prompt or "",
+            negative_prompt or "",
+        )
+        status = (
+            f"{view.run_id}\t{view.status}\tprofile={view.profile_label}\t"
+            f"{view.message}"
+        )
+        evidence = (
+            f"execution_fingerprint={view.execution_fingerprint or ''}\t"
+            f"verification={view.verification}\trepair={view.repair}\t"
+            f"export={view.export}"
+        )
+        return status, list(view.display_images), evidence
+
+    def on_run_preview_wall(
+        source_file: object,
+        style_file: object,
+        spec_file: object,
+        positive_prompt: str,
+        negative_prompt: str,
+        wall_count: float,
+    ) -> tuple[str, list[str], str]:
+        if services.run_preview_wall is None:
+            return "UNAVAILABLE\tprofile=preview\tENGINEERING_ONLY", [], ""
+        count: object = wall_count
+        if type(wall_count) is float and wall_count.is_integer():
+            count = int(wall_count)
+        view = services.run_preview_wall(
+            source_file,
+            style_file,
+            spec_file,
+            positive_prompt or "",
+            negative_prompt or "",
+            count,  # type: ignore[arg-type]
+        )
+        status = (
+            f"{view.wall_id}\t{view.status}\tprofile={view.profile_label}\t"
+            f"{view.evidence_class}\t{view.message}"
+        )
+        evidence = (
+            f"verification={view.verification}\trepair={view.repair}\t"
+            f"export={view.export}\n{view.evidence_tsv}"
+        )
+        return status, list(view.display_images), evidence
+
     with gr.Blocks(title="SpecStyle") as demo:
         gr.Markdown("# SpecStyle StyleOps")
         with gr.Tab("Spec (UI-001)"):
@@ -324,6 +401,68 @@ def create_app(services: UiServices) -> Any:
             compile_out = gr.Textbox(label="Compile result")
             gr.Button("Compile").click(
                 on_compile, inputs=[spec_in], outputs=[compile_out]
+            )
+        with gr.Tab("Preview"):
+            preview_source = gr.File(label="Preview source image")
+            preview_style = gr.File(label="Preview style reference")
+            preview_spec = gr.File(label="Preview spec")
+            preview_positive = gr.Textbox(label="Preview positive prompt")
+            preview_negative = gr.Textbox(label="Preview negative prompt")
+            preview_readiness = gr.Textbox(label="Preview readiness")
+            gr.Button("Refresh preview readiness").click(
+                on_preview_readiness,
+                outputs=[preview_readiness],
+                **_production_event_options("control"),
+            )
+            preview_status = gr.Textbox(label="Preview run status")
+            preview_gallery = gr.Gallery(label="Preview output")
+            preview_evidence = gr.Textbox(label="Preview execution evidence")
+            gr.Button("Run preview").click(
+                on_run_preview,
+                inputs=[
+                    preview_source,
+                    preview_style,
+                    preview_spec,
+                    preview_positive,
+                    preview_negative,
+                ],
+                outputs=[preview_status, preview_gallery, preview_evidence],
+                **_production_event_options("run"),
+            )
+            preview_wall_count = gr.Slider(
+                minimum=1,
+                maximum=4,
+                step=1,
+                value=4,
+                label="Engineering wall seeds",
+            )
+            preview_wall_status = gr.Textbox(label="Engineering wall status")
+            preview_wall_gallery = gr.Gallery(
+                label="Engineering wall output",
+                columns=4,
+                rows=1,
+                height=360,
+                object_fit="contain",
+            )
+            preview_wall_evidence = gr.Textbox(
+                label="Engineering-only evidence", lines=10
+            )
+            gr.Button("Generate engineering wall").click(
+                on_run_preview_wall,
+                inputs=[
+                    preview_source,
+                    preview_style,
+                    preview_spec,
+                    preview_positive,
+                    preview_negative,
+                    preview_wall_count,
+                ],
+                outputs=[
+                    preview_wall_status,
+                    preview_wall_gallery,
+                    preview_wall_evidence,
+                ],
+                **_production_event_options("run"),
             )
         with gr.Tab("Job / QA (UI-002)"):
             source_file = gr.File(label="Source image")
@@ -458,6 +597,9 @@ __all__ = [
     "JobStatusView",
     "ProductionBatchUiView",
     "ProductionRunUiView",
+    "PreviewReadinessUiView",
+    "PreviewRunUiView",
+    "PreviewWallUiView",
     "QaRuleView",
     "RepairStepView",
     "ReplayView",

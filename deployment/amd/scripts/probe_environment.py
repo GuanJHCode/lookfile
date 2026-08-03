@@ -66,6 +66,7 @@ DEPENDENCIES = {
     "orjson": "3.11.9",
     "packaging": "26.0",
     "pandas": "2.2.3",
+    "peft": "0.18.1",
     "Pillow": "12.3.0",
     "psutil": "7.1.0",
     "pydantic": "2.11.10",

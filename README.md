@@ -21,20 +21,32 @@ The following path has been exercised on an AMD Radeon ROCm 7.2.1 runtime:
    ControlNet Canny supply.
 2. Upload one source image, one style reference, and one Style Spec through the
    authenticated Gradio application.
-3. Run a production job or a sequential two-to-four variation batch.
+3. Run an isolated LCM Preview or a Production job. Preview can publish a
+   sequential one-to-four variation engineering wall from one staged input set.
 4. Observe live persisted job status, request cancellation, and display approved
    and rejected outputs, QA rows, deterministic seed evidence, and the published
    bundle digest.
 
-The current AMD candidate is `2be6547`. It serves 49 Gradio components on the
-isolated candidate port and passed 874 affected AMD tests with one capability
+The current AMD candidate is `fd4e45b`. It serves 71 Gradio components on the
+isolated candidate port and passed 1,009 affected AMD tests with one capability
 skip, plus repository-configured Ruff check and format gates. The stable
-`1a1af45` service remained online during candidate validation.
+`657ac0b` service remained online during candidate validation.
 
 The Radeon runtime used PyTorch `2.9.1+gitff65f5b` with HIP
 `7.2.53211-e1a6bc5663` and Diffusers `0.39.0`. Real GPU evidence was collected
 on the following commits, all of which are ancestors of the current candidate:
 
+- `fd4e45b`: an actual browser-driven Gradio Preview uploaded the source, style
+  reference, and Spec, refreshed readiness, and generated a four-seed wall. The
+  UI completed in 65.38 seconds; the workflow manifest reports four completed
+  items, four unique content hashes, zero failures, and completed cleanup. All
+  four outputs are visible in one row. This is engineering execution evidence;
+  quality and diversity remain `NOT_EVALUATED`.
+- `4cc3da8`: the strict local LCM Preview loader completed a Radeon N=4 wall
+  while preserving the reusable SDXL/Canny/IP-Adapter/LCM-LoRA runtime integrity
+  contract. Preview evidence records deterministic seeds, content hashes,
+  execution fingerprints, FP16 at-rest VAE state, FP32 VAE compute, and the
+  Diffusers force-upcast round trip.
 - `a3832be`: one interactive job traversed `OPENING`, `GENERATING`,
   `VERIFYING`, `CLEANUP`, and `COMPLETED`; controls stayed responsive during
   generation. A separate real job was cancelled during `GENERATING` and
@@ -62,17 +74,25 @@ on the following commits, all of which are ancestors of the current candidate:
   `run-one-77e54905ae7c4d0a88d8e2d7f1bd6c4d` completed and exported an
   approved `1920x1080` PNG with single-item sequence semantics.
 
-## Known submission gaps
+The checked-in competition pack contains the English Project Profile source,
+sanitized Radeon evidence, media provenance, a rendered PDF, a presentation,
+and a 3-5 minute demo video under
+[`submission/track1-specstyle/`](submission/track1-specstyle/).
 
-- Preview is a compile-time contract only. No approved Turbo or LCM supply is
-  included, and Preview must not be routed through the Production pipeline.
+## Evidence boundaries and remaining evaluation work
+
+- Preview is a separate LCM execution profile and never enters the approved
+  Production package. Its current N=4 wall is engineering evidence, not a
+  calibrated quality or diversity result.
 - L2 remains advisory until real held-out human annotations replace the current
   placeholder calibration evidence. No universal L2 threshold is claimed.
 - No calibrated L3 domain plugin is enabled. `NOT_APPLICABLE` and
   `UNVERIFIABLE` are not presented as `PASS`.
 - A real failure-to-repair-to-reverification Radeon comparison, five-arm
-  equal-budget ablation, and blind human evaluation are still required for the
-  full competition claim.
+  equal-budget ablation, and blind human evaluation require approved held-out
+  assets, independent labels, and a trusted Production threshold package. The
+  code paths and fail-closed evidence protocol exist; the empirical result is
+  not claimed.
 - The post-`2be6547` Production `VALIDATED` evidence gate has CPU verification
   but has not been exercised against an approved threshold package on Radeon.
 

@@ -13,11 +13,16 @@ from typing import Any
 
 from specstyle.domain.identifiers import JobId
 from specstyle.errors import DomainError, InfrastructureError
+from specstyle.generation.gpu_runtime_lane import (
+    GpuRuntimeLaneLease,
+    acquire_gpu_runtime_lane,
+)
 from specstyle.generation.model_approval import verify_pipeline_supply
 from specstyle.observability.environment import capture_environment
 from specstyle.production.context_config import (
     load_production_context_config,
     make_production_compiler_context_factory,
+    require_validated_production_threshold,
 )
 from specstyle.production.supply_config import load_production_supply_config
 from specstyle.workflow.job_models import JobState
@@ -178,6 +183,7 @@ class ProductionRunOneExecution:
         "_pending_cancel",
         "_result",
         "_run_started",
+        "_runtime_lane",
         "_runtime",
         "_supply",
     )
@@ -190,14 +196,18 @@ class ProductionRunOneExecution:
         supply: Any,
         job_store: JobStore,
         export_root_fd: int,
+        runtime_lane: GpuRuntimeLaneLease,
         /,
     ) -> None:
+        if type(runtime_lane) is not GpuRuntimeLaneLease:
+            raise _invalid()
         self._job_id, self._runtime, self._asset_input = job_id, runtime, asset_input
         self._supply, self._job_store, self._export_root_fd = (
             supply,
             job_store,
             export_root_fd,
         )
+        self._runtime_lane = runtime_lane
         self._lock, self._closed, self._run_started = threading.RLock(), False, False
         self._pending_cancel: str | None = None
         self._result: ProductionRunOneResult | None = None
@@ -264,21 +274,24 @@ class ProductionRunOneExecution:
             if self._closed:
                 return
             self._closed = True
-        failures: list[BaseException] = []
-        for resource in (
-            self._runtime,
-            self._asset_input,
-            self._supply,
-            self._job_store,
-        ):
-            try:
-                resource.close()
-            except BaseException as error:
-                failures.append(error)
         try:
-            os.close(self._export_root_fd)
-        except OSError as error:
-            failures.append(error)
+            failures: list[BaseException] = []
+            for resource in (
+                self._runtime,
+                self._asset_input,
+                self._supply,
+                self._job_store,
+            ):
+                try:
+                    resource.close()
+                except BaseException as error:
+                    failures.append(error)
+            try:
+                os.close(self._export_root_fd)
+            except OSError as error:
+                failures.append(error)
+        finally:
+            self._runtime_lane.close()
         if failures:
             cleanup = ProductionRunOneCleanupError(self._result)
             for error in failures:
@@ -374,9 +387,6 @@ def _close_descriptors(descriptors: list[int]) -> None:
 def _open_resources(
     owned: tuple[int, ...], job_id: JobId, variation_index: int
 ) -> tuple[Any, ProductionJobInput, Any, JobStore]:
-    # Lazy: CannyControlInputBuilder pulls OpenCV; keep run_one importable without cv2.
-    from specstyle.generation.canny import CannyControlInputBuilder
-
     (
         config,
         evidence,
@@ -390,40 +400,52 @@ def _open_resources(
         spec,
         metadata,
     ) = owned
-    input_metadata = load_production_job_input_metadata(metadata)
-    context = load_production_context_config(config, evidence)
-    supply_config = load_production_supply_config(config)
-    supply = verify_pipeline_supply(
-        models, supply_config.graph, supply_config.manifests, supply_config.approvals
-    )
-    environment = capture_environment()
-    factory = make_production_compiler_context_factory(
-        context, environment, supply_config.graph
-    )
-    store = JobStore.from_root_fd(state)
-    job_input = open_production_job_input(
-        source,
-        style,
-        spec,
-        styles,
-        input_metadata,
-        context,
-        job_id,
-        f"bundle-{job_id.value}",
-        variation_index=variation_index,
-    )
-    runtime = open_production_runtime(
-        supply,
-        supply_config.graph,
-        environment,
-        factory,
-        job_input.style_assets,
-        CannyControlInputBuilder(context.canny),
-        production_l1_rule_bindings(),
-        store,
-        artifacts,
-    )
-    return runtime, job_input, supply, store
+    supply = store = job_input = None
+    try:
+        context = load_production_context_config(config, evidence)
+        require_validated_production_threshold(context)
+        # Lazy: CannyControlInputBuilder pulls OpenCV; keep run_one importable without cv2.
+        from specstyle.generation.canny import CannyControlInputBuilder
+
+        input_metadata = load_production_job_input_metadata(metadata)
+        supply_config = load_production_supply_config(config)
+        supply = verify_pipeline_supply(
+            models,
+            supply_config.graph,
+            supply_config.manifests,
+            supply_config.approvals,
+        )
+        environment = capture_environment()
+        factory = make_production_compiler_context_factory(
+            context, environment, supply_config.graph
+        )
+        store = JobStore.from_root_fd(state)
+        job_input = open_production_job_input(
+            source,
+            style,
+            spec,
+            styles,
+            input_metadata,
+            context,
+            job_id,
+            f"bundle-{job_id.value}",
+            variation_index=variation_index,
+        )
+        runtime = open_production_runtime(
+            supply,
+            supply_config.graph,
+            environment,
+            factory,
+            job_input.style_assets,
+            CannyControlInputBuilder(context.canny),
+            production_l1_rule_bindings(),
+            store,
+            artifacts,
+        )
+        return runtime, job_input, supply, store
+    except BaseException:
+        _close_open_failure((job_input, supply, store), None)
+        raise
 
 
 def _close_open_failure(resources: tuple[Any, ...], export_fd: int | None) -> None:
@@ -449,21 +471,28 @@ def open_production_run_one(
         or type(reservation) is not ProductionRunOneReservation
     ):
         raise _invalid()
-    job_id, variation_index = reservation._consume()
-    owned = _owned_descriptors(fds)
+    runtime_lane = acquire_gpu_runtime_lane()
+    owned: tuple[int, ...] = ()
     export_fd: int | None = None
+    transferred = False
     runtime = job_input = supply = store = None
     try:
+        job_id, variation_index = reservation._consume()
+        owned = _owned_descriptors(fds)
         runtime, job_input, supply, store = _open_resources(
             owned, job_id, variation_index
         )
         export_fd = owned[6]
         owned = (*owned[:6], *owned[7:])
-        return ProductionRunOneExecution(
-            job_id, runtime, job_input, supply, store, export_fd
+        execution = ProductionRunOneExecution(
+            job_id, runtime, job_input, supply, store, export_fd, runtime_lane
         )
+        transferred = True
+        return execution
     except BaseException:
         _close_open_failure((runtime, job_input, supply, store), export_fd)
         raise
     finally:
         _close_descriptors(list(owned))
+        if not transferred:
+            runtime_lane.close()

@@ -65,6 +65,7 @@ def test_lock_covers_verified_amd_ui_runtime() -> None:
     assert installer.DEPENDENCIES["python-multipart"] == "0.0.32"
     assert installer.DEPENDENCIES["starlette"] == "1.3.1"
     assert installer.DEPENDENCIES["importlib-metadata"] == "9.0.0"
+    assert installer.DEPENDENCIES["peft"] == "0.18.1"
     assert {
         "Brotli",
         "groovy",

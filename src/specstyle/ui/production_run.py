@@ -8,7 +8,7 @@ backends directly.
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from specstyle.errors import DomainError, InfrastructureError
@@ -256,6 +256,20 @@ def bind_production_run_one_services(
         run_replay=run_replay,
         run_production_job=run,
         run_production_batch=run_batch,
+        get_preview_readiness=base.get_preview_readiness,
+        run_preview_job=base.run_preview_job,
+        run_preview_wall=base.run_preview_wall,
+    )
+
+
+def bind_unavailable_production_services(base: UiServices, reason: str) -> UiServices:
+    if type(base) is not UiServices or type(reason) is not str or not reason:
+        raise DomainError("invalid unavailable production services")
+    return replace(
+        base,
+        run_replay=lambda *_args: reason,
+        run_production_job=lambda *_args: _failure("", reason),
+        run_production_batch=lambda *_args: _batch_failure(reason),
     )
 
 

@@ -140,8 +140,7 @@ def _validate_binding(
     if rebuilt != source:
         raise DomainError("invalid Canny builder input")
     if (
-        graph.generation_profile != "production"
-        or graph.controlnet.role != "controlnet"
+        graph.controlnet.role != "controlnet"
         or graph.controlnet.controlnet_type != "canny"
         or graph.resolution != (rebuilt.width, rebuilt.height)
     ):

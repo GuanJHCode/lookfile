@@ -29,6 +29,33 @@ class _NamedString(str):
     pass
 
 
+def test_unavailable_production_binding_returns_exact_threshold_reason_without_work() -> (
+    None
+):
+    from specstyle.ui.production_run import bind_unavailable_production_services
+
+    def compile_spec(_text: str) -> object:
+        return object()
+
+    services = bind_unavailable_production_services(
+        UiServices(compile_spec), "PRODUCTION_THRESHOLD_NOT_VALIDATED"
+    )
+    arguments = (None, None, None, "", "", None, None, None, "")
+
+    single = services.run_production_job(*arguments)
+    batch = services.run_production_batch(*arguments, 4)
+    replay = services.run_replay(*arguments)
+
+    assert services.compile_spec is compile_spec
+    assert single.status == "JOB_FAILED"
+    assert single.message == "PRODUCTION_THRESHOLD_NOT_VALIDATED"
+    assert single.approved_images == single.rejected_images == ()
+    assert batch.status == "JOB_FAILED"
+    assert batch.message == "PRODUCTION_THRESHOLD_NOT_VALIDATED"
+    assert batch.items == ()
+    assert replay == "PRODUCTION_THRESHOLD_NOT_VALIDATED"
+
+
 def _roots(tmp_path: Path):
     from specstyle.ui.production_run import ProductionUiRuntimePaths
 
