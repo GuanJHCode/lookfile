@@ -26,8 +26,8 @@ The following path has been exercised on an AMD Radeon ROCm 7.2.1 runtime:
    and rejected outputs, QA rows, deterministic seed evidence, and the published
    bundle digest.
 
-The current AMD candidate is `597642e`. It serves 49 Gradio components on the
-isolated candidate port and passed 872 affected AMD tests with one capability
+The current AMD candidate is `2be6547`. It serves 49 Gradio components on the
+isolated candidate port and passed 874 affected AMD tests with one capability
 skip, plus repository-configured Ruff check and format gates. The stable
 `1a1af45` service remained online during candidate validation.
 
@@ -53,6 +53,14 @@ on the following commits, all of which are ancestors of the current candidate:
   artifact hashes happened to match, but pixel equality is diagnostic and is
   not required by the semantic replay contract. Replay baselines are
   process-local and must be re-established after a UI restart.
+- `6f78974`: `xhs_grid` job `run-one-2ac378454d6b4849be2f82d68c1b5ffc`
+  completed and exported an approved `1080x1080` PNG.
+- `e06d0ae`: `talking_head_cover` job
+  `run-one-c9fc95a5afee42eab410dede99c832dd` completed and exported an
+  approved `1080x1440` PNG.
+- `2be6547`: `background_sequence` job
+  `run-one-77e54905ae7c4d0a88d8e2d7f1bd6c4d` completed and exported an
+  approved `1920x1080` PNG with single-item sequence semantics.
 
 ## Known submission gaps
 
@@ -65,8 +73,8 @@ on the following commits, all of which are ancestors of the current candidate:
 - A real failure-to-repair-to-reverification Radeon comparison, five-arm
   equal-budget ablation, and blind human evaluation are still required for the
   full competition claim.
-- The current production upload contract accepts `xhs_grid`; the other output
-  profiles are not yet productized.
+- The post-`2be6547` Production `VALIDATED` evidence gate has CPU verification
+  but has not been exercised against an approved threshold package on Radeon.
 
 ## Repository layout
 
@@ -141,8 +149,8 @@ The launcher expects this layout by default:
   tmp/          private upload staging
 ```
 
-The four JSON files are mandatory. `context.json` uses
-`specstyle.production.context.v1`; the other files use the
+The four JSON files are mandatory. `context.json` supports
+`specstyle.production.context.v1`, `.v2`, and `.v3`; the other files use the
 `specstyle.production.models.v1`,
 `specstyle.production.weight_manifests.v1`, and
 `specstyle.production.license_approvals.v1` schemas. Every evidence digest in
@@ -158,6 +166,22 @@ Copy an independently approved package into these paths before launching; the
 bootstrap intentionally fails closed when any file, approval, hash, permission,
 or evidence object is absent. Do not reuse the engineering smoke threshold
 markers as calibration evidence.
+
+Context v1/v2 remain compatible for `DRAFT` and `CALIBRATED` thresholds, but
+they cannot claim `VALIDATED`. A v3 `VALIDATED` threshold is intentionally
+limited to one `product_instance` output profile and one metric. It requires a
+pinned metric implementation and four canonical, content-addressed objects:
+prepared evidence, test reveal, annotation protocol, and a Production approval.
+The loader cross-binds their hashes, style/domain/output and output pin,
+threshold pin, metric/operator/value/implementation pin, verifier pin, and
+preprocessor pin. It then matches the verified encoder at factory creation and
+the loaded preprocessing provenance before the runtime becomes ready. Any
+missing or mismatched field fails closed; the loader never generates approval,
+rewrites evidence, or downgrades status.
+
+The Production approval is an owner-only trusted-administrator record, not a
+digital signature or third-party identity proof. Non-`VALIDATED` v3 contexts
+must set `production_approval_sha256` to JSON `null`.
 
 ## Prepare held-out calibration evidence
 
