@@ -133,6 +133,51 @@ def test_pinned_xhs_renderer_contains_without_stretch_or_overlay() -> None:
     assert rendered.getpixel((0, 0)) == (255, 255, 255)
 
 
+def test_pinned_talking_cover_renderer_centers_without_crop_or_stretch() -> None:
+    from io import BytesIO
+
+    from PIL import Image
+
+    module = importlib.import_module("specstyle.generation.output_profiles")
+    contracts = importlib.import_module("specstyle.generation.output_profile_contracts")
+    capabilities = contracts.production_output_profile_capabilities()
+    assert tuple(item.profile for item in capabilities) == (
+        "xhs_grid",
+        "talking_head_cover",
+    )
+    capability = capabilities[1]
+    assert capability.pin.id == "specstyle-output-renderer-talking-head-cover"
+    assert capability.pin.revision == "v1"
+    assert capability.pin.sha256.value == (
+        "8325042d826cdcbfd3fa376f570109be331349c7a193bdd3fe33d7b305d08648"
+    )
+    assert capability.render_contract.native_resolution == (768, 768)
+    assert capability.render_contract.final_resolution == (1080, 1440)
+    assert capability.render_contract.fit == "contain_pad_center"
+    source = BytesIO()
+    Image.new("RGB", (768, 768), (20, 140, 60)).save(source, format="PNG")
+
+    first = module.render_production_output(source.getvalue(), capability)
+    second = module.render_production_output(source.getvalue(), capability)
+
+    assert first == second
+    with Image.open(BytesIO(first)) as rendered:
+        assert rendered.mode == "RGB"
+        assert rendered.size == (1080, 1440)
+        assert rendered.info == {}
+        assert rendered.getpixel((0, 179)) == (255, 255, 255)
+        assert rendered.getpixel((0, 180)) == (20, 140, 60)
+        assert rendered.getpixel((1079, 1259)) == (20, 140, 60)
+        assert rendered.getpixel((1079, 1260)) == (255, 255, 255)
+
+    wrong_size = BytesIO()
+    Image.new("RGB", (1024, 1024), (20, 140, 60)).save(wrong_size, format="PNG")
+    with pytest.raises(DomainError, match="^invalid native output resolution$"):
+        module.render_production_output(wrong_size.getvalue(), capability)
+    with pytest.raises(TypeError):
+        module.render_production_output(source.getvalue(), capability, "title")
+
+
 def test_production_renderer_rejects_a_forged_capability_pin() -> None:
     from io import BytesIO
 

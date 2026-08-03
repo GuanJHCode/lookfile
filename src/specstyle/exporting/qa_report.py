@@ -678,7 +678,7 @@ def _graph_primitive(graph: CompiledExecutionGraph) -> dict[str, Any]:
     }
     if graph.render_contract is not None:
         contract = graph.render_contract
-        primitive["render_contract"] = {
+        render_primitive = {
             "background": list(contract.background),
             "final_resolution": list(contract.final_resolution),
             "fit": contract.fit,
@@ -686,6 +686,9 @@ def _graph_primitive(graph: CompiledExecutionGraph) -> dict[str, Any]:
             "resampling": contract.resampling,
             "sequence_semantics": contract.sequence_semantics,
         }
+        if contract.native_resolution is not None:
+            render_primitive["native_resolution"] = list(contract.native_resolution)
+        primitive["render_contract"] = render_primitive
     return primitive
 
 

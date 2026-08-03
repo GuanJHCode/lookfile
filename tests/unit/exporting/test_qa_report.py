@@ -148,3 +148,21 @@ def test_graph_primitive_adds_render_contract_only_for_rendered_v2_graph() -> No
         "resampling": "lanczos",
         "sequence_semantics": "single_static",
     }
+
+
+def test_graph_primitive_includes_talking_native_resolution_binding() -> None:
+    legacy = compile_style_spec(raw_spec(), context()).production_graphs[0]
+    capability = production_output_profile_capabilities()[1]
+    talking = replace(
+        legacy,
+        output_profile="talking_head_cover",
+        output_profile_pin=capability.pin,
+        resolution=(768, 768),
+        render_contract=capability.render_contract,
+    )
+
+    primitive = qa_report.graph_primitive(talking)
+
+    assert primitive["resolution"] == [768, 768]
+    assert primitive["render_contract"]["native_resolution"] == [768, 768]
+    assert primitive["render_contract"]["final_resolution"] == [1080, 1440]

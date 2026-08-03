@@ -215,6 +215,7 @@ def test_scalar_contracts_reject_coercion_and_nonfinite_values(
     (
         ("final_resolution", ([], (1080,), (1080, 0), (True, 1080))),
         ("background", ([], (255, 255), (255, 255, 256), (False, 255, 255))),
+        ("native_resolution", ([], (768,), (768, 0), (True, 768))),
         ("fit", ("stretch", None)),
         ("resampling", ("bicubic", None)),
         ("overlay", ("enabled", None)),

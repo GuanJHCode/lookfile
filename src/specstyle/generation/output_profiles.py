@@ -110,7 +110,7 @@ def _render_image(
     if contract is None:  # pragma: no cover - guarded by _implemented_capability
         raise DomainError("invalid output renderer contract")
     size = contract.final_resolution
-    if contract.fit == "contain_pad":
+    if contract.fit in {"contain_pad", "contain_pad_center"}:
         resized = ImageOps.contain(image, size, Image.Resampling.LANCZOS)
         output = Image.new("RGB", size, contract.background)
         offset = ((size[0] - resized.width) // 2, (size[1] - resized.height) // 2)
@@ -128,6 +128,14 @@ def render_production_output(
     source = _decode_source(source_png)
     output = None
     try:
+        contract = capability.render_contract
+        if contract is None:  # pragma: no cover - guarded by capability validation
+            raise DomainError("invalid output renderer contract")
+        if (
+            contract.native_resolution is not None
+            and source.size != contract.native_resolution
+        ):
+            raise DomainError("invalid native output resolution")
         output = _render_image(source, capability)
         encoded = BytesIO()
         output.save(encoded, format="PNG", optimize=False, compress_level=9)

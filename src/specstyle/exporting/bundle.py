@@ -1172,23 +1172,31 @@ def _final_graph_resolution(graph: dict[str, object]) -> tuple[int, int]:
     contract = graph.get("render_contract")
     if contract is None:
         return (resolution[0], resolution[1])
-    if type(contract) is not dict or set(contract) != {
+    base_keys = {
         "background",
         "final_resolution",
         "fit",
         "overlay",
         "resampling",
         "sequence_semantics",
-    }:
+    }
+    if type(contract) is not dict or set(contract) not in (
+        base_keys,
+        base_keys | {"native_resolution"},
+    ):
         _hash_mismatch()
     background = contract["background"]
     final = contract["final_resolution"]
+    native = contract.get("native_resolution")
     if (
         not _valid_resolution(final)
+        or (native is not None and not _valid_resolution(native))
+        or (native is not None and native != resolution)
+        or (contract["fit"] == "contain_pad_center" and native is None)
         or type(background) is not list
         or len(background) != 3
         or any(type(item) is not int or not 0 <= item <= 255 for item in background)
-        or contract["fit"] not in ("contain_pad", "cover_center")
+        or contract["fit"] not in ("contain_pad", "contain_pad_center", "cover_center")
         or contract["overlay"] != "disabled"
         or contract["resampling"] != "lanczos"
         or contract["sequence_semantics"] != "single_static"

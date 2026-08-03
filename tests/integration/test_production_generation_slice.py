@@ -67,9 +67,9 @@ from tests.unit.verification._production_builders import (
 _TIMESTAMP = "2026-08-01T00:00:00.000Z"
 
 
-def _png(color: str) -> bytes:
+def _png(color: str, size: tuple[int, int] = (1024, 1024)) -> bytes:
     output = BytesIO()
-    Image.new("RGB", (1024, 1024), color).save(output, "PNG")
+    Image.new("RGB", size, color).save(output, "PNG")
     return output.getvalue()
 
 
@@ -80,6 +80,8 @@ def _compiler_inputs(
     applicable_batch: bool = False,
     mismatch: str | None = None,
     rendered_output: bool = False,
+    output_profile: str = "xhs_grid",
+    native_resolution: tuple[int, int] = (1024, 1024),
 ) -> tuple[str, CompilerContext, tuple[ProductionL1RuleBinding, ...]]:
     provenance = _build_processor_provenance(
         _Transformers, _CLIPImageProcessor(), _Transformers.__version__
@@ -95,7 +97,10 @@ def _compiler_inputs(
     raw = _verification_raw_spec(
         pipeline_graph, compiler_context, style_contents, fidelity_required=False
     ).model_dump(mode="json")
-    raw["profiles"]["production"]["resolution"] = [1024, 1024]
+    raw["profiles"]["production"]["resolution"] = list(native_resolution)
+    raw["outputs"]["profiles"] = [output_profile]
+    if output_profile == "talking_head_cover":
+        raw["verification"]["l3"] = None
     raw["repair"] = {
         "policy_version": "1.0",
         "max_rounds": 1,
@@ -103,9 +108,20 @@ def _compiler_inputs(
     }
     compiler_context, raw = _apply_compiler_mismatch(compiler_context, raw, mismatch)
     if rendered_output:
+        catalog = compiler_context.rule_catalogs[0]
+        rules = tuple(
+            replace(
+                rule,
+                supported_output_profiles=("xhs_grid", "talking_head_cover"),
+            )
+            if rule.kind in {"L1_TECHNICAL", "L2_STYLE_FIDELITY"}
+            else rule
+            for rule in catalog.rules
+        )
         compiler_context = replace(
             compiler_context,
             output_profile_capabilities=production_output_profile_capabilities(),
+            rule_catalogs=(replace(catalog, rules=rules),),
         )
     if applicable_batch:
         compiler_context = _add_applicable_batch_rule(compiler_context)
@@ -164,13 +180,13 @@ def _add_applicable_batch_rule(
     )
 
 
-def _source() -> PreparedImage:
-    content = _png("white")
+def _source(size: tuple[int, int] = (1024, 1024)) -> PreparedImage:
+    content = _png("white", size)
     return preprocess_image(
         content,
         AssetRef(AssetId("source"), hash_bytes(content)),
         PreprocessPlan(
-            (1024, 1024),
+            size,
             "contain_pad",
             (0, 0, 0),
             ResourcePin("processor", "r1", hash_bytes(b"processor")),
@@ -200,11 +216,14 @@ def _job_request(
     job_id: str,
     spec_text: str,
     style_references: tuple[AssetRef, ...],
+    *,
+    output_profile: str = "xhs_grid",
+    native_resolution: tuple[int, int] = (1024, 1024),
 ) -> ProductionJobRequest:
     return ProductionJobRequest(
         JobId(job_id),
         spec_text,
-        _source(),
+        _source(native_resolution),
         style_references,
         RenderedPrompt(
             ResourcePin("template", "r1", hash_bytes(b"template")),
@@ -212,7 +231,7 @@ def _job_request(
             "positive",
             "negative",
         ),
-        "xhs_grid",
+        output_profile,
         0,
         f"bundle-{job_id}",
     )
@@ -251,25 +270,44 @@ def _open_runtime(
 
 
 @pytest.mark.parametrize(
-    ("rendered_output", "expected_size"),
-    ((False, (1024, 1024)), (True, (1080, 1080))),
+    ("rendered_output", "output_profile", "native_resolution", "expected_size"),
+    (
+        (False, "xhs_grid", (1024, 1024), (1024, 1024)),
+        (True, "xhs_grid", (1024, 1024), (1080, 1080)),
+        (True, "talking_head_cover", (768, 768), (1080, 1440)),
+    ),
 )
 def test_real_initial_attempt_reaches_terminal_with_exact_durable_audit_history(
     tmp_path: Path,
     monkeypatch,
     rendered_output: bool,
+    output_profile: str,
+    native_resolution: tuple[int, int],
     expected_size: tuple[int, int],
 ) -> None:
-    style_contents = (_png("red"), _png("blue"))
+    style_contents = (
+        _png("red", native_resolution),
+        _png("blue", native_resolution),
+    )
     supply, pipeline_graph = _supply(tmp_path / "weights")
     spec_text, compiler_context, allowlist = _compiler_inputs(
-        pipeline_graph, style_contents, rendered_output=rendered_output
+        pipeline_graph,
+        style_contents,
+        rendered_output=rendered_output,
+        output_profile=output_profile,
+        native_resolution=native_resolution,
     )
     style_references = tuple(
         AssetRef(AssetId(f"style-{index}"), hash_bytes(content))
         for index, content in enumerate(style_contents)
     )
-    request = _job_request("job-success", spec_text, style_references)
+    request = _job_request(
+        "job-success",
+        spec_text,
+        style_references,
+        output_profile=output_profile,
+        native_resolution=native_resolution,
+    )
     builder = _CannyBuilder()
     store_root = tmp_path / "store"
     store_root.mkdir()
@@ -287,7 +325,13 @@ def test_real_initial_attempt_reaches_terminal_with_exact_durable_audit_history(
         )
         observed["control_image"] = kwargs["control_image"]
         return type(
-            "Result", (), {"images": [Image.new("RGB", (1024, 1024), "green")]}
+            "Result",
+            (),
+            {
+                "images": [
+                    Image.new("RGB", (kwargs["width"], kwargs["height"]), "green")
+                ]
+            },
         )()
 
     monkeypatch.setattr(_Pipeline, "__call__", generate, raising=False)
@@ -308,9 +352,10 @@ def test_real_initial_attempt_reaches_terminal_with_exact_durable_audit_history(
     try:
         result = runtime._execute_initial_attempt(request)
 
-        assert result.graph.output_profile == "xhs_grid"
-        assert result.verification_plan.output_profile == "xhs_grid"
-        assert result.request.attempt_id.value == "job-success-a0-xhs_grid-0"
+        assert result.graph.output_profile == output_profile
+        assert result.graph.resolution == native_resolution
+        assert result.verification_plan.output_profile == output_profile
+        assert result.request.attempt_id.value == (f"job-success-a0-{output_profile}-0")
         assert result.artifact.content.startswith(b"\x89PNG")
         with Image.open(BytesIO(result.artifact.content)) as rendered:
             assert rendered.size == expected_size
@@ -322,8 +367,26 @@ def test_real_initial_attempt_reaches_terminal_with_exact_durable_audit_history(
         assert tuple(item.status for item in result.report.results) == (
             *(RuleStatus.PASS for _ in range(4)),
             RuleStatus.UNVERIFIABLE,
-            RuleStatus.UNVERIFIABLE,
+            *(
+                ()
+                if output_profile == "talking_head_cover"
+                else (RuleStatus.UNVERIFIABLE,)
+            ),
         )
+        assert all(
+            item.score is None
+            for item in result.report.results
+            if item.status is RuleStatus.UNVERIFIABLE
+        )
+        if output_profile == "talking_head_cover":
+            assert result.verification_plan.l3_status == "NOT_APPLICABLE"
+            assert result.verification_plan.l3_reason == "NO_L3_CONFIG"
+            batch = next(
+                rule
+                for rule in result.verification_plan.rules
+                if rule.definition.scope is RuleScope.BATCH
+            )
+            assert batch.definition.applicability.value == "NOT_APPLICABLE"
         assert (
             result.terminal.artifact_decision.artifact_status is ArtifactStatus.APPROVED
         )
@@ -339,7 +402,7 @@ def test_real_initial_attempt_reaches_terminal_with_exact_durable_audit_history(
         assert result.job_state.last_sequence == 5
         assert len(builder.calls) == 1
         assert observed["style_colors"] == ((255, 0, 0), (0, 0, 255))
-        assert observed["control_image"].size == (1024, 1024)
+        assert observed["control_image"].size == native_resolution
         root = tmp_path / "artifacts" / "jobs" / request.job_id.value
         artifact_dir = root / "artifacts" / result.artifact.ref.artifact_id.value
         report_dir = root / "reports" / result.request.attempt_id.value

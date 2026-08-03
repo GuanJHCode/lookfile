@@ -411,6 +411,30 @@ def test_rendered_v2_png_readback_uses_final_resolution(tmp_path: Path) -> None:
         assert image.size == (1080, 1080)
 
 
+def test_talking_readback_binds_native_and_final_resolutions() -> None:
+    from specstyle.exporting import bundle as bundle_module
+    from specstyle.exporting.qa_report import graph_primitive
+
+    legacy = _production_request().graph
+    capability = production_output_profile_capabilities()[1]
+    talking = replace(
+        legacy,
+        output_profile="talking_head_cover",
+        output_profile_pin=capability.pin,
+        resolution=(768, 768),
+        render_contract=capability.render_contract,
+    )
+    primitive = graph_primitive(talking)
+
+    assert bundle_module._final_graph_resolution(primitive) == (1080, 1440)
+    primitive["render_contract"]["native_resolution"] = [1024, 1024]
+    with pytest.raises(DomainError, match="^export hash mismatch$"):
+        bundle_module._final_graph_resolution(primitive)
+    del primitive["render_contract"]["native_resolution"]
+    with pytest.raises(DomainError, match="^export hash mismatch$"):
+        bundle_module._final_graph_resolution(primitive)
+
+
 # --------------------------------------------------------------------------- #
 # Forbidden APIs
 # --------------------------------------------------------------------------- #

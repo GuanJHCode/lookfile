@@ -26,6 +26,7 @@ _V2_OUTPUT_KEYS = {
     "overlay",
     "sequence_semantics",
 }
+_V2_NATIVE_OUTPUT_KEYS = _V2_OUTPUT_KEYS | {"native_resolution"}
 _PROFILE_ORDER = ("xhs_grid", "talking_head_cover", "background_sequence")
 
 
@@ -51,7 +52,12 @@ def parse_legacy_output_profile(value: object) -> OutputProfileCapability:
 
 
 def _parse_v2_output_profile(value: object) -> OutputProfileCapability:
-    raw = _exact(value, _V2_OUTPUT_KEYS, "output")
+    if type(value) is not dict or set(value) not in (
+        _V2_OUTPUT_KEYS,
+        _V2_NATIVE_OUTPUT_KEYS,
+    ):
+        raise DomainError("invalid production context output")
+    raw = value
     contract = OutputRenderContract(
         tuple(raw["final_resolution"]),
         raw["fit"],
@@ -59,6 +65,7 @@ def _parse_v2_output_profile(value: object) -> OutputProfileCapability:
         tuple(raw["background"]),
         raw["overlay"],
         raw["sequence_semantics"],
+        None if "native_resolution" not in raw else tuple(raw["native_resolution"]),
     )
     capability = OutputProfileCapability(
         _pin(raw["pin"]),
@@ -105,5 +112,8 @@ def copy_output_profile(value: OutputProfileCapability) -> OutputProfileCapabili
             tuple(contract.background),
             str(contract.overlay),
             str(contract.sequence_semantics),
+            None
+            if contract.native_resolution is None
+            else tuple(contract.native_resolution),
         ),
     )

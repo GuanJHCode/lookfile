@@ -237,6 +237,35 @@ def _v2_xhs_context_document(evidence: dict[str, str]) -> dict[str, Any]:
     return document
 
 
+def _v2_talking_context_document(evidence: dict[str, str]) -> dict[str, Any]:
+    document = _v2_xhs_context_document(evidence)
+    document["output_profiles"].append(
+        {
+            "profile": "talking_head_cover",
+            "pin": {
+                "id": "specstyle-output-renderer-talking-head-cover",
+                "revision": "v1",
+                "sha256": (
+                    "8325042d826cdcbfd3fa376f570109be331349c7a193bdd3fe33d7b305d08648"
+                ),
+            },
+            "native_resolution": [768, 768],
+            "final_resolution": [1080, 1440],
+            "fit": "contain_pad_center",
+            "resampling": "lanczos",
+            "background": [255, 255, 255],
+            "overlay": "disabled",
+            "sequence_semantics": "single_static",
+        }
+    )
+    profiles = ["xhs_grid", "talking_head_cover"]
+    catalog = document["rule_catalog"]
+    for rule in catalog["l1_rules"]:
+        rule["supported_output_profiles"] = profiles
+    catalog["l2_item_rule"]["supported_output_profiles"] = profiles
+    return document
+
+
 def _write_roots(tmp_path: Path, *, status: str = "VALIDATED") -> tuple[Path, Path]:
     config_root, evidence_root = tmp_path / "config", tmp_path / "evidence"
     config_root.mkdir(mode=0o700)
@@ -471,6 +500,59 @@ def test_v2_rejects_a_renderer_pin_not_implemented_by_this_revision(
     with pytest.raises(
         DomainError, match="^invalid production output renderer contract$"
     ):
+        _load(config_root, evidence_root)
+
+
+def test_loads_v2_talking_renderer_as_a_second_explicit_profile(
+    tmp_path: Path,
+) -> None:
+    config_root, evidence_root = _write_roots(tmp_path)
+    document = _read_document(config_root)
+    evidence = document["l2_threshold_profile"]["evidence"]
+    _write_document(config_root, _v2_talking_context_document(evidence))
+
+    loaded = _load(config_root, evidence_root)
+
+    assert tuple(item.profile for item in loaded.output_profiles) == (
+        "xhs_grid",
+        "talking_head_cover",
+    )
+    capability = loaded.output_profiles[1]
+    assert capability.pin.sha256 == Sha256(
+        "8325042d826cdcbfd3fa376f570109be331349c7a193bdd3fe33d7b305d08648"
+    )
+    assert capability.render_contract.native_resolution == (768, 768)
+    assert capability.render_contract.final_resolution == (1080, 1440)
+    assert capability.render_contract.fit == "contain_pad_center"
+    assert all(
+        rule.supported_output_profiles == ("xhs_grid", "talking_head_cover")
+        for rule in loaded.rule_catalog.rules[:-1]
+    )
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    (
+        ("profile", "background_sequence"),
+        ("native_resolution", [1024, 1024]),
+        ("final_resolution", [1080, 1080]),
+        ("fit", "cover_center"),
+        ("background", [0, 0, 0]),
+        ("overlay", "enabled"),
+        ("sequence_semantics", "multi"),
+    ),
+)
+def test_v2_rejects_drift_in_talking_renderer_contract(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    config_root, evidence_root = _write_roots(tmp_path)
+    document = _read_document(config_root)
+    evidence = document["l2_threshold_profile"]["evidence"]
+    document = _v2_talking_context_document(evidence)
+    document["output_profiles"][1][field] = value
+    _write_document(config_root, document)
+
+    with pytest.raises(DomainError):
         _load(config_root, evidence_root)
 
 
@@ -2142,6 +2224,74 @@ def test_v2_compiler_graph_keeps_native_and_final_output_resolutions_separate(
         production_graph.output_profile_pin
         == context.output_profile_capabilities[0].pin
     )
+
+
+def test_v2_compiles_talking_with_fixed_native_final_and_honest_applicability(
+    tmp_path: Path,
+) -> None:
+    module = importlib.import_module("specstyle.production.context_config")
+    config_root, evidence_root = _write_roots(tmp_path)
+    document = _read_document(config_root)
+    evidence = document["l2_threshold_profile"]["evidence"]
+    _write_document(config_root, _v2_talking_context_document(evidence))
+    environment, graph = _factory_environment(), _factory_graph()
+    preprocessing_version = "clip-preprocess-v1"
+    context = module.make_production_compiler_context_factory(
+        _load(config_root, evidence_root), environment, graph
+    )(preprocessing_version)
+    raw = _raw_for_factory(context, environment, graph, preprocessing_version)
+    primitive = raw.model_dump(mode="python")
+    primitive["outputs"]["profiles"] = ("talking_head_cover",)
+    primitive["profiles"]["production"]["resolution"] = (768, 768)
+
+    compiled = compile_style_spec(StyleSpecV1.model_validate(primitive), context)
+    production_graph = compiled.production_graphs[0]
+    plan = compiled.verification_plans[0]
+
+    assert production_graph.output_profile == "talking_head_cover"
+    assert production_graph.resolution == (768, 768)
+    assert production_graph.final_output_resolution == (1080, 1440)
+    l1 = tuple(rule for rule in plan.rules if rule.definition.level is RuleLevel.L1)
+    assert len(l1) == 4
+    assert all(rule.definition.applicability.value == "APPLICABLE" for rule in l1)
+    item_l2 = next(
+        rule
+        for rule in plan.rules
+        if rule.definition.level is RuleLevel.L2
+        and rule.definition.scope is RuleScope.ITEM
+    )
+    assert item_l2.definition.applicability.value == "APPLICABLE"
+    assert item_l2.threshold_binding.status == "DRAFT"
+    batch_l2 = next(
+        rule
+        for rule in plan.rules
+        if rule.definition.level is RuleLevel.L2
+        and rule.definition.scope is RuleScope.BATCH
+    )
+    assert batch_l2.definition.applicability.value == "NOT_APPLICABLE"
+    assert plan.l3_status == "NOT_APPLICABLE"
+    assert plan.l3_reason == "NO_L3_CONFIG"
+
+
+def test_v2_rejects_talking_production_resolution_outside_the_pinned_contract(
+    tmp_path: Path,
+) -> None:
+    module = importlib.import_module("specstyle.production.context_config")
+    config_root, evidence_root = _write_roots(tmp_path)
+    document = _read_document(config_root)
+    evidence = document["l2_threshold_profile"]["evidence"]
+    _write_document(config_root, _v2_talking_context_document(evidence))
+    environment, graph = _factory_environment(), _factory_graph()
+    preprocessing_version = "clip-preprocess-v1"
+    context = module.make_production_compiler_context_factory(
+        _load(config_root, evidence_root), environment, graph
+    )(preprocessing_version)
+    raw = _raw_for_factory(context, environment, graph, preprocessing_version)
+    primitive = raw.model_dump(mode="python")
+    primitive["outputs"]["profiles"] = ("talking_head_cover",)
+
+    with pytest.raises(DomainError, match="^graph native output resolution mismatch$"):
+        compile_style_spec(StyleSpecV1.model_validate(primitive), context)
 
 
 @pytest.mark.parametrize("mismatch", ("runtime", "model", "threshold"))

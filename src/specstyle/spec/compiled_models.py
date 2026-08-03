@@ -216,17 +216,19 @@ class StrengthMappingCapability:
 @dataclass(frozen=True, slots=True)
 class OutputRenderContract:
     final_resolution: tuple[int, int]
-    fit: Literal["contain_pad", "cover_center"]
+    fit: Literal["contain_pad", "contain_pad_center", "cover_center"]
     resampling: Literal["lanczos"]
     background: tuple[int, int, int]
     overlay: Literal["disabled"]
     sequence_semantics: Literal["single_static"]
+    native_resolution: tuple[int, int] | None = None
 
     def __post_init__(self) -> None:
         resolution = _tuple(
             self.final_resolution, "final output resolution", nonempty=True
         )
         background = _tuple(self.background, "output background", nonempty=True)
+        native = self.native_resolution
         if (
             len(resolution) != 2
             or any(type(item) is not int or item < 1 for item in resolution)
@@ -234,7 +236,17 @@ class OutputRenderContract:
             or any(type(item) is not int or not 0 <= item <= 255 for item in background)
         ):
             raise DomainError("invalid output render contract")
-        _choice(self.fit, {"contain_pad", "cover_center"}, "output fit")
+        if native is not None:
+            native = _tuple(native, "native output resolution", nonempty=True)
+            if len(native) != 2 or any(
+                type(item) is not int or item < 1 for item in native
+            ):
+                raise DomainError("invalid output render contract")
+        _choice(
+            self.fit,
+            {"contain_pad", "contain_pad_center", "cover_center"},
+            "output fit",
+        )
         _choice(self.resampling, {"lanczos"}, "output resampling")
         _choice(self.overlay, {"disabled"}, "output overlay")
         _choice(
@@ -667,6 +679,13 @@ class CompiledExecutionGraph:
         ):
             raise DomainError("resolution must be two exact ints")
         if (
+            self.generation_profile == "production"
+            and self.render_contract is not None
+            and self.render_contract.native_resolution is not None
+            and self.resolution != self.render_contract.native_resolution
+        ):
+            raise DomainError("graph native output resolution mismatch")
+        if (
             type(self.steps) is not int
             or isinstance(self.steps, bool)
             or self.steps < 1
@@ -841,6 +860,11 @@ def _primitive(value: object) -> object:
                 type(value) is CompiledExecutionGraph
                 and item.name == "render_contract"
                 and value.render_contract is None
+            )
+            and not (
+                type(value) is OutputRenderContract
+                and item.name == "native_resolution"
+                and value.native_resolution is None
             )
         }
     if isinstance(value, tuple):
