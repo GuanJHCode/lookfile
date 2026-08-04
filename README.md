@@ -85,9 +85,11 @@ and a 3-5 minute demo video under
   Production package. Its current N=4 wall is engineering evidence, not a
   calibrated quality or diversity result.
 - L2 remains advisory until real held-out human annotations replace the current
-  placeholder calibration evidence. No universal L2 threshold is claimed.
-- No calibrated L3 domain plugin is enabled. `NOT_APPLICABLE` and
-  `UNVERIFIABLE` are not presented as `PASS`.
+  placeholder calibration evidence. The formal item/cohort evidence and atomic
+  batch paths are CPU-validated, but no universal L2 threshold is claimed.
+- A pinned `structure_only` edge-similarity L3 implementation and context v4
+  contract are CPU-validated. No calibrated L3 profile is enabled;
+  `NOT_APPLICABLE` and `UNVERIFIABLE` are not presented as `PASS`.
 - A real failure-to-repair-to-reverification Radeon comparison, five-arm
   equal-budget ablation, and blind human evaluation require approved held-out
   assets, independent labels, and a trusted Production threshold package. The
@@ -170,8 +172,8 @@ The launcher expects this layout by default:
 ```
 
 The four JSON files are mandatory. `context.json` supports
-`specstyle.production.context.v1`, `.v2`, and `.v3`; the other files use the
-`specstyle.production.models.v1`,
+`specstyle.production.context.v1`, `.v2`, `.v3`, and `.v4`; the other files use
+the `specstyle.production.models.v1`,
 `specstyle.production.weight_manifests.v1`, and
 `specstyle.production.license_approvals.v1` schemas. Every evidence digest in
 `context.json` must resolve to a regular content-addressed file at the path
@@ -237,6 +239,14 @@ test reveal is still only `TEST_PASSED_PENDING_PRODUCTION_APPROVAL`. Neither
 status is a Production `VALIDATED` threshold. The current repository includes
 no approved human label set, reveal authorization, or Production threshold
 approval, so the competition calibration claim remains blocked.
+
+For the three-metric context v4 process, use the English operator kit at
+[`submission/track1-specstyle/formal-study-kit/`](submission/track1-specstyle/formal-study-kit/).
+It defines the independent rater/label/reveal/Production approval roles, exact
+item and complete-cohort templates, minimum study sizes, provenance register,
+and the fail-closed `formal_study_workspace` prepare/reveal/validate commands.
+The kit contains no approved labels and cannot make a metric `VALIDATED` by
+itself.
 
 The `config/` and `evidence/` directories, the four JSON files, and every
 evidence object must be owned by the service process's effective user. The

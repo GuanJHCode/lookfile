@@ -21,6 +21,9 @@ and supports bounded repair and replay workflows.
   boundaries.
 - [`ASSET_PROVENANCE.md`](ASSET_PROVENANCE.md): demo media provenance and
   redistribution notes.
+- [`formal-study-kit/`](formal-study-kit/): exact formal L2/L3 study templates,
+  blinded rater protocol, provenance register, approval roles, and fail-closed
+  operator commands. It contains no approved labels.
 - [`evidence/video_manifest.json`](evidence/video_manifest.json): codecs,
   duration, source hashes, and the exact composition timeline.
 - [`SHA256SUMS`](SHA256SUMS): hashes for every submitted document, evidence
@@ -58,7 +61,10 @@ included in Git.
 
 The submission proves a real local Radeon UI workflow, deterministic execution
 evidence, Preview/Production separation, Production export examples, and
-fail-closed evaluation infrastructure. It does not claim calibrated L2/L3
+fail-closed evaluation infrastructure. The new context v4, pinned
+`structure_only` L3 gate, formal batch metric and atomic cohort publication are
+CPU-validated but not yet evidenced on Radeon with approved thresholds. It does
+not claim calibrated L2/L3
 accuracy, human-rated perceptual diversity, or a Radeon repair uplift study.
 Those results require approved held-out assets, independent labels, and a
 trusted Production threshold package that are not available in this repository.
@@ -67,4 +73,4 @@ trusted Production threshold package that are not available in this repository.
 
 The official competition repository is
 <https://github.com/AMD-DEV-CONTEST/Radeon-hackathon-2026-07>. The submission PR
-title must follow `Track 1, <Team or name>, SpecStyle`.
+title is `Track 1, guan, SpecStyle`.
