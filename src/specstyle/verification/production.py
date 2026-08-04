@@ -37,6 +37,7 @@ from specstyle.verification.l1.production_bindings import (
     _ProductionL1Implementation,
     _validate_production_l1_rule_registry,
 )
+from specstyle.verification.l3.structure_edges import _structure_edge_similarity_for_pin
 from specstyle.verification.production_contracts import (
     _CanonicalProductionState,
     _FactoryIssuedState,
@@ -58,6 +59,7 @@ from specstyle.verification.production_metrics import (
     _l2_similarity,
     _l3_similarity,
     _threshold_outcome,
+    _unverifiable_result,
 )
 from specstyle.verification.rule_models import RuleDefinition, RuleResult
 
@@ -279,6 +281,7 @@ def _validate_create_binding(
             plan,
             issued.context_snapshot,
             issued.mappings,
+            True,
         )
     except Exception:
         raise _dependency_failure() from None
@@ -575,12 +578,7 @@ def _l2_result(
         for content, reference in zip(styles, state.request.style_references)
     )
     if output is None or any(reference is None for reference in references):
-        return RuleResult(
-            rule.definition.rule_id,
-            RuleStatus.UNVERIFIABLE,
-            (artifact.ref.artifact_id,),
-            None,
-        )
+        return _unverifiable_result(rule, artifact.ref.artifact_id)
     try:
         score = _l2_similarity(
             state.issued.torch,
@@ -614,15 +612,23 @@ def _l3_result(
     cache: dict[Sha256, _VerifiedImageEvidence | None],
 ) -> RuleResult:
     source_content, source_sha = _source_evidence_material(verifier)
+    if (
+        rule.metric_id is not None
+        and rule.metric_id.value == "structure_edge_similarity"
+    ):
+        score = _structure_edge_similarity_for_pin(
+            rule.verifier_pin, source_content, artifact.content
+        )
+        _checkpoint(verifier)
+        return (
+            _unverifiable_result(rule, artifact.ref.artifact_id)
+            if score is None
+            else _metric_result(rule, artifact.ref.artifact_id, score)
+        )
     output = _encode_evidence(verifier, artifact.content, artifact.ref.sha256, cache)
     source = _encode_evidence(verifier, source_content, source_sha, cache)
     if output is None or source is None:
-        return RuleResult(
-            rule.definition.rule_id,
-            RuleStatus.UNVERIFIABLE,
-            (artifact.ref.artifact_id,),
-            None,
-        )
+        return _unverifiable_result(rule, artifact.ref.artifact_id)
     try:
         score = _l3_similarity(
             verifier._canonical.issued.torch,
@@ -699,14 +705,7 @@ def _evaluate_rules(
             if type(style_contents) is object:
                 style_contents = _resolve_styles(verifier)
             if style_contents is None:
-                results.append(
-                    RuleResult(
-                        definition.rule_id,
-                        RuleStatus.UNVERIFIABLE,
-                        (artifact.ref.artifact_id,),
-                        None,
-                    )
-                )
+                results.append(_unverifiable_result(rule, artifact.ref.artifact_id))
                 continue
             results.append(
                 _l2_result(verifier, rule, artifact, style_contents, evidence_cache)

@@ -26,6 +26,7 @@ from specstyle.spec.models import StyleSpecV1
 
 _L2_METRIC = Identifier("reference_style_statistics_similarity")
 _L3_METRIC = Identifier("subject_semantic_similarity")
+_STRUCTURE_METRIC = Identifier("structure_edge_similarity")
 _L1_MAPPINGS = (
     (RuleId("l1_bundle"), "technical_rgb_png_bundle_v1"),
     (RuleId("l1_decode"), "decode_png_rgb_no_metadata_v1"),
@@ -40,6 +41,7 @@ def _pin(identifier: str, material: str) -> ResourcePin:
 
 def _l1_rules(
     bundle_actions: tuple[Identifier, ...] = (),
+    domain_profile: str = "product_instance",
 ) -> tuple[RuleCapability, ...]:
     return tuple(
         RuleCapability(
@@ -48,7 +50,7 @@ def _l1_rules(
             RuleLevel.L1,
             RuleScope.ITEM,
             "always_required",
-            ("product_instance",),
+            (domain_profile,),
             ("xhs_grid",),
             _pin(f"{rule_id.value}-verifier", rule_id.value),
             "none",
@@ -60,14 +62,16 @@ def _l1_rules(
     )
 
 
-def _l2_rules() -> tuple[RuleCapability, RuleCapability]:
+def _l2_rules(
+    domain_profile: str = "product_instance",
+) -> tuple[RuleCapability, RuleCapability]:
     style = RuleCapability(
         RuleId("l2_style"),
         "L2_STYLE_FIDELITY",
         RuleLevel.L2,
         RuleScope.ITEM,
         "always_advisory",
-        ("product_instance",),
+        (domain_profile,),
         ("xhs_grid",),
         _pin("l2-verifier", "l2-verifier"),
         "l2",
@@ -81,7 +85,7 @@ def _l2_rules() -> tuple[RuleCapability, RuleCapability]:
         RuleLevel.L2,
         RuleScope.BATCH,
         "always_advisory",
-        ("product_instance",),
+        (domain_profile,),
         ("background_sequence",),
         _pin("batch-verifier", "batch-verifier"),
         "l2",
@@ -93,7 +97,13 @@ def _l2_rules() -> tuple[RuleCapability, RuleCapability]:
 
 
 def _l3_plugin(
-    plugin_pin: ResourcePin, kind: str, requirement: str
+    plugin_pin: ResourcePin,
+    kind: str,
+    requirement: str,
+    *,
+    domain_profile: str = "product_instance",
+    metric_id: Identifier = _L3_METRIC,
+    verifier_pin: ResourcePin | None = None,
 ) -> L3PluginCapability:
     rule = RuleCapability(
         RuleId("l3_diagnostic"),
@@ -101,18 +111,18 @@ def _l3_plugin(
         RuleLevel.L3,
         RuleScope.ITEM,
         requirement,
-        ("product_instance",),
+        (domain_profile,),
         ("xhs_grid",),
-        _pin("l3-verifier", "l3-verifier"),
+        _pin("l3-verifier", "l3-verifier") if verifier_pin is None else verifier_pin,
         "l3",
-        _L3_METRIC,
+        metric_id,
         20,
         (),
     )
     return L3PluginCapability(
         plugin_pin,
-        "product_instance",
-        "v1",
+        domain_profile,
+        "sobel-cosine-v1" if domain_profile == "structure_only" else "v1",
         ("xhs_grid",),
         (rule,),
     )
@@ -147,20 +157,27 @@ def _threshold_profile(
     *,
     encoder_pin: ResourcePin | None,
     plugin_pin: ResourcePin | None,
+    domain_profile: str = "product_instance",
 ) -> ThresholdProfileCapability:
+    approval_sha256 = (
+        hash_bytes(b"formal-production-approval")
+        if domain_profile == "structure_only" and status == "VALIDATED"
+        else None
+    )
     return ThresholdProfileCapability(
         _pin(f"{source}-profile", f"{source}-profile"),
         f"{source}-profile",
         source,
         status,
         Identifier("preset"),
-        "product_instance",
+        domain_profile,
         encoder_pin,
         plugin_pin,
         (ThresholdMetricCapability(metric_id, ">=", 0.5),),
         hash_bytes(f"{source}-calibration".encode()),
         hash_bytes(f"{source}-validation".encode()),
         hash_bytes(f"{source}-protocol".encode()),
+        approval_sha256,
     )
 
 
@@ -169,6 +186,9 @@ def _threshold_profiles(
     plugin_pin: ResourcePin,
     l2_status: str,
     l3_status: str,
+    *,
+    domain_profile: str = "product_instance",
+    l3_metric: Identifier = _L3_METRIC,
 ) -> tuple[ThresholdProfileCapability, ThresholdProfileCapability]:
     return (
         _threshold_profile(
@@ -177,13 +197,15 @@ def _threshold_profiles(
             _L2_METRIC,
             encoder_pin=ip_pin,
             plugin_pin=None,
+            domain_profile=domain_profile,
         ),
         _threshold_profile(
             "l3",
             l3_status,
-            _L3_METRIC,
+            l3_metric,
             encoder_pin=None,
             plugin_pin=plugin_pin,
+            domain_profile=domain_profile,
         ),
     )
 
@@ -218,7 +240,12 @@ def _compiler_context(
     l3_kind: str,
     l3_requirement: str,
     l1_bundle_actions: tuple[Identifier, ...] = (),
+    domain_profile: str = "product_instance",
 ) -> CompilerContext:
+    from specstyle.verification.l3.structure_edges import (
+        structure_edge_verifier_pin,
+    )
+
     runtime_pin = _pin("runtime", "runtime")
     ip_pin = _ip_adapter_pin(pipeline_graph)
     plugin_pin = _pin("diagnostic-plugin", "diagnostic-plugin")
@@ -235,7 +262,7 @@ def _compiler_context(
     output = OutputProfileCapability(
         _pin("output", "output"),
         "xhs_grid",
-        ("product_instance",),
+        (domain_profile,),
         ("preview", "production"),
     )
     return CompilerContext(
@@ -249,11 +276,38 @@ def _compiler_context(
             RuleCatalogCapability(
                 "1",
                 _pin("rules", "rules"),
-                _l1_rules(l1_bundle_actions) + _l2_rules(),
+                _l1_rules(l1_bundle_actions, domain_profile)
+                + _l2_rules(domain_profile),
             ),
         ),
-        _threshold_profiles(ip_pin, plugin_pin, l2_status, l3_status),
-        (_l3_plugin(plugin_pin, l3_kind, l3_requirement),),
+        _threshold_profiles(
+            ip_pin,
+            plugin_pin,
+            l2_status,
+            l3_status,
+            domain_profile=domain_profile,
+            l3_metric=(
+                _STRUCTURE_METRIC if domain_profile == "structure_only" else _L3_METRIC
+            ),
+        ),
+        (
+            _l3_plugin(
+                plugin_pin,
+                l3_kind,
+                l3_requirement,
+                domain_profile=domain_profile,
+                metric_id=(
+                    _STRUCTURE_METRIC
+                    if domain_profile == "structure_only"
+                    else _L3_METRIC
+                ),
+                verifier_pin=(
+                    structure_edge_verifier_pin()
+                    if domain_profile == "structure_only"
+                    else None
+                ),
+            ),
+        ),
     )
 
 
@@ -328,7 +382,9 @@ def _profile_specs() -> dict[str, object]:
     }
 
 
-def _style_contract_sections(fidelity_required: bool) -> dict[str, object]:
+def _style_contract_sections(
+    fidelity_required: bool, domain_profile: str = "product_instance"
+) -> dict[str, object]:
     return {
         "style": {
             "preset_id": "preset",
@@ -343,8 +399,10 @@ def _style_contract_sections(fidelity_required: bool) -> dict[str, object]:
             "batch_execution": "sequential",
         },
         "domain": {
-            "profile": "product_instance",
-            "verifier_version": "v1",
+            "profile": domain_profile,
+            "verifier_version": (
+                "sobel-cosine-v1" if domain_profile == "structure_only" else "v1"
+            ),
             "fidelity_required": fidelity_required,
         },
         "outputs": {"profiles": ("xhs_grid",)},
@@ -402,6 +460,7 @@ def _raw_spec(
     style_contents: tuple[bytes, ...],
     *,
     fidelity_required: bool,
+    domain_profile: str = "product_instance",
 ) -> StyleSpecV1:
     data = {
         "schema_version": "1.0",
@@ -411,7 +470,7 @@ def _raw_spec(
         "models": _model_specs(pipeline_graph),
         "assets": _style_assets(style_contents),
         "profiles": _profile_specs(),
-        **_style_contract_sections(fidelity_required),
+        **_style_contract_sections(fidelity_required, domain_profile),
         "verification": _verification_spec(pipeline_graph, context),
         "repair": {
             "policy_version": "1.0",

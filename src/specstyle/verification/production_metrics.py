@@ -7,15 +7,24 @@ from dataclasses import dataclass
 from typing import Any
 
 from specstyle.domain.enums import RuleStatus
+from specstyle.domain.identifiers import ArtifactId
+from specstyle.spec.compiled_models import CompiledRule
 from specstyle.verification.l1.production_bindings import (
     _ProductionL1Implementation as _L1Implementation,
 )
+from specstyle.verification.rule_models import RuleResult
 
 __all__ = ()
 
 
 class _MetricContractViolation(Exception):
     pass
+
+
+def _unverifiable_result(rule: CompiledRule, artifact_id: ArtifactId) -> RuleResult:
+    return RuleResult(
+        rule.definition.rule_id, RuleStatus.UNVERIFIABLE, (artifact_id,), None
+    )
 
 
 @dataclass(frozen=True, slots=True)

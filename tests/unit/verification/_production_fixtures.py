@@ -381,6 +381,7 @@ def _compile_case(
     l3_requirement: str,
     fidelity_required: bool,
     l1_bundle_actions: tuple[Identifier, ...],
+    domain_profile: str,
 ) -> tuple[CompilerContext, object]:
     capability = loaded._borrow_image_evidence_encoder()
     context = _compiler_context(
@@ -391,18 +392,20 @@ def _compile_case(
         l3_kind=l3_kind,
         l3_requirement=l3_requirement,
         l1_bundle_actions=l1_bundle_actions,
+        domain_profile=domain_profile,
     )
     raw = _raw_spec(
         pipeline_graph,
         context,
         styles,
         fidelity_required=fidelity_required,
+        domain_profile=domain_profile,
     )
     return context, compile_style_spec(raw, context)
 
 
-def _source_image() -> object:
-    content = _png((200, 10, 10))
+def _source_image(content: bytes | None = None) -> object:
+    content = _png((200, 10, 10)) if content is None else content
     return preprocess_image(
         content,
         AssetRef(AssetId("source"), hash_bytes(content)),
@@ -413,9 +416,9 @@ def _source_image() -> object:
 
 
 def _generation_request(
-    compiled: object, styles: tuple[bytes, ...]
+    compiled: object, styles: tuple[bytes, ...], source_content: bytes | None = None
 ) -> tuple[GenerationRequest, tuple[AssetRef, ...]]:
-    source = _source_image()
+    source = _source_image(source_content)
     graph = compiled.production_graphs[0]
     references = tuple(
         AssetRef(AssetId(f"style-{index}"), hash_bytes(content))
@@ -440,8 +443,10 @@ def _generation_request(
     return request, references
 
 
-def _generated_artifact(request: GenerationRequest) -> GeneratedArtifact:
-    content = _png((10, 200, 10))
+def _generated_artifact(
+    request: GenerationRequest, content: bytes | None = None
+) -> GeneratedArtifact:
+    content = _png((10, 200, 10)) if content is None else content
     return GeneratedArtifact(
         ArtifactRef(ArtifactId("artifact"), hash_bytes(content)),
         content,
@@ -472,6 +477,9 @@ def _make_production_case(
     l3_requirement: str = "always_advisory",
     fidelity_required: bool = False,
     l1_bundle_actions: tuple[Identifier, ...] = (),
+    domain_profile: str = "product_instance",
+    source_content: bytes | None = None,
+    artifact_content: bytes | None = None,
 ) -> _ProductionCase:
     styles = (_png((10, 10, 200)),) if style_contents is None else style_contents
     supply, pipeline_graph, torch, loaded = _load_case_pipeline(tmp_path)
@@ -485,9 +493,10 @@ def _make_production_case(
         l3_requirement=l3_requirement,
         fidelity_required=fidelity_required,
         l1_bundle_actions=l1_bundle_actions,
+        domain_profile=domain_profile,
     )
-    request, references = _generation_request(compiled, styles)
-    artifact = _generated_artifact(request)
+    request, references = _generation_request(compiled, styles, source_content)
+    artifact = _generated_artifact(request, artifact_content)
     case = _ProductionCase(
         supply,
         loaded,

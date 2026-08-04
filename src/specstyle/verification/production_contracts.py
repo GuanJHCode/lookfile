@@ -38,6 +38,7 @@ __all__ = ()
 _L2_METRIC = Identifier("reference_style_statistics_similarity")
 _L2_BATCH_METRIC = Identifier("batch_style_consistency")
 _L3_METRIC = Identifier("subject_semantic_similarity")
+_STRUCTURE_L3_METRIC = Identifier("structure_edge_similarity")
 
 
 class _ProductionContractViolation(Exception):
@@ -466,16 +467,26 @@ def _validate_l3_semantics(
     capability = _one(
         plugin.rules, lambda item: item.rule_id == rule.definition.rule_id
     )
+    legacy = (
+        capability.kind == "L3_DIAGNOSTIC"
+        and capability.requirement == "always_advisory"
+        and capability.metric_id == _L3_METRIC
+        and rule.metric_id == _L3_METRIC
+        and not rule.definition.required
+    )
+    structure = (
+        capability.kind == "L3_DOMAIN_FIDELITY"
+        and capability.requirement == "fidelity_required"
+        and capability.metric_id == _STRUCTURE_L3_METRIC
+        and rule.metric_id == _STRUCTURE_L3_METRIC
+        and rule.definition.required
+    )
     if (
-        capability.kind != "L3_DIAGNOSTIC"
-        or capability.level is not RuleLevel.L3
+        capability.level is not RuleLevel.L3
         or capability.scope is not RuleScope.ITEM
-        or capability.requirement != "always_advisory"
         or capability.threshold_source != "l3"
-        or capability.metric_id != _L3_METRIC
-        or rule.metric_id != _L3_METRIC
         or capability.verifier_pin != rule.verifier_pin
-        or rule.definition.required
+        or not (legacy or structure)
     ):
         raise _ProductionContractViolation
     return plugin
@@ -498,9 +509,8 @@ def _validate_l3_binding(
     if len(profiles) != 1:
         raise _ProductionContractViolation
     profile, metric = profiles[0], rule.threshold_binding
-    valid = (
-        not source.domain.fidelity_required
-        and plugin.domain_profile == source.domain.profile
+    common = (
+        plugin.domain_profile == source.domain.profile
         and plugin.domain_verifier_version == source.domain.verifier_version
         and profile.source == "l3"
         and profile.style_pack_id == Identifier(source.style.preset_id)
@@ -510,9 +520,68 @@ def _validate_l3_binding(
         and plan.l3_threshold_profile_pin == profile.pin
         and _profile_matches_binding(profile, rule)
     )
-    if metric is None or metric.operator != ">=" or not -1.0 <= metric.value <= 1.0:
-        valid = False
+    capability = _one(
+        plugin.rules, lambda item: item.rule_id == rule.definition.rule_id
+    )
+    legacy = (
+        not source.domain.fidelity_required
+        and capability.kind == "L3_DIAGNOSTIC"
+        and metric is not None
+        and metric.metric_id == _L3_METRIC
+        and metric.operator == ">="
+        and -1.0 <= metric.value <= 1.0
+    )
+    structure = _valid_structure_l3(source, plugin, profile, rule, capability, metric)
+    valid = common and (legacy or structure)
     if not valid:
+        raise _ProductionContractViolation
+
+
+def _valid_structure_l3(
+    source: Any,
+    plugin: L3PluginCapability,
+    profile: ThresholdProfileCapability,
+    rule: CompiledRule,
+    capability: RuleCapability,
+    metric: CompiledThresholdBinding | None,
+) -> bool:
+    return (
+        source.domain.profile == "structure_only"
+        and source.domain.fidelity_required
+        and plugin.domain_profile == "structure_only"
+        and plugin.domain_verifier_version == "sobel-cosine-v1"
+        and plugin.supported_output_profiles == ("xhs_grid",)
+        and capability.kind == "L3_DOMAIN_FIDELITY"
+        and capability.requirement == "fidelity_required"
+        and capability.supported_domains == ("structure_only",)
+        and capability.supported_output_profiles == ("xhs_grid",)
+        and capability.verifier_pin == rule.verifier_pin
+        and rule.verifier_pin.id == "structure-edge-verifier"
+        and rule.verifier_pin.revision == "sobel-cosine-v1"
+        and profile.status == "VALIDATED"
+        and profile.production_approval_sha256 is not None
+        and metric is not None
+        and metric.metric_id == _STRUCTURE_L3_METRIC
+        and metric.production_approval_sha256 is not None
+        and metric.operator == ">="
+        and 0.0 <= metric.value <= 1.0
+    )
+
+
+def _validate_structure_implementation_pin(plan: CompiledVerificationPlan) -> None:
+    from specstyle.verification.l3.structure_edges import (
+        structure_edge_verifier_pin,
+    )
+
+    try:
+        implementation_pin = structure_edge_verifier_pin()
+    except Exception:
+        raise _ProductionContractViolation from None
+    if any(
+        rule.metric_id == _STRUCTURE_L3_METRIC
+        and rule.verifier_pin != implementation_pin
+        for rule in plan.rules
+    ):
         raise _ProductionContractViolation
 
 
@@ -572,6 +641,7 @@ def _validate_production_binding(
     plan: CompiledVerificationPlan,
     context: CompilerContext,
     mappings: tuple[tuple[RuleId, str], ...],
+    validate_structure_implementation: bool = False,
 ) -> tuple[CompiledStyleSpec, CompiledVerificationPlan]:
     try:
         context_snapshot = _clone_compiler_context(context)
@@ -605,4 +675,6 @@ def _validate_production_binding(
     _validate_rule_bindings(
         context_snapshot, binding, independent, canonical[0], mappings
     )
+    if validate_structure_implementation:
+        _validate_structure_implementation_pin(canonical[0])
     return independent, canonical[0]

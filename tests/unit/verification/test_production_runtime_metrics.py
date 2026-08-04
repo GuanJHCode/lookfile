@@ -8,15 +8,21 @@ from pathlib import Path
 import threading
 
 import pytest
-from PIL import Image
+from PIL import Image, ImageDraw
 
 from specstyle.domain.artifacts import ArtifactRef
-from specstyle.domain.enums import RuleStatus
+from specstyle.domain.enums import (
+    ArtifactStatus,
+    DecisionReason,
+    RuleStatus,
+)
 from specstyle.errors import DomainError, InfrastructureError
 from specstyle.generation.diffusers_backend import DiffusersBackend
 from specstyle.generation.diffusers_loader import load_production_pipeline
 from specstyle.generation.protocols import GeneratedArtifact
 from specstyle.observability.hashing import hash_bytes
+from specstyle.verification.routing import decide_artifact
+from specstyle.verification.rule_models import VerificationReport
 from tests.unit.verification._production_fixtures import (
     _OOM,
     _ProductionCase,
@@ -49,6 +55,108 @@ def _result(case: _ProductionCase, rule_id: str) -> object:
     verifier, rules = _bind(case)
     results = verifier.verify((case.artifact.ref,), rules)
     return next(result for result in results if result.rule_id.value == rule_id)
+
+
+def _structure_scene(
+    position: tuple[int, int, int, int] | None,
+    *,
+    color: tuple[int, int, int] = (230, 230, 230),
+) -> bytes:
+    image = Image.new("RGB", (64, 64), (10, 10, 10))
+    if position is not None:
+        ImageDraw.Draw(image).rectangle(position, fill=color)
+    output = BytesIO()
+    image.save(output, "PNG")
+    return output.getvalue()
+
+
+@pytest.mark.parametrize(
+    ("source_position", "output_position", "expected_rule", "expected_artifact"),
+    (
+        ((12, 12, 44, 44), (12, 12, 44, 44), RuleStatus.PASS, ArtifactStatus.APPROVED),
+        ((6, 6, 26, 26), (38, 38, 58, 58), RuleStatus.FAIL, ArtifactStatus.REJECTED),
+        (None, (12, 12, 44, 44), RuleStatus.UNVERIFIABLE, ArtifactStatus.REJECTED),
+    ),
+)
+def test_structure_only_required_l3_controls_routing_without_clip_encoding(
+    tmp_path: Path,
+    source_position: tuple[int, int, int, int] | None,
+    output_position: tuple[int, int, int, int],
+    expected_rule: RuleStatus,
+    expected_artifact: ArtifactStatus,
+) -> None:
+    case = _make_production_case(
+        tmp_path,
+        l2_status="DRAFT",
+        l3_status="VALIDATED",
+        l3_kind="L3_DOMAIN_FIDELITY",
+        l3_requirement="fidelity_required",
+        fidelity_required=True,
+        domain_profile="structure_only",
+        source_content=_structure_scene(source_position),
+        artifact_content=_structure_scene(output_position, color=(30, 180, 90)),
+    )
+    try:
+        verifier, rules = _bind(case)
+        results = verifier.verify((case.artifact.ref,), rules)
+        l3 = next(
+            result for result in results if result.rule_id.value == "l3_diagnostic"
+        )
+        report = VerificationReport((case.artifact.ref,), rules, results)
+        decision = decide_artifact(report, case.artifact.ref.artifact_id)
+
+        assert l3.status is expected_rule
+        assert decision.artifact_status is expected_artifact
+        assert decision.decision_reason is (
+            DecisionReason.ALL_REQUIRED_PASS
+            if expected_rule is RuleStatus.PASS
+            else DecisionReason.REQUIRED_GATE_UNVERIFIABLE
+            if expected_rule is RuleStatus.UNVERIFIABLE
+            else DecisionReason.REQUIRED_GATE_FAILED
+        )
+        assert case.evidence_calls == {}
+    finally:
+        case.close()
+
+
+def test_structure_only_runtime_pin_drift_is_unverifiable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    structure_edges = importlib.import_module(
+        "specstyle.verification.l3.structure_edges"
+    )
+    case = _make_production_case(
+        tmp_path,
+        l2_status="DRAFT",
+        l3_status="VALIDATED",
+        l3_kind="L3_DOMAIN_FIDELITY",
+        l3_requirement="fidelity_required",
+        fidelity_required=True,
+        domain_profile="structure_only",
+        source_content=_structure_scene((12, 12, 44, 44)),
+        artifact_content=_structure_scene((12, 12, 44, 44)),
+    )
+    try:
+        verifier, rules = _bind(case)
+        original_pin = structure_edges.structure_edge_verifier_pin()
+        monkeypatch.setattr(
+            structure_edges,
+            "structure_edge_verifier_pin",
+            lambda: type(original_pin)(
+                original_pin.id, original_pin.revision, hash_bytes(b"drift")
+            ),
+        )
+
+        results = verifier.verify((case.artifact.ref,), rules)
+        l3 = next(
+            result for result in results if result.rule_id.value == "l3_diagnostic"
+        )
+
+        assert l3.status is RuleStatus.UNVERIFIABLE
+        assert l3.score is None
+        assert case.evidence_calls == {}
+    finally:
+        case.close()
 
 
 def _bind_with(

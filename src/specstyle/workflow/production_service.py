@@ -9,7 +9,7 @@ import threading
 from typing import Any, Callable
 
 from specstyle.domain.artifacts import ArtifactRef, AssetRef
-from specstyle.domain.enums import ArtifactStatus
+from specstyle.domain.enums import ArtifactStatus, RuleScope, StaticApplicability
 from specstyle.domain.identifiers import AttemptId, JobId
 from specstyle.errors import DomainError, InfrastructureError, _GpuOutOfMemoryError
 from specstyle.generation.diffusers_backend import DiffusersBackend, StyleAssetResolver
@@ -256,8 +256,19 @@ def _select_initial_contract(
     )
     if len(graphs) != 1 or len(plans) != 1:
         raise DomainError("production selectors must resolve exactly once")
+    _reject_required_batch_plan(plans[0])
     _validate_repair_contract(compiled, request.output_profile)
     return compiled, graphs[0], plans[0]
+
+
+def _reject_required_batch_plan(plan: object) -> None:
+    if any(
+        rule.definition.scope is RuleScope.BATCH
+        and rule.definition.required
+        and rule.definition.applicability is StaticApplicability.APPLICABLE
+        for rule in getattr(plan, "rules", ())
+    ):
+        raise DomainError("BATCH_CONTEXT_REQUIRED")
 
 
 def _matches_descriptor(resolved: object, descriptor: object) -> bool:

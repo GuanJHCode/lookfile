@@ -29,6 +29,7 @@ from specstyle.spec.compiled_models import ThresholdMetricCapability
 from specstyle.spec.compiler import compile_style_spec
 from tests.unit.verification._production_fixtures import (
     _ProductionCase,
+    _make_production_case,
     _png,
     production_case as production_case,
 )
@@ -246,6 +247,47 @@ def test_create_rejects_coarse_or_required_l3_rule(
             request=request,
             plan=plan,
         )
+
+
+@pytest.mark.parametrize("mutation", ("verifier_pin", "approval"))
+def test_create_rejects_unsealed_structure_l3_contract(tmp_path, mutation: str) -> None:
+    case = _make_production_case(
+        tmp_path,
+        l2_status="DRAFT",
+        l3_status="VALIDATED",
+        l3_kind="L3_DOMAIN_FIDELITY",
+        l3_requirement="fidelity_required",
+        fidelity_required=True,
+        domain_profile="structure_only",
+    )
+    try:
+        production = importlib.import_module("specstyle.verification.production")
+        context = case.compiler_context
+        if mutation == "verifier_pin":
+            plugin = context.l3_plugins[0]
+            rule = plugin.rules[0]
+            bad_pin = replace(rule.verifier_pin, sha256=Sha256("f" * 64))
+            context = replace(
+                context,
+                l3_plugins=(
+                    replace(plugin, rules=(replace(rule, verifier_pin=bad_pin),)),
+                ),
+            )
+        else:
+            profiles = list(context.threshold_profiles)
+            profiles[1] = replace(profiles[1], production_approval_sha256=None)
+            context = replace(context, threshold_profiles=tuple(profiles))
+        request, plan = _request_for_context(case, context)
+
+        with pytest.raises(
+            DomainError, match="^invalid production verifier dependency$"
+        ):
+            _create(case, production, context=context, request=request, plan=plan)
+        assert case.artifact_resolver.calls == []
+        assert case.style_resolver.calls == []
+        assert case.evidence_calls == {}
+    finally:
+        case.close()
 
 
 @pytest.mark.parametrize("mutation", ("coarse", "required"))

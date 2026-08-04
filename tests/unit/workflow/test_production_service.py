@@ -198,6 +198,22 @@ def test_production_runtime_exposes_only_named_export_entrypoints() -> None:
     )
 
 
+def test_single_item_runtime_rejects_required_batch_plan() -> None:
+    module = importlib.import_module("specstyle.workflow.production_service")
+    definition = RuleDefinition(
+        RuleId("batch_required"),
+        RuleLevel.L2,
+        RuleScope.BATCH,
+        True,
+        StaticApplicability.APPLICABLE,
+        GatePolicy("reject", "reject", "manual_review"),
+    )
+    plan = SimpleNamespace(rules=(SimpleNamespace(definition=definition),))
+
+    with pytest.raises(DomainError, match="^BATCH_CONTEXT_REQUIRED$"):
+        module._reject_required_batch_plan(plan)
+
+
 def test_public_l1_bindings_are_frozen_slotted_and_exact() -> None:
     module = _request_type()[0]
     binding = module.ProductionL1RuleBinding(

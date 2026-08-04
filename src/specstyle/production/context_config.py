@@ -27,6 +27,14 @@ from specstyle.production._fd_ownership import (
     _duplicate_directory_fd,
 )
 from specstyle.production.config_io import _load_json_document_from_owned_root
+from specstyle.production.context_v4 import (
+    FormalContextBindings,
+    FormalThresholdProfileConfig,
+    V4_TOP_KEYS,
+    load_formal_context_bindings,
+    require_formal_context_integrity,
+)
+from specstyle.production.context_v4_integrity import FormalContextAnchor
 from specstyle.production.output_profile_config import (
     copy_output_profile,
     parse_legacy_output_profile,
@@ -35,6 +43,7 @@ from specstyle.production.output_profile_config import (
 from specstyle.spec.compiled_models import (
     CompilerContext,
     EncoderCapability,
+    L3PluginCapability,
     ModelCapability,
     OutputProfileCapability,
     ResourcePin,
@@ -61,6 +70,7 @@ __all__ = (
 _SCHEMA_V1 = "specstyle.production.context.v1"
 _SCHEMA_V2 = "specstyle.production.context.v2"
 _SCHEMA_V3 = "specstyle.production.context.v3"
+_SCHEMA_V4 = "specstyle.production.context.v4"
 _CONFIG_BYTES = 1024 * 1024
 _EVIDENCE_BYTES = 16 * 1024 * 1024
 _EVIDENCE_TOTAL_BYTES = 48 * 1024 * 1024
@@ -220,7 +230,11 @@ class ProductionContextConfig:
     strength_mapping: StrengthMappingCapability
     output_profiles: tuple[OutputProfileCapability, ...]
     rule_catalog: RuleCatalogCapability
-    l2_threshold_profile: _L2ThresholdProfile
+    l2_threshold_profile: _L2ThresholdProfile | FormalThresholdProfileConfig
+    threshold_profiles: tuple[_L2ThresholdProfile | FormalThresholdProfileConfig, ...]
+    l3_plugins: tuple[L3PluginCapability, ...]
+    target_cell_sha256: Sha256 | None
+    _v4_integrity_anchor: FormalContextAnchor | None
     source_preprocess: _SourcePreprocess
     canny: CannyProcessorConfig
     _seal: object = field(repr=False, compare=False)
@@ -256,16 +270,36 @@ def require_model_pipeline_support(
 
 
 def require_validated_production_threshold(config: object, /) -> None:
-    """Fail closed unless the loader issued a bound v3 Production approval."""
+    """Fail closed unless the loader issued every required Production approval."""
     if (
         type(config) is not ProductionContextConfig
         or getattr(config, "_seal", None) is not _CONFIG_SEAL
-        or config.schema_version != _SCHEMA_V3
-        or config.l2_threshold_profile.status != "VALIDATED"
-        or type(config.l2_threshold_profile.production_binding)
-        is not ValidatedEvidenceBinding
     ):
         raise DomainError("PRODUCTION_THRESHOLD_NOT_VALIDATED")
+    if config.schema_version == _SCHEMA_V3:
+        if (
+            config.l2_threshold_profile.status != "VALIDATED"
+            or type(config.l2_threshold_profile) is not _L2ThresholdProfile
+            or type(config.l2_threshold_profile.production_binding)
+            is not ValidatedEvidenceBinding
+        ):
+            raise DomainError("PRODUCTION_THRESHOLD_NOT_VALIDATED")
+        return
+    if config.schema_version == _SCHEMA_V4:
+        try:
+            require_formal_context_integrity(
+                config._v4_integrity_anchor,
+                config.target_cell_sha256,
+                config.threshold_profiles,
+                config.l2_threshold_profile,
+                config.l3_plugins,
+                require_validated=True,
+            )
+        except DomainError:
+            pass
+        else:
+            return
+    raise DomainError("PRODUCTION_THRESHOLD_NOT_VALIDATED")
 
 
 def _exact(value: object, keys: set[str], label: str) -> dict[str, Any]:
@@ -305,6 +339,8 @@ def _rule(
     kind: str,
     scope: RuleScope,
     outputs: tuple[str, ...] | None,
+    domains: tuple[str, ...] = ("product_instance",),
+    requirement: str | None = None,
 ):
     keys = (
         (_L1_RULE_V2_KEYS if kind == "L1_TECHNICAL" else _L2_RULE_V2_KEYS)
@@ -323,8 +359,12 @@ def _rule(
         kind,
         RuleLevel.L1 if kind == "L1_TECHNICAL" else RuleLevel.L2,
         scope,
-        "always_required" if kind == "L1_TECHNICAL" else "always_advisory",
-        ("product_instance",),
+        requirement
+        if requirement is not None
+        else "always_required"
+        if kind == "L1_TECHNICAL"
+        else "always_advisory",
+        domains,
         supported,
         _pin(raw["verifier_pin"]),
         "none" if metric is None else "l2",
@@ -338,13 +378,17 @@ def _catalog(value: object, schema_version: str) -> RuleCatalogCapability:
     raw = _exact(value, _CATALOG_KEYS, "rule catalog")
     if type(raw["l1_rules"]) is not list:
         raise DomainError("invalid production context rule catalog")
-    v2 = schema_version in {_SCHEMA_V2, _SCHEMA_V3}
+    v2 = schema_version in {_SCHEMA_V2, _SCHEMA_V3, _SCHEMA_V4}
+    domains = (
+        ("structure_only",) if schema_version == _SCHEMA_V4 else ("product_instance",)
+    )
     l1 = tuple(
         _rule(
             item,
             kind="L1_TECHNICAL",
             scope=RuleScope.ITEM,
             outputs=None if v2 else ("xhs_grid",),
+            domains=domains,
         )
         for item in raw["l1_rules"]
     )
@@ -357,6 +401,7 @@ def _catalog(value: object, schema_version: str) -> RuleCatalogCapability:
         kind="L2_STYLE_FIDELITY",
         scope=RuleScope.ITEM,
         outputs=None if v2 else ("xhs_grid",),
+        domains=domains,
     )
     if item.metric_id != Identifier(_L2_METRIC):
         raise DomainError("invalid production L2 item metric")
@@ -365,6 +410,8 @@ def _catalog(value: object, schema_version: str) -> RuleCatalogCapability:
         kind="L2_BATCH_CONSISTENCY",
         scope=RuleScope.BATCH,
         outputs=None if v2 else ("background_sequence",),
+        domains=domains,
+        requirement="always_required" if schema_version == _SCHEMA_V4 else None,
     )
     if batch.metric_id != Identifier(_L2_BATCH_METRIC):
         raise DomainError("invalid production L2 batch metric")
@@ -636,6 +683,10 @@ def _issue(document: dict[str, Any]) -> ProductionContextConfig:
         ("output_profiles", outputs),
         ("rule_catalog", catalog),
         ("l2_threshold_profile", threshold),
+        ("threshold_profiles", (threshold,)),
+        ("l3_plugins", ()),
+        ("target_cell_sha256", None),
+        ("_v4_integrity_anchor", None),
         ("source_preprocess", _source(document["source_preprocess"])),
         ("canny", _canny(document["canny"])),
         ("_seal", _CONFIG_SEAL),
@@ -643,6 +694,106 @@ def _issue(document: dict[str, Any]) -> ProductionContextConfig:
     for name, value in values:
         object.__setattr__(issued, name, value)
     return issued
+
+
+def _structure_output(value: OutputProfileCapability) -> OutputProfileCapability:
+    return OutputProfileCapability(
+        _copy_pin(value.pin),
+        value.profile,
+        ("structure_only",),
+        tuple(value.supported_generation_profiles),
+        value.render_contract,
+    )
+
+
+def _issue_v4(
+    document: dict[str, Any], formal: FormalContextBindings
+) -> ProductionContextConfig:
+    mapping = _mapping(document["strength_mapping"])
+    outputs = tuple(
+        _structure_output(item)
+        for item in parse_output_profiles_v2(document["output_profiles"])
+    )
+    catalog = _catalog(document["rule_catalog"], _SCHEMA_V4)
+    target = formal.target
+    expected_l2 = {
+        rule.metric_id
+        for rule in catalog.rules
+        if rule.level is RuleLevel.L2
+        and target.output_profile in rule.supported_output_profiles
+    }
+    actual_l2 = {item.metric_id for item in formal.threshold_profiles[0].metrics}
+    if (
+        target.domain_profile != "structure_only"
+        or target.output_profile != "xhs_grid"
+        or _pin(document["compiler_pin"]) != target.compiler_pin
+        or mapping.preset_id != target.style_pack_id
+        or mapping.pin != target.style_pack_pin
+        or len(outputs) != 1
+        or outputs[0].profile != target.output_profile
+        or outputs[0].pin != target.output_profile_pin
+        or catalog.pin != target.rule_catalog_pin
+        or expected_l2 != actual_l2
+    ):
+        raise DomainError("v4 context target drift")
+    source = _source(document["source_preprocess"])
+    expected_preprocessor = target.require_metric(_L2_METRIC).preprocessor_pin
+    if source.processor_pin != expected_preprocessor:
+        raise DomainError("v4 source preprocessor drift")
+    issued = object.__new__(ProductionContextConfig)
+    values = (
+        ("schema_version", _SCHEMA_V4),
+        ("compiler_pin", target.compiler_pin),
+        ("model_support", _model_support(document["model_support"])),
+        ("strength_mapping", mapping),
+        ("output_profiles", outputs),
+        ("rule_catalog", catalog),
+        ("l2_threshold_profile", formal.threshold_profiles[0]),
+        ("threshold_profiles", formal.threshold_profiles),
+        ("l3_plugins", formal.l3_plugins),
+        ("target_cell_sha256", target.sha256),
+        ("_v4_integrity_anchor", formal.integrity_anchor),
+        ("source_preprocess", source),
+        ("canny", _canny(document["canny"])),
+        ("_seal", _CONFIG_SEAL),
+    )
+    for name, value in values:
+        object.__setattr__(issued, name, value)
+    require_formal_context_integrity(
+        issued._v4_integrity_anchor,
+        issued.target_cell_sha256,
+        issued.threshold_profiles,
+        issued.l2_threshold_profile,
+        issued.l3_plugins,
+        require_validated=False,
+    )
+    return issued
+
+
+def _load_v4(
+    document: dict[str, Any],
+    evidence_root_fd: int,
+    owned: _OwnedFileDescriptors,
+) -> ProductionContextConfig:
+    cache: dict[Sha256, bytes] = {}
+    evidence_total = 0
+
+    def read(digest: Sha256) -> bytes:
+        nonlocal evidence_total
+        if type(digest) is not Sha256:
+            raise DomainError("invalid v4 evidence digest")
+        if digest not in cache:
+            content = _read_evidence(evidence_root_fd, digest, owned)
+            evidence_total += len(content)
+            if evidence_total > _EVIDENCE_TOTAL_BYTES:
+                raise InfrastructureError(
+                    "production context evidence total size refused"
+                )
+            cache[digest] = content
+        return cache[digest]
+
+    formal = load_formal_context_bindings(document, read)
+    return _issue_v4(document, formal)
 
 
 def _bind_validated_evidence(
@@ -716,8 +867,16 @@ def load_production_context_config(
             if type(document) is not dict:
                 raise DomainError("invalid production context document")
             schema_version = document.get("schema_version")
-            if schema_version not in (_SCHEMA_V1, _SCHEMA_V2, _SCHEMA_V3):
+            if schema_version not in (
+                _SCHEMA_V1,
+                _SCHEMA_V2,
+                _SCHEMA_V3,
+                _SCHEMA_V4,
+            ):
                 raise DomainError("invalid production context schema")
+            if schema_version == _SCHEMA_V4:
+                document = _exact(document, V4_TOP_KEYS, "document")
+                return _load_v4(document, owned_evidence_root_fd, owned)
             document = _exact(
                 document,
                 _TOP_KEYS_V1 if schema_version == _SCHEMA_V1 else _TOP_KEYS_V2,
@@ -825,6 +984,43 @@ def _copy_threshold(
     )
 
 
+def _copy_formal_threshold(
+    value: FormalThresholdProfileConfig,
+) -> ThresholdProfileCapability:
+    return ThresholdProfileCapability(
+        _copy_pin(value.pin),
+        str(value.logical_name),
+        value.source,
+        value.status,
+        Identifier(value.style_pack_id.value),
+        "structure_only",
+        _copy_pin(value.binding_pin) if value.source == "l2" else None,
+        _copy_pin(value.binding_pin) if value.source == "l3" else None,
+        tuple(
+            ThresholdMetricCapability(
+                Identifier(metric.metric_id.value), metric.operator, metric.value
+            )
+            for metric in value.metrics
+        ),
+        Sha256(value.calibration_dataset_sha256.value),
+        Sha256(value.validation_dataset_sha256.value),
+        Sha256(value.annotation_protocol_sha256.value),
+        None
+        if value.production_approval_sha256 is None
+        else Sha256(value.production_approval_sha256.value),
+    )
+
+
+def _copy_l3_plugin(value: L3PluginCapability) -> L3PluginCapability:
+    return L3PluginCapability(
+        _copy_pin(value.pin),
+        value.domain_profile,
+        str(value.domain_verifier_version),
+        tuple(value.supported_output_profiles),
+        tuple(_copy_rule(rule) for rule in value.rules),
+    )
+
+
 def _available_runtime(environment: EnvironmentSnapshot) -> tuple[str, str, str]:
     observations = tuple(
         getattr(environment, name)
@@ -888,17 +1084,39 @@ def _validate_factory_inputs(
         or tuple(item.role for item in config.model_support) != _MODEL_ROLES
     ):
         raise DomainError("invalid production pipeline graph")
-    binding = config.l2_threshold_profile.production_binding
-    if config.l2_threshold_profile.status == "VALIDATED":
-        if (
-            binding is None
-            or graph.ip_adapter.model_id != binding.verifier_pin.id
-            or graph.ip_adapter.revision != binding.verifier_pin.revision
-            or graph.ip_adapter.expected_sha256 != binding.verifier_pin.sha256
+    if config.schema_version == _SCHEMA_V4:
+        require_formal_context_integrity(
+            config._v4_integrity_anchor,
+            config.target_cell_sha256,
+            config.threshold_profiles,
+            config.l2_threshold_profile,
+            config.l3_plugins,
+            require_validated=False,
+        )
+        l2 = config.l2_threshold_profile
+        if type(l2) is not FormalThresholdProfileConfig or any(
+            graph.ip_adapter.model_id != binding.binding_pin.id
+            or graph.ip_adapter.revision != binding.binding_pin.revision
+            or graph.ip_adapter.expected_sha256 != binding.binding_pin.sha256
+            or binding.preprocessor_pin != config.source_preprocess.processor_pin
+            for binding in l2.metric_bindings
         ):
             raise DomainError("production runtime evidence binding mismatch")
-    elif binding is not None:
-        raise DomainError("invalid nonvalidated production evidence binding")
+    else:
+        threshold = config.l2_threshold_profile
+        if type(threshold) is not _L2ThresholdProfile:
+            raise DomainError("invalid production threshold profile")
+        binding = threshold.production_binding
+        if threshold.status == "VALIDATED":
+            if (
+                binding is None
+                or graph.ip_adapter.model_id != binding.verifier_pin.id
+                or graph.ip_adapter.revision != binding.verifier_pin.revision
+                or graph.ip_adapter.expected_sha256 != binding.verifier_pin.sha256
+            ):
+                raise DomainError("production runtime evidence binding mismatch")
+        elif binding is not None:
+            raise DomainError("invalid nonvalidated production evidence binding")
     return _available_runtime(environment)
 
 
@@ -930,13 +1148,43 @@ def _context(
         )
     )
     encoder_pin = model_capabilities[1].pin
-    binding = config.l2_threshold_profile.production_binding
-    if config.l2_threshold_profile.status == "VALIDATED":
-        if binding is None:
-            raise DomainError("validated production evidence binding missing")
-        require_runtime_evidence_binding(binding, encoder_pin, preprocessing_version)
-    elif binding is not None:
-        raise DomainError("invalid nonvalidated production evidence binding")
+    if config.schema_version == _SCHEMA_V4:
+        require_formal_context_integrity(
+            config._v4_integrity_anchor,
+            config.target_cell_sha256,
+            config.threshold_profiles,
+            config.l2_threshold_profile,
+            config.l3_plugins,
+            require_validated=False,
+        )
+        l2 = config.l2_threshold_profile
+        if type(l2) is not FormalThresholdProfileConfig:
+            raise DomainError("invalid v4 L2 threshold profile")
+        if l2.status == "VALIDATED" and any(
+            binding.binding_pin != encoder_pin
+            or binding.preprocessor_pin != config.source_preprocess.processor_pin
+            or binding.preprocessor_pin.revision != preprocessing_version
+            for binding in l2.metric_bindings
+        ):
+            raise DomainError("production runtime evidence binding mismatch")
+    else:
+        threshold = config.l2_threshold_profile
+        if type(threshold) is not _L2ThresholdProfile:
+            raise DomainError("invalid production threshold profile")
+        binding = threshold.production_binding
+        if threshold.status == "VALIDATED":
+            if binding is None:
+                raise DomainError("validated production evidence binding missing")
+            require_runtime_evidence_binding(
+                binding, encoder_pin, preprocessing_version
+            )
+        elif binding is not None:
+            raise DomainError("invalid nonvalidated production evidence binding")
+    threshold_profiles = (
+        tuple(_copy_formal_threshold(profile) for profile in config.threshold_profiles)
+        if config.schema_version == _SCHEMA_V4
+        else (_copy_threshold(threshold, encoder_pin),)
+    )
     return CompilerContext(
         _copy_pin(config.compiler_pin),
         (RuntimeCapability(runtime_pin, "rocm", *versions, "float16"),),
@@ -953,8 +1201,8 @@ def _context(
         (_copy_mapping(config.strength_mapping),),
         tuple(copy_output_profile(item) for item in config.output_profiles),
         (_copy_catalog(config.rule_catalog),),
-        (_copy_threshold(config.l2_threshold_profile, encoder_pin),),
-        (),
+        threshold_profiles,
+        tuple(_copy_l3_plugin(plugin) for plugin in config.l3_plugins),
     )
 
 
