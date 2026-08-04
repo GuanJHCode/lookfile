@@ -75,10 +75,10 @@
     {
       "kind": "submission_demo_video",
       "license": "LicenseRef-First-Party-Demo",
-      "origin": "Evidence slides plus the complete first-party AMD UI recording",
+      "origin": "Evidence slides, current AMD command evidence, and excerpts from the first-party AMD UI recording; the standalone WebM remains the uncut archival capture",
       "path": "../SpecStyle_Radeon_Demo.mp4",
-      "sha256": "c712b73b1d9308c1d75f128796f4de47c52eb5953c617190a8e3db405beed28f",
-      "size_bytes": 2686729
+      "sha256": "af408a2fd300cdc6fecd52428472e902ac07bedb60697808e7a309e90a46221a",
+      "size_bytes": 3076461
     }
   ],
   "consent": "not_applicable_no_people_or_private_source_media",

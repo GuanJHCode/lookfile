@@ -6,10 +6,10 @@
         "codec": "AAC-LC",
         "sample_rate_hz": 48000
       },
-      "duration_seconds": 235.88,
+      "duration_seconds": 196.04,
       "path": "../SpecStyle_Radeon_Demo.mp4",
-      "sha256": "c712b73b1d9308c1d75f128796f4de47c52eb5953c617190a8e3db405beed28f",
-      "size_bytes": 2686729,
+      "sha256": "af408a2fd300cdc6fecd52428472e902ac07bedb60697808e7a309e90a46221a",
+      "size_bytes": 3076461,
       "video": {
         "codec": "H.264 High",
         "frame_rate": 25,
@@ -35,31 +35,42 @@
   },
   "composition": {
     "audio_policy": "silent AAC compatibility track; no narration or synthesized claims",
-    "raw_capture_policy": "the standalone WebM is uncut; the demo presents the run at original speed and loses one 25 fps frame at its concat boundary",
+    "raw_capture_policy": "the standalone WebM is uncut; the demo shows setup and completed results at original speed, compresses only the inference wait to 4x, and presents the exact recorded Radeon output files without visual alteration",
     "segments": [
-      {"duration_seconds": 14.96, "source": "deck slide 1"},
-      {"duration_seconds": 17.96, "source": "deck slide 2"},
-      {"duration_seconds": 21.96, "source": "deck slide 3"},
-      {"duration_seconds": 13.96, "source": "deck slide 4"},
-      {"duration_seconds": 73.24, "source": "raw UI capture"},
-      {"duration_seconds": 21.96, "source": "deck slide 5"},
-      {"duration_seconds": 17.96, "source": "deck slide 6"},
-      {"duration_seconds": 21.96, "source": "deck slide 7"},
-      {"duration_seconds": 19.96, "source": "deck slide 8"},
-      {"duration_seconds": 11.96, "source": "deck slide 9"}
+      {"duration_seconds": 11.96, "source": "deck slide 1 with submitter footer"},
+      {"duration_seconds": 16.0, "source": "current AMD deployment command evidence"},
+      {"duration_seconds": 13.96, "source": "deck slide 3 workflow"},
+      {"duration_seconds": 14.96, "source": "raw UI input and setup at original speed"},
+      {"duration_seconds": 11.48, "source": "raw UI Radeon inference wait at 4x"},
+      {"duration_seconds": 12.24, "source": "raw UI completed output wall at original speed"},
+      {"duration_seconds": 11.96, "source": "completed UI frame"},
+      {"duration_seconds": 8.0, "source": "recorded Radeon output preview-seed-0.png"},
+      {"duration_seconds": 8.0, "source": "recorded Radeon output preview-seed-1.png"},
+      {"duration_seconds": 8.0, "source": "recorded Radeon output preview-seed-2.png"},
+      {"duration_seconds": 8.0, "source": "recorded Radeon output preview-seed-3.png"},
+      {"duration_seconds": 11.96, "source": "full UI evidence frame"},
+      {"duration_seconds": 15.0, "source": "content-addressed Preview wall manifest"},
+      {"duration_seconds": 15.52, "source": "deck slide 6 runtime stack"},
+      {"duration_seconds": 17.52, "source": "deck slide 8 claim boundaries"},
+      {"duration_seconds": 11.48, "source": "deck slide 9 with submitter footer"}
     ]
   },
   "inputs": {
+    "amd_deployment_current": {
+      "path": "amd_deployment_current.json",
+      "sha256": "98571e835ef82264cd9e01fa9c077083b3892616f9a1ee6e15057364e37004a5",
+      "size_bytes": 1123
+    },
     "project_profile_pdf": {
       "path": "../SpecStyle_Project_Profile.pdf",
-      "sha256": "5095d30dfaa16c6c3f72f5797bf1af2384d08ff7d5fa113b1b50677fd2525d77",
-      "size_bytes": 5396958
+      "sha256": "1bf45d24155427dea80d9592b3c07c502390df6a586de37492beb6e3a51bbc32",
+      "size_bytes": 5397663
     },
     "presentation": {
       "path": "../SpecStyle_Track1_Deck.pptx",
-      "sha256": "b9937d37251169d3f93eb1bd28cb8acecc6ca26387aada1584427d178982c575",
-      "size_bytes": 3131499
+      "sha256": "bd5fa903b2e24c137ce2233c3a70d3622981874b9cfc1fb314ed0fa4912344f5",
+      "size_bytes": 3131609
     }
   },
-  "schema_version": "specstyle.submission.video-manifest.v1"
+  "schema_version": "specstyle.submission.video-manifest.v2"
 }

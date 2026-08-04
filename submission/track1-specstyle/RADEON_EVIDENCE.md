@@ -16,6 +16,17 @@
 - Diffusers: 0.39.0
 - Python: 3.12
 
+## Current reviewed deployment
+
+- Deployed/source SHA: `b0efb77ba265a317767598f2617ed40c0ad3af57`
+- Tracked worktree: clean
+- Device: `AMD Radeon Graphics`
+- UI: HTTP 200, Gradio 6.15.1, 71 components
+- Focused formal-approval/batch tests on the AMD host: 64 passed
+
+This is a current deployment readback. The four-image wall below remains bound
+to candidate `fd4e45b`; the current record does not relabel historical output.
+
 ## Actual browser-driven Preview wall
 
 Wall ID: `preview-wall-3a18518754104e71ab06f32050c2e3bf`
@@ -54,6 +65,7 @@ diversity=NOT_EVALUATED
 
 ## Files
 
+- [`evidence/amd_deployment_current.json`](evidence/amd_deployment_current.json)
 - [`evidence/amd_environment.json`](evidence/amd_environment.json)
 - [`evidence/radeon_preview_wall.json`](evidence/radeon_preview_wall.json)
 - [`evidence/radeon_ui_capture.json`](evidence/radeon_ui_capture.json)

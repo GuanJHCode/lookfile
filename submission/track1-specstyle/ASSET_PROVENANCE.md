@@ -37,10 +37,11 @@ on the AMD competition instance. They show filenames and engineering evidence,
 but no credentials, tokens, private filesystem locations, or private media.
 
 `SpecStyle_Radeon_UI_Run.webm` is the uncut 73.28-second browser capture.
-`SpecStyle_Radeon_Demo.mp4` presents the run between evidence slides rendered
-from the editable deck. Its encoded UI segment is 73.24 seconds because the
-concat boundary consumes one 25 fps frame; the standalone WebM is the archival
-record. The machine-readable timeline and media hashes are recorded in
+`SpecStyle_Radeon_Demo.mp4` combines evidence slides, current AMD deployment
+commands, the UI setup and completed results at original speed, and a 4x view
+of only the inference wait. It also presents the four recorded Radeon outputs
+at inspectable size. The standalone WebM is the uncut archival record. The
+machine-readable timeline and media hashes are recorded in
 [`evidence/video_manifest.json`](evidence/video_manifest.json).
 
 ## License identifiers

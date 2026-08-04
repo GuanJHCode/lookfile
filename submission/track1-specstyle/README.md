@@ -7,13 +7,16 @@ and supports bounded repair and replay workflows.
 
 ## Deliverables
 
-- [`SpecStyle_Project_Profile.pdf`](SpecStyle_Project_Profile.pdf): project
-  background, users and scenarios, architecture, model stack, and AMD/ROCm use.
+- [`SpecStyle_Project_Profile.pdf`](SpecStyle_Project_Profile.pdf): English
+  project profile submitted by `guan`, covering users and scenarios,
+  architecture, model stack, and AMD/ROCm use.
 - [`SpecStyle_Track1_Deck.pptx`](SpecStyle_Track1_Deck.pptx): editable English
-  presentation.
-- [`SpecStyle_Radeon_Demo.mp4`](SpecStyle_Radeon_Demo.mp4): 235.88-second
-  H.264/AAC video presenting the browser-driven Radeon Preview run and its
-  evidence boundaries.
+  presentation submitted by `guan`.
+- [`SpecStyle_Radeon_Demo.mp4`](SpecStyle_Radeon_Demo.mp4): 196.04-second
+  H.264/AAC video showing current AMD command-line evidence, the real
+  browser-driven Radeon run, the four outputs at inspectable size, and the
+  stability/diversity claim boundaries. Only the inference wait is shown at
+  4x; the raw capture remains available below.
 - [`SpecStyle_Radeon_UI_Run.webm`](SpecStyle_Radeon_UI_Run.webm): raw 73.28
   second Gradio capture from candidate `fd4e45b`.
 - [`PROJECT_PROFILE.md`](PROJECT_PROFILE.md): text source for the PDF.
@@ -26,6 +29,9 @@ and supports bounded repair and replay workflows.
   operator commands. It contains no approved labels.
 - [`evidence/video_manifest.json`](evidence/video_manifest.json): codecs,
   duration, source hashes, and the exact composition timeline.
+- [`evidence/amd_deployment_current.json`](evidence/amd_deployment_current.json):
+  current reviewed AMD deployment SHA, GPU/runtime, UI health, and focused
+  test result.
 - [`SHA256SUMS`](SHA256SUMS): hashes for every submitted document, evidence
   record, image, and media artifact.
 
@@ -45,6 +51,15 @@ and supports bounded repair and replay workflows.
 The four Preview images are shown in
 [`media/radeon-ui-preview-wall.png`](media/radeon-ui-preview-wall.png). The raw
 records are under [`evidence/`](evidence/).
+
+## Current reviewed deployment
+
+The current AMD host checkout and service were independently read back at
+`b0efb77ba265a317767598f2617ed40c0ad3af57`: the tracked worktree was clean,
+the device was `AMD Radeon Graphics`, the UI returned HTTP 200 with Gradio
+6.15.1 and 71 components, and 64 focused formal-approval/batch tests passed.
+This deployment record does not reassign the four-image wall from its recorded
+candidate `fd4e45b`.
 
 ## Reproduce
 
