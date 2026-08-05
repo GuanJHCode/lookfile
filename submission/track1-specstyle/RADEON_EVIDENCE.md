@@ -55,6 +55,38 @@ quality=NOT_EVALUATED
 diversity=NOT_EVALUATED
 ```
 
+## Complementary stability and creative-variation walls
+
+These two runs answer different demonstration questions and are not combined
+into one metric claim.
+
+| Evidence | Source commit | Runtime result | Claim boundary |
+|---|---|---|---|
+| Production-profile stability | `f60fd8e` | 4/4 completed exports, 125.54 s, four unique seeds and hashes | L1 `PASS`; L2 `UNVERIFIABLE`; L3 `NOT_APPLICABLE`; formal threshold `DRAFT` |
+| Bold Preview creative variation | `4482837` | 4/4 completed images, 45.47 s, four unique seeds and hashes | `ENGINEERING_ONLY`; Verification/Repair/Export `NOT_RUN`; quality/diversity `NOT_EVALUATED` |
+
+### Production-profile stability
+
+![Production-profile stability wall](media/evidence/stability-production-n4-wall.png)
+
+This wall shows one synthetic source, one style reference, and four sequential
+768x768 Production-profile jobs from the same compiled Spec. The runtime route
+was `approved/` for all four because the configured required L1 checks passed.
+That routing result is not calibrated L2/L3 approval, and this independent-job
+wall is not the formal L2 cohort gate. The current formal Production gate stays
+closed while its threshold evidence is `DRAFT`.
+
+### Bold Preview creative variation
+
+![Bold Preview creative-variation wall](media/evidence/creative-preview-n4-wall.png)
+
+This wall uses the submitted generated source/style pair and stronger Preview
+settings to expose more visible changes in framing, palette, lighting, and
+background geometry. It records actual AMD execution at commit `4482837`, one
+pipeline load, four deterministic seeds, four unique content hashes, zero
+failures, and completed cleanup. It does not enter the Production package or
+establish human-rated quality or perceptual diversity.
+
 ## Verification gates
 
 - AMD focused tests: 1,009 passed, 1 skipped
@@ -68,9 +100,13 @@ diversity=NOT_EVALUATED
 - [`evidence/amd_deployment_current.json`](evidence/amd_deployment_current.json)
 - [`evidence/amd_environment.json`](evidence/amd_environment.json)
 - [`evidence/radeon_preview_wall.json`](evidence/radeon_preview_wall.json)
+- [`evidence/radeon_production_stability_n4.json`](evidence/radeon_production_stability_n4.json)
+- [`evidence/radeon_bold_preview_n4.json`](evidence/radeon_bold_preview_n4.json)
 - [`evidence/radeon_ui_capture.json`](evidence/radeon_ui_capture.json)
 - [`evidence/video_manifest.json`](evidence/video_manifest.json)
 - [`media/radeon-ui-preview-wall.png`](media/radeon-ui-preview-wall.png)
+- [`media/evidence/stability-production-n4-wall.png`](media/evidence/stability-production-n4-wall.png)
+- [`media/evidence/creative-preview-n4-wall.png`](media/evidence/creative-preview-n4-wall.png)
 - [`SpecStyle_Radeon_Demo.mp4`](SpecStyle_Radeon_Demo.mp4)
 - [`SpecStyle_Radeon_UI_Run.webm`](SpecStyle_Radeon_UI_Run.webm)
 

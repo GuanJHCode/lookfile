@@ -32,6 +32,12 @@ and supports bounded repair and replay workflows.
 - [`evidence/amd_deployment_current.json`](evidence/amd_deployment_current.json):
   current reviewed AMD deployment SHA, GPU/runtime, UI health, and focused
   test result.
+- [`evidence/radeon_production_stability_n4.json`](evidence/radeon_production_stability_n4.json):
+  four Production-profile engineering jobs with L1/L2/L3 state and formal-gate
+  boundaries.
+- [`evidence/radeon_bold_preview_n4.json`](evidence/radeon_bold_preview_n4.json):
+  a higher-variation Preview wall with exact seeds, hashes, runtime, and
+  `NOT_EVALUATED` claim labels.
 - [`SHA256SUMS`](SHA256SUMS): hashes for every submitted document, evidence
   record, image, and media artifact.
 
@@ -51,6 +57,31 @@ and supports bounded repair and replay workflows.
 The four Preview images are shown in
 [`media/radeon-ui-preview-wall.png`](media/radeon-ui-preview-wall.png). The raw
 records are under [`evidence/`](evidence/).
+
+## Complementary Radeon evidence
+
+### Production-profile engineering stability
+
+![Production-profile stability wall](media/evidence/stability-production-n4-wall.png)
+
+Four sequential 768x768 jobs completed and exported in 125.54 seconds on AMD
+Radeon. All required L1 checks passed, while L2 remained `UNVERIFIABLE` and L3
+was `NOT_APPLICABLE`. The runtime routed all four files to `approved/`, but that
+route means the configured L1-required workflow gate passed; it is not formal
+L2 or L3 approval. This retained `f60fd8e` engineering run used one source,
+style reference, and compiled Spec. The formal Production threshold evidence
+was still `DRAFT`, so the current formal gate remains closed.
+
+### Creative variation: Bold Preview
+
+![Bold Preview creative-variation wall](media/evidence/creative-preview-n4-wall.png)
+
+Source commit `4482837` produced four 512x512 Preview outputs in 45.47 seconds
+with four unique deterministic seeds and content hashes. The stronger
+Preview settings visibly expose a broader range of composition, palette,
+lighting, and background geometry while retaining the same source and style
+inputs. This wall remains `ENGINEERING_ONLY`: Verification, Repair, and Export
+were `NOT_RUN`, and quality and perceptual diversity are `NOT_EVALUATED`.
 
 ## Current reviewed deployment
 
@@ -79,8 +110,10 @@ evidence, Preview/Production separation, Production export examples, and
 fail-closed evaluation infrastructure. The new context v4, pinned
 `structure_only` L3 gate, formal batch metric and atomic cohort publication are
 CPU-validated but not yet evidenced on Radeon with approved thresholds. It does
-not claim calibrated L2/L3
-accuracy, human-rated perceptual diversity, or a Radeon repair uplift study.
+not claim calibrated L2/L3 accuracy, human-rated perceptual diversity, or a
+Radeon repair uplift study. The two complementary walls above demonstrate
+engineering stability and visibly different Preview outcomes without changing
+those formal claim boundaries.
 Those results require approved held-out assets, independent labels, and a
 trusted Production threshold package that are not available in this repository.
 

@@ -79,6 +79,12 @@ sanitized Radeon evidence, media provenance, a rendered PDF, a presentation,
 and a 3-5 minute demo video under
 [`submission/track1-specstyle/`](submission/track1-specstyle/).
 
+The pack also includes two complementary Radeon walls: a retained
+Production-profile N=4 stability run whose formal threshold status remained
+`DRAFT`, and a commit `4482837` Bold Preview N=4 run with visibly stronger
+creative variation. Both are explicitly bounded as engineering evidence; no
+calibrated L2/L3 or human-rated perceptual-diversity result is claimed.
+
 ## Evidence boundaries and remaining evaluation work
 
 - Preview is a separate LCM execution profile and never enters the approved

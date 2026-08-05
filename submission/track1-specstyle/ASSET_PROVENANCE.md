@@ -30,6 +30,25 @@ These are demonstration outputs generated from the recorded demo inputs using
 the local, approved runtime model supply. Model weights are not redistributed.
 Use of the outputs remains subject to the applicable model and platform terms.
 
+## Complementary evidence composites
+
+`media/evidence/stability-production-n4-wall.png` is a deterministic montage of
+one synthetic, non-person source, one style reference, and four local Radeon
+Production-profile outputs. The underlying source is recorded as `CC0-1.0` and
+attributed to `SpecStyle synthetic replay material 1`. The montage operation
+only resized and arranged the recorded pixels and added factual labels.
+
+`media/evidence/creative-preview-n4-wall.png` is a deterministic montage of the
+same generated `media/source.png` and `media/style.png` inputs documented above
+plus four local Radeon Bold Preview outputs. No private or third-party source
+media is present. The montage operation only resized and arranged the recorded
+pixels and added factual labels.
+
+The exact composite hashes, dimensions, runtime output hashes, and claim
+boundaries are recorded in
+[`evidence/radeon_production_stability_n4.json`](evidence/radeon_production_stability_n4.json)
+and [`evidence/radeon_bold_preview_n4.json`](evidence/radeon_bold_preview_n4.json).
+
 ## Screenshots and recordings
 
 The UI screenshots and recordings are first-party captures of SpecStyle running
@@ -53,6 +72,9 @@ machine-readable timeline and media hashes are recorded in
 - `LicenseRef-First-Party-Screenshot`: first-party software screen capture.
 - `LicenseRef-First-Party-Demo`: first-party evidence deck and software capture
   compiled into the submission video.
+- `LicenseRef-First-Party-Evidence-Composite`: first-party deterministic layout
+  of recorded inputs and locally generated Radeon outputs; no model weights or
+  additional source image is included.
 
 The repository code license is intentionally not selected by this provenance
 record. Model license approvals remain separate deployment evidence.
