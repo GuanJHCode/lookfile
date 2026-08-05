@@ -1,4 +1,4 @@
-"""SPEC-004 semantic_diff tests。"""
+"""SPEC-004 semantic_diff tests."""
 
 from __future__ import annotations
 

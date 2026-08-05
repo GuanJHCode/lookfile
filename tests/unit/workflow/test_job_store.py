@@ -1,4 +1,4 @@
-"""WF-001 JobStore + 状态机 + 恢复契约测试（§5, INV-W1..W15）。"""
+"""WF-001 JobStore, state-machine, and recovery contract tests."""
 
 from __future__ import annotations
 
@@ -1316,7 +1316,7 @@ def test_corrupted_attempt_ids_type_fail_closed(tmp_path: Path) -> None:
 def test_append_event_fsyncs_directory(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """append_event 必须在文件 fsync 后 fsync 目录，保证崩溃恢复幂等。"""
+    """append_event fsyncs the directory after the file for crash idempotency."""
     import specstyle.workflow.job_store as store_mod
 
     calls: list[int] = []

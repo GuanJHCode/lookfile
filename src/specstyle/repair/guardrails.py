@@ -1,4 +1,4 @@
-"""Repair report 的离散 gate-level guardrail。"""
+"""Discrete gate-level guardrail for repair reports."""
 
 from __future__ import annotations
 
@@ -32,7 +32,7 @@ def _vector(plan: _Plan, report: _Report, target: _ArtifactId) -> tuple[int, ...
 def required_gate_vector(
     plan: _Plan, report: _Report, target_artifact_id: _ArtifactId
 ) -> tuple[int, ...]:
-    """按稳定 required gate 顺序生成 target 的 PASS/non-PASS 位向量。"""
+    """Build a target PASS/non-PASS bit vector in stable required-gate order."""
     rebuilt_plan, rebuilt_report, target = _validated_plan_report(
         plan, report, target_artifact_id
     )
@@ -49,7 +49,7 @@ def is_repair_improvement(
     child_target_artifact_id: _ArtifactId,
     decision: _RepairDecision,
 ) -> bool:
-    """仅接受 trigger 修复且 required gate 字典序严格改善的 child report。"""
+    """Accept only trigger repair with strict lexicographic gate improvement."""
     rebuilt_plan, parent, parent_target = _validated_plan_report(
         plan, parent_report, parent_target_artifact_id
     )

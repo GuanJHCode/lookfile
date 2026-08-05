@@ -1,13 +1,15 @@
-"""SpecStyle 安全导出平面。
+"""SpecStyle secure export plane.
 
-冻结于架构合同 ``architecture/contracts.md`` §13。
+Frozen by architecture contract ``architecture/contracts.md`` section 13.
 
-EXP-001A 负责输入模型、跨对象不变量、纯路径规划与 canonical
-manifest/QA/credits/style_spec/payload/digest 的纯内存生成；不执行文件系统、
-环境捕获、网络或 native syscall。EXP-001B 负责 trusted root fd、
-stage/write/readback/fsync、native no-replace rename、安全清理与 ``ExportBundle``。
+EXP-001A owns input models, cross-object invariants, pure path planning, and
+in-memory generation of canonical manifest, QA, credits, style spec, payload,
+and digest documents. It performs no filesystem access, environment capture,
+network access, or native syscall. EXP-001B owns the trusted root fd,
+stage/write/readback/fsync sequence, native no-replace rename, secure cleanup,
+and ``ExportBundle``.
 
-本模块仅文档字符串：不 re-export、不 alias、不 lazy-load 任何类型。
-公共类型分别由 :mod:`specstyle.exporting.manifest` 与
-:mod:`specstyle.exporting.bundle` 直接定义。
+This module contains documentation only: it does not re-export, alias, or
+lazy-load any type. Public types are defined directly by
+:mod:`specstyle.exporting.manifest` and :mod:`specstyle.exporting.bundle`.
 """

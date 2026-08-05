@@ -1,13 +1,12 @@
-"""specstyle.spec.loader 单测：YAML 安全解析 + 路径/输入安全。
+"""Unit tests for secure YAML parsing and path/input safety.
 
-覆盖 Module 2 冻结合同：
-- 文本：UTF-8 byte size、duplicate key、unsafe/custom tag、alias、merge、root mapping、深度、节点数；
-  非法 UTF-8/孤立 surrogate、YAML/Pydantic 输入错误抛 DomainError，不回显原文/值；
-- 文件：allowed_root 可信目录、relative path 相对且不含 ..、逐组件拒绝 symlink、resolve 后仍在 root、
-  仅 regular file、读取前后双重 size/短读检查；
-- 异常分类：不存在/路径政策违反 = DomainError；权限/设备/短读/其它非输入 OSError = InfrastructureError；
-  错误信息不含完整私密绝对路径。
-- 限额：MAX_SPEC_BYTES=1_048_576、MAX_YAML_DEPTH=32、MAX_YAML_NODES=10_000；P0 拒绝所有 alias 和 merge。
+Cover the frozen Module 2 contract: UTF-8 and byte-size limits, duplicate keys,
+unsafe or custom tags, aliases, merges, mapping roots, depth and node limits;
+``DomainError`` without source/value echo for invalid text or model input;
+trusted-root relative paths without ``..``, component-wise symlink rejection,
+resolved containment, regular files, and pre/post read checks; correct domain
+versus infrastructure error classification without private absolute paths; and
+the fixed byte, depth, and node limits with all aliases and merges rejected.
 """
 
 from __future__ import annotations
@@ -150,7 +149,7 @@ def _mutate_yaml(mutator) -> str:
     return yaml.dump(d, sort_keys=False, default_flow_style=False, allow_unicode=True)
 
 
-# --- 常量 ---
+# --- Constants ---
 
 
 def test_limits_constants():
@@ -159,14 +158,14 @@ def test_limits_constants():
     assert MAX_YAML_NODES == 10_000
 
 
-# --- 合法文本加载 ---
+# --- Valid text loading ---
 
 
 def test_load_valid_text_returns_spec():
     spec = load_style_spec_text(_valid_yaml())
     assert spec.schema_version == "1.0"
     assert spec.metadata.spec_id == "brand-retro-v1"
-    # YAML sequence 已转为 tuple
+    # YAML sequences have been converted to tuples.
     assert spec.profiles.preview.resolution == (512, 512)
     assert spec.outputs.profiles == ("xhs_grid",)
 
@@ -184,7 +183,7 @@ def test_sha_uppercase_normalized_in_text():
     assert spec.models.base.sha256 == "a" * 64
 
 
-# --- 非法 UTF-8 / 大小 ---
+# --- Invalid UTF-8 and size ---
 
 
 def test_invalid_utf8_raises_domain_error():
@@ -247,21 +246,21 @@ def test_empty_yaml_raises():
 
 
 def test_excessive_depth_raises():
-    # 嵌套深度 > 32
+    # Nesting depth exceeds 32.
     text = "a:\n" + "".join("  " * i + "b:\n" for i in range(1, MAX_YAML_DEPTH + 2))
     with pytest.raises(DomainError):
         load_style_spec_text(text)
 
 
 def test_very_deep_recursion_caught():
-    # ~800 层嵌套可能触发 PyYAML RecursionError（取决于栈限）；无论哪条路径都必须是 DomainError
+    # About 800 levels may hit PyYAML recursion limits; every path is DomainError.
     text = "a:\n" + "".join("  " * i + "b:\n" for i in range(1, 800))
     with pytest.raises(DomainError):
         load_style_spec_text(text)
 
 
 def test_excessive_nodes_raises():
-    # 节点数 > 10000
+    # Node count exceeds 10,000.
     text = (
         'schema_version: "1.0"\nitems: ['
         + ", ".join("1" for _ in range(MAX_YAML_NODES + 1))
@@ -271,12 +270,12 @@ def test_excessive_nodes_raises():
         load_style_spec_text(text)
 
 
-# --- Pydantic 输入错误 -> DomainError，不回显值 ---
+# --- Pydantic input errors become DomainError without echoing values ---
 
 
 def test_pydantic_validation_error_becomes_domain_error():
     def m(d):
-        d["schema_version"] = "9.9"  # 非法 Literal
+        d["schema_version"] = "9.9"  # Invalid Literal.
 
     with pytest.raises(DomainError):
         load_style_spec_text(_mutate_yaml(m))
@@ -293,7 +292,7 @@ def test_error_message_does_not_leak_value():
         assert "SECRET-LEAK-VALUE" not in msg
 
 
-# --- 文件加载 + 路径安全 ---
+# --- File loading and path safety ---
 
 
 def _write(tmp_path: Path, name: str, content: str) -> Path:
@@ -358,7 +357,7 @@ def test_non_str_text_raises():
 
 
 def test_load_file_uses_size_guard(tmp_path):
-    # 写一个刚好等于上限的合法文件不应被拒
+    # A valid file exactly at the limit must not be rejected.
     _write(tmp_path, "spec.yaml", _valid_yaml())
     spec = load_style_spec_file(
         tmp_path, "spec.yaml", max_bytes=len(_valid_yaml().encode("utf-8")) + 1000

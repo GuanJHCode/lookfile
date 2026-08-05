@@ -1,6 +1,6 @@
-"""SPEC-005 same-input / new-batch replay assessment（contracts §14.5）。
+"""SPEC-005 same-input and new-batch replay assessment, contracts section 14.5.
 
-纯函数：不 mutation、不 backend、不网络。
+Pure functions with no mutation, backend access, or network access.
 """
 
 from __future__ import annotations
@@ -117,7 +117,7 @@ def assess_same_input_replay(req: SameInputReplayRequest, /) -> ReplayAssessment
         if policy == "strict":
             reasons.append("environment_fingerprint_mismatch")
         else:
-            # advisory：env 差异单独记 reason，不单独构成 REJECTED
+            # Record environment differences as advisory reasons, not rejection alone.
             pass
 
     if reasons:

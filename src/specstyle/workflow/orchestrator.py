@@ -1,14 +1,17 @@
-"""WF-002 Fake CPU 端到端纵向切片 orchestrator。
+"""WF-002 fake CPU end-to-end vertical-slice orchestrator.
 
-按 architect 冻结合同（contracts §3/§11.7/§12.9/§13）连接既有冻结函数：
-``load_style_spec_text``/``compile_style_spec``、``run_generation``、``run_verifier``、
-``VerificationReport``、``start_repair_history``/``next_repair_step``/
-``consume_repair_result``、``export_bundle``。本模块不复制 compiler/verifier/repair/
-gate 业务规则，只组装这些平面；不 import torch/diffusers/gradio。
+The architect-frozen contract connects existing frozen functions from
+contracts sections 3, 11.7, 12.9, and 13:
+``load_style_spec_text``/``compile_style_spec``, ``run_generation``,
+``run_verifier``, ``VerificationReport``, ``start_repair_history``/
+``next_repair_step``/``consume_repair_result``, and ``export_bundle``. This
+module assembles the planes without duplicating compiler, verifier, repair, or
+gate business rules, and it does not import torch, diffusers, or gradio.
 
-ID 派生确定（``_attempt_id``/``_decision_id``），重启同输入得到相同 ID，配合 WF-001
-JobStore 实现阶段幂等。本模块不声称 Spec replay 已验证；同 seed 重复仅依赖
-FakeBackend bit-exact。
+ID derivation is deterministic through ``_attempt_id`` and ``_decision_id``;
+restarting with the same input produces the same IDs and enables stage
+idempotency with the WF-001 JobStore. This module does not claim verified Spec
+replay; same-seed repetition relies only on FakeBackend bit-exact behavior.
 """
 
 from __future__ import annotations
@@ -80,11 +83,12 @@ _SNAPSHOT_VERSION = "specstyle.workflow.snapshot.v1"
 
 @dataclass(frozen=True, slots=True)
 class FakeJobPlan:
-    """单作业计划：每 profile 生成 ``item_count`` 个 item（P0=1）。
+    """Single-job plan producing ``item_count`` items per profile (P0=1).
 
-    ``output_profiles`` 为 xhs_grid/talking_head_cover/background_sequence 的非空无重复
-    子集；``generation_profile`` 固定 ``"production"``；``variation_index`` 为初始
-    attempt 的 variation（0）。
+    ``output_profiles`` is a non-empty, duplicate-free subset of ``xhs_grid``,
+    ``talking_head_cover``, and ``background_sequence``.
+    ``generation_profile`` is fixed at ``"production"`` and
+    ``variation_index`` is the initial attempt variation (zero).
     """
 
     job_id: JobId
@@ -111,7 +115,7 @@ class FakeJobPlan:
             if type(profile) is not str or profile not in allowed or profile in seen:
                 raise ValueError("invalid fake job plan")
             seen.add(profile)
-        # P0：状态机在 item 终态后只能进 EXPORTING，暂强制单 profile × 单 item。
+        # P0 permits only EXPORTING after an item terminal, so require one profile/item.
         if (
             self.item_count != 1
             or len(self.output_profiles) != 1
@@ -124,10 +128,12 @@ class FakeJobPlan:
 
 @dataclass(frozen=True, slots=True)
 class FakeJobResult:
-    """单作业终态：bundle 仅在 ``final_status == "COMPLETED"`` 的成功运行中非空。
+    """Single-job terminal result.
 
-    重启已完成作业时 orchestrator 短路返回 ``bundle=None``（bundle 已在先前运行发布），
-    且不重复生成/导出（INV-WF002-5）。
+    The bundle is non-empty only for a successful run with
+    ``final_status == "COMPLETED"``. On restart of a completed job, the
+    orchestrator returns ``bundle=None`` because the bundle was published
+    previously, and it repeats neither generation nor export (INV-WF002-5).
     """
 
     bundle: ExportBundle | None
@@ -138,17 +144,17 @@ class FakeJobResult:
 
 
 def _attempt_id(job: JobId, profile: str, item: int, rnd: int) -> AttemptId:
-    """确定性 attempt ID：``{job}-a{round}-{profile}-{item}``。"""
+    """Deterministic attempt ID: ``{job}-a{round}-{profile}-{item}``."""
     return AttemptId(f"{job.value}-a{rnd}-{profile}-{item}")
 
 
 def _decision_id(job: JobId, profile: str, item: int, rnd: int) -> DecisionId:
-    """确定性 decision ID：``{job}-d{round}-{profile}-{item}``。"""
+    """Deterministic decision ID: ``{job}-d{round}-{profile}-{item}``."""
     return DecisionId(f"{job.value}-d{rnd}-{profile}-{item}")
 
 
 def _style_reference_refs(graph: CompiledExecutionGraph) -> tuple[AssetRef, ...]:
-    """位置匹配 ``graph.style_reference_hashes`` 的 style ref AssetRef。"""
+    """Style-reference AssetRefs aligned with ``graph.style_reference_hashes``."""
     return tuple(
         AssetRef(AssetId(f"style-{index}"), sha)
         for index, sha in enumerate(graph.style_reference_hashes)
@@ -158,7 +164,7 @@ def _style_reference_refs(graph: CompiledExecutionGraph) -> tuple[AssetRef, ...]
 def _production_graph(
     compiled: CompiledStyleSpec, profile: str
 ) -> CompiledExecutionGraph:
-    """唯一命中 output_profile 的 production graph。"""
+    """Return the unique production graph matching the output profile."""
     matched = tuple(
         graph for graph in compiled.production_graphs if graph.output_profile == profile
     )
@@ -170,7 +176,7 @@ def _production_graph(
 def _verification_plan(
     compiled: CompiledStyleSpec, profile: str
 ) -> CompiledVerificationPlan:
-    """唯一命中 output_profile 的 verification plan。"""
+    """Return the unique verification plan matching the output profile."""
     matched = tuple(
         plan for plan in compiled.verification_plans if plan.output_profile == profile
     )
@@ -189,7 +195,7 @@ def _initial_request(
     profile: str,
     item_index: int,
 ) -> GenerationRequest:
-    """组装初始 root request（variation_index 来自 plan，attempt_id 为 round 0）。"""
+    """Build the root request from the plan variation and a round-zero attempt ID."""
     graph = _production_graph(compiled, profile)
     control = build_control_input(control_builder, source, graph)
     return GenerationRequest(
@@ -209,7 +215,7 @@ def _initial_request(
 
 
 def _expected_artifact_id(request: GenerationRequest) -> str:
-    """复用 FakeBackend §11.7 派生：artifact_id 由 request_hash 决定。"""
+    """Reuse FakeBackend section 11.7 derivation from request_hash to artifact_id."""
     return f"artifact-{request.request_hash.value}"
 
 
@@ -219,7 +225,7 @@ def _load_or_init(
     compiled: CompiledStyleSpec,
     plan: FakeJobPlan,
 ) -> object:
-    """load 检查 resume；job not found 时 save_snapshot 创建初始 Job。"""
+    """Load for resume or create an initial job snapshot when none exists."""
     snapshot = job_store.get_snapshot(job_id)
     if snapshot is None:
         budget = JobBudget(1 + compiled.source_spec.repair.max_rounds)
@@ -244,14 +250,14 @@ def _append(
     to_state: JobStatus,
     payload: object,
 ) -> None:
-    """记录事件并推进 cursor.status；from_state 取自当前 cursor。"""
+    """Record an event and advance cursor.status from the current state."""
     event = Event(1, job_id, event_type, cursor.status, to_state, _TIMESTAMP, payload)
     job_store.append_event(job_id, event)
     cursor.status = to_state
 
 
 def _terminal_to_state(terminal: RepairTerminal) -> JobStatus:
-    """终态 item status → job status（APPROVED/REJECTED/MANUAL_REVIEW）。"""
+    """Map a terminal item status to an APPROVED/REJECTED/MANUAL_REVIEW job state."""
     status = terminal.artifact_decision.artifact_status
     if status is ArtifactStatus.APPROVED:
         return JobStatus.APPROVED
@@ -265,7 +271,7 @@ def _build_credits(
     source: PreparedImage,
     graph: CompiledExecutionGraph,
 ) -> tuple[AssetCredit, ...]:
-    """从 source（input）+ style_refs（style_reference）+ spec provenance 构造 credits。"""
+    """Build input, style_reference, and Spec-provenance credits."""
     spec_refs = compiled.source_spec.assets.style_references
     style_refs = _style_reference_refs(graph)
     credits: list[AssetCredit] = [
@@ -288,7 +294,7 @@ def _build_credits(
 
 
 def _try_fatal(job_store: JobStore, job_id: JobId, cursor: SimpleNamespace) -> None:
-    """失败前 best-effort 追加 FATAL（脱敏）；不发布部分 bundle。"""
+    """Best-effort sanitized FATAL append before failure; publish no partial bundle."""
     if cursor.status in (
         JobStatus.COMPLETED,
         JobStatus.JOB_FAILED,
@@ -322,12 +328,15 @@ def _run_item(
     verifier: Verifier,
     backend: GenerationBackend,
 ) -> tuple[RepairHistory, RepairTerminal]:
-    """单 item 的 generate→verify→repair FSM。
+    """Generate, verify, and repair FSM for a single item.
 
-    记录 ATTEMPT_STARTED/FINISHED 与最终 VERIFIER_FINISHED（终态，非 None stop）。
-    repair 轮次在线性 history 内推进，不落 REPAIR_STEP 事件——WF-001 JobStore 无法
-    序列化进入 REPAIR_SELECTING 所需的 repair_stop_reason=None VERIFIER_FINISHED
-    （RepairStopReason(None) 抛 ValueError），故仅保留可幂等的 attempt/terminal/export 审计。
+    Records ATTEMPT_STARTED/FINISHED and the final terminal VERIFIER_FINISHED
+    with a non-None stop reason.
+    Repair rounds advance in linear history without REPAIR_STEP events because
+    WF-001 JobStore cannot serialize the ``repair_stop_reason=None``
+    VERIFIER_FINISHED needed to enter REPAIR_SELECTING; ``RepairStopReason(None)``
+    raises ``ValueError``. Only idempotent attempt, terminal, and export audit
+    events are retained.
     """
     req0 = _initial_request(
         compiled, plan, source, prompt, control_builder, env_hash, profile, item_index
@@ -403,7 +412,7 @@ def run_fake_job(
     verifier: Verifier,
     backend: GenerationBackend,
 ) -> FakeJobResult:
-    """串联 compile→generate→verify→repair FSM→export 的四链纵向切片。"""
+    """Four-chain vertical slice: compile, generate, verify, repair, and export."""
     compiled = compile_style_spec(load_style_spec_text(spec_text), context)
     env_hash = hash_environment(environment)
     state = _load_or_init(job_store, plan.job_id, compiled, plan)

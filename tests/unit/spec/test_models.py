@@ -1,14 +1,15 @@
-"""specstyle.spec.models 单测：StyleSpecV1 严格模型。
+"""Unit tests for strict StyleSpecV1 models.
 
-覆盖 Module 2 冻结合同：
-- 14 顶层字段全 required、extra-forbid、strict types、frozen；
-- SafeText/NameStr/IDLike/RFC3339/HttpUrl/Sha256/Scale/Resolution 边界；
-- SHA 小写规范化；nullable 精确三处；Literal[False] before-validator；
-- outputs 无重复不去重；assets 非空；stop_after_no_improvement ≤ max_rounds；
-- fidelity_required strict bool；fidelity_required=true + l3=null raw 放行（SPEC-003 fail closed）。
+Cover the frozen Module 2 contract: all 14 top-level fields are required with
+extra fields forbidden, strict and frozen types, constrained scalar bounds,
+lowercase SHA normalization, exactly three nullable locations, the
+``Literal[False]`` validator, duplicate output rejection without deduplication,
+non-empty assets, repair-round bounds, strict fidelity booleans, and the
+SPEC-003 fail-closed handling of required fidelity with raw null L3.
 
-注：strict=True 使 tuple 字段拒绝 list（合同：loader 在 YAML sequence 边界显式转 tuple，
-直接 model validation 不放宽）。故本文件集合字段用 tuple（loader 转换后形态）。
+With ``strict=True``, tuple fields reject lists. The loader explicitly converts
+YAML sequences, while direct model validation remains strict, so fixtures here
+use tuples.
 """
 
 from __future__ import annotations
@@ -21,7 +22,7 @@ from pydantic import ValidationError
 
 from specstyle.spec.models import StyleSpecV1
 
-# --- 合法最小 Spec fixture ---
+# --- Minimal valid Spec fixture ---
 
 
 def _valid_spec() -> dict[str, Any]:
@@ -144,7 +145,7 @@ def _with(spec: dict, path: list, value: Any) -> dict:
     return s
 
 
-# --- 合法构造 ---
+# --- Valid construction ---
 
 
 def test_valid_spec_constructs(valid_spec):
@@ -154,7 +155,7 @@ def test_valid_spec_constructs(valid_spec):
     assert spec.models.controlnet.type == "canny"
     assert spec.domain.fidelity_required is False
     assert spec.verification.l3 is None
-    # collection 保存为 tuple
+    # Collections are stored as tuples.
     assert spec.profiles.preview.resolution == (512, 512)
     assert spec.outputs.profiles == ("xhs_grid",)
 

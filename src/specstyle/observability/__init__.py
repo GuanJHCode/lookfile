@@ -1,1 +1,1 @@
-"""审计、安全哈希与环境观测边界。"""
+"""Boundaries for auditing, safe hashing, and environment observation."""

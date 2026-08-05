@@ -1,6 +1,8 @@
-"""SpecStyle StyleOps 引擎：把视觉风格编译为可版本化、可回放、可验证、可自动修复的生产规范。
+"""SpecStyle StyleOps engine for compiling visual styles into versioned,
+replayable, verifiable, and automatically repairable production specifications.
 
-本模块仅暴露 __version__；领域异常见 specstyle.errors。
+This module exposes only ``__version__``; see ``specstyle.errors`` for domain
+exceptions.
 """
 
 __version__ = "0.1.0"

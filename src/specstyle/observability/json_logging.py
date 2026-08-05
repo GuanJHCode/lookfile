@@ -1,4 +1,4 @@
-"""只接受显式安全上下文的 fail-closed JSON 日志。"""
+"""Fail-closed JSON logging that accepts only explicitly safe context."""
 
 from __future__ import annotations
 
@@ -104,7 +104,7 @@ def _sensitive_key(key: str) -> bool:
 
 
 def sanitize_log_value(value: object, /) -> JsonValue:
-    """递归拷贝允许值；绝不格式化或遍历未授权对象。"""
+    """Copy allowed values recursively without formatting or traversing others."""
     try:
         return _sanitize(value, 0, [0], set())
     except Exception:

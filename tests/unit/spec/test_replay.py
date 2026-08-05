@@ -1,4 +1,4 @@
-"""SPEC-005 replay assessment tests（contracts §14.5）。"""
+"""SPEC-005 replay assessment tests for contracts section 14.5."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ from tests.unit.spec.test_models import _valid_spec
 
 
 def _sha(ch: str = "a") -> Sha256:
-    # Sha256 仅接受 hex；测试用单字符 0-9a-f 填充
+    # Sha256 accepts only hexadecimal; fill tests with one character from 0-9a-f.
     if ch not in "0123456789abcdef":
         ch = "a"
     return Sha256(ch * 64)

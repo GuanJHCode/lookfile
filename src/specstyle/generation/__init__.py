@@ -1,1 +1,1 @@
-"""确定性、无模型的生成核心合同。"""
+"""Deterministic, model-free generation core contracts."""

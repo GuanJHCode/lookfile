@@ -1,15 +1,18 @@
-"""EXP-001A module-private primitive/JSON helpers.
+"""EXP-001A module-private primitive and JSON helpers.
 
-按 §13.2，本模块不定义 public API：所有 canonical 序列化、strict 解析、
-canonical material、leaf primitive builder 与 defensive rebuild helper 均为
-module-private implementation detail，不属于 A/B ABI。:mod:`specstyle.exporting.manifest`
-在 input model 不变量校验与 ``_prepare_export`` 文档组装中调用本模块。
+Under section 13.2 this module defines no public API. Canonical serialization,
+strict parsing, canonical material, leaf primitive builders, and defensive
+rebuild helpers are module-private implementation details outside the A/B ABI.
+:mod:`specstyle.exporting.manifest` calls this module while validating input
+model invariants and assembling documents in ``_prepare_export``.
 
-canonical JSON 规则（§13.9）：``sort_keys``、紧凑分隔符、``ensure_ascii=False``、
-``allow_nan=False``、无 BOM 无尾换行、递归 ``-0.0`` → ``0.0``。strict parser 拒绝
-duplicate key、NaN/Infinity、unknown/missing key，并要求 parsed primitive
-re-dump 等于原 bytes。canonical material 复现 ``repair.history._canonical`` 语义，
-用于跨对象 compiled Spec material 比较（§13.4）。
+Section 13.9 canonical JSON uses ``sort_keys``, compact separators,
+``ensure_ascii=False``, ``allow_nan=False``, no BOM or trailing newline, and
+recursive normalization of ``-0.0`` to ``0.0``. The strict parser rejects
+duplicate keys, NaN/Infinity, and unknown or missing keys, and requires parsed
+primitives to re-dump to the original bytes. Canonical material reproduces
+``repair.history._canonical`` semantics for cross-object compiled Spec material
+comparison under section 13.4.
 """
 
 from __future__ import annotations
@@ -90,7 +93,7 @@ _METRIC_KEYS = (
 
 
 def _normalize(value: Any) -> Any:
-    """递归 ``-0.0`` → ``0.0``；其余原样返回。"""
+    """Recursively normalize ``-0.0`` to ``0.0`` and preserve other values."""
     if type(value) is float:
         return 0.0 if value == 0.0 else value
     if type(value) is dict:
@@ -101,7 +104,7 @@ def _normalize(value: Any) -> Any:
 
 
 def canonical_json_bytes(primitive: Any) -> bytes:
-    """§13.9 canonical JSON bytes。"""
+    """Section 13.9 canonical JSON bytes."""
     return json.dumps(
         _normalize(primitive),
         sort_keys=True,
@@ -127,7 +130,7 @@ def _reject_constant(value: str) -> Any:
 
 
 def parse_strict(data: bytes) -> Any:
-    """拒绝 duplicate key 与 NaN/Infinity 的 strict JSON 解析。"""
+    """Strict JSON parsing that rejects duplicate keys and NaN/Infinity."""
     if type(data) is not bytes:
         raise DomainError("export invariant violation")
     try:
@@ -143,14 +146,14 @@ def parse_strict(data: bytes) -> Any:
 
 
 def assert_canonical_round_trip(data: bytes) -> None:
-    """parsed primitive re-dump 必须等于原 bytes。"""
+    """Require a parsed primitive to re-dump to the original bytes."""
     parsed = parse_strict(data)
     if canonical_json_bytes(parsed) != data:
         raise DomainError("export invariant violation")
 
 
 # --------------------------------------------------------------------------- #
-# Canonical material (§13.4，复现 repair.history._canonical 语义)
+# Canonical material (section 13.4, reproducing repair.history._canonical semantics)
 # --------------------------------------------------------------------------- #
 
 
@@ -161,7 +164,7 @@ def _text(value: object) -> str:
 
 
 def canonical_material(value: object) -> tuple[object, ...]:
-    """与 repair history canonical 语义一致的 type-tagged material。"""
+    """Type-tagged material matching repair history canonical semantics."""
     if value is None:
         return ("none",)
     if type(value) is bool:
@@ -228,7 +231,7 @@ def _model_material(value: object) -> tuple[object, ...]:
 
 
 # --------------------------------------------------------------------------- #
-# Defensive rebuild helpers (§13.2，禁止信任 cached field / dataclass equality)
+# Defensive rebuild helpers (section 13.2; trust neither caches nor equality)
 # --------------------------------------------------------------------------- #
 
 
@@ -516,7 +519,7 @@ def rebuild_repair_history(value: object) -> RepairHistory:
 
 
 def rebuild_compiled_spec(value: object) -> CompiledStyleSpec:
-    """重建并验证 computed compiled_spec_hash（§13.4）。"""
+    """Rebuild and validate the computed compiled_spec_hash under section 13.4."""
     if type(value) is not CompiledStyleSpec:
         _raise_invalid_request()
     try:
@@ -815,7 +818,7 @@ def _result_primitive(value: RuleResult) -> dict[str, Any]:
 def report_primitive(
     report: VerificationReport, plan: CompiledVerificationPlan
 ) -> dict[str, Any]:
-    """构建 manifest ``Report`` primitive（Rule 为 RuleDefinition+CompiledRule join）。"""
+    """Build ``Report`` by joining each ``RuleDefinition`` and ``CompiledRule``."""
     rebuilt = rebuild_verification_report(report)
     by_id = {rule.definition.rule_id.value: rule for rule in plan.rules}
     applicable_ids = {
@@ -961,7 +964,7 @@ def build_qa_report(
     cohorts: list[dict[str, Any]],
     job_id: str,
 ) -> dict[str, Any]:
-    """组装 ``qa_report.json`` canonical primitive（固定 NOT_PROVIDED metrics）。"""
+    """Assemble the canonical ``qa_report.json`` with fixed NOT_PROVIDED metrics."""
     return {
         "cohorts": cohorts,
         "job_id": job_id,

@@ -1,1 +1,1 @@
-"""Repair Core 的值对象与纯请求构造。"""
+"""Repair Core value objects and pure request construction."""

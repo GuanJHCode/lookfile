@@ -1,4 +1,4 @@
-"""WF-001 崩溃恢复、幂等与 cancel/fatal 审计契约测试。"""
+"""WF-001 crash recovery, idempotency, and cancel/fatal audit contract tests."""
 
 from __future__ import annotations
 
@@ -87,7 +87,7 @@ def test_recovery_rejects_snapshot_sequence_beyond_complete_event_log(
 ) -> None:
     store = JobStore(tmp_path)
     _seed_to(store, "CREATED")
-    # 模拟崩溃：直接篡改 snapshot 的 last_sequence 为错误值
+    # Simulate a crash by forging an incorrect snapshot last_sequence.
     directory = tmp_path / "jobs" / "job1"
     import json
 

@@ -1,7 +1,9 @@
-"""specstyle 领域资产/产物引用值对象。
+"""Value objects for specstyle domain asset and artifact references.
 
-AssetRef(asset_id, sha256) 与 ArtifactRef(artifact_id, sha256)：immutable、严格类型、
-精确 mapping round-trip。不含 path，不做 IO、解码或 hash 计算（hash 由外部计算后传入）。
+``AssetRef(asset_id, sha256)`` and ``ArtifactRef(artifact_id, sha256)`` are
+immutable, strictly typed, and support exact mapping round trips. They contain
+no path and perform no I/O, decoding, or hash calculation; hashes are computed
+externally and passed in.
 """
 
 from __future__ import annotations
@@ -18,7 +20,7 @@ _ARTIFACT_KEYS = frozenset({"artifact_id", "sha256"})
 
 @dataclass(frozen=True, slots=True)
 class AssetRef:
-    """对一项输入资产的不可变引用（资产 ID + 内容哈希）。不含 path。"""
+    """An immutable input asset reference with no path: ID plus content hash."""
 
     asset_id: AssetId
     sha256: Sha256
@@ -49,7 +51,7 @@ class AssetRef:
 
 @dataclass(frozen=True, slots=True)
 class ArtifactRef:
-    """对一项生成产物的不可变引用（产物 ID + 内容哈希）。不含 path。"""
+    """An immutable generated artifact reference with no path: ID plus content hash."""
 
     artifact_id: ArtifactId
     sha256: Sha256

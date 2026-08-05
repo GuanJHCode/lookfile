@@ -1,8 +1,9 @@
-"""specstyle.spec.models — Style Spec v1 严格 Pydantic 模型。
+"""Strict Pydantic models for Style Spec v1.
 
-所有模型使用 ConfigDict(strict=True, frozen=True, extra="forbid", allow_inf_nan=False)。
-无业务默认值；collection 保存为 tuple；未列字段禁止。
-字段集合冻结自 master-plan Module 2 合同，L3Config 内部字段对照 spec §4.1。
+All models use ``ConfigDict(strict=True, frozen=True, extra="forbid",
+allow_inf_nan=False)``. There are no business defaults, collections are stored
+as tuples, and unlisted fields are forbidden. The field set is frozen by the
+master-plan Module 2 contract; ``L3Config`` fields follow spec section 4.1.
 """
 
 from __future__ import annotations
@@ -35,7 +36,7 @@ _URL_PATTERN = re.compile(r"\Ahttps?://.+\Z")
 _C0_DEL_PATTERN = re.compile(r"[\x00-\x1f\x7f]")
 
 
-# --- 受限字符串与数值类型 ---
+# --- Constrained string and numeric types ---
 
 
 def _safe_text(value: str) -> str:
@@ -99,7 +100,7 @@ HttpUrlStr = Annotated[
 
 
 def _sha256_adapter(value: str) -> str:
-    # 复用 domain.Sha256 语义：校验 64 hex + 规范小写
+    # Reuse domain.Sha256 semantics: validate 64 hex characters and lowercase.
     try:
         return Sha256(value).value
     except DomainError as exc:
@@ -120,8 +121,8 @@ def _reject_bool(value):
 
 
 def _num_coerce(value):
-    # 接受 int（转 float）或 float，拒绝 bool；str/None 等交 strict float 拒绝。
-    # 用 float（而非 int|float Union）使 Schema 发标准 minimum/maximum。
+    # Accept int converted to float or float, but reject bool; strict float handles others.
+    # Use float instead of int | float so the schema emits standard bounds.
     if isinstance(value, bool):
         raise ValueError("boolean rejected for numeric field")
     if isinstance(value, int):
@@ -129,7 +130,7 @@ def _num_coerce(value):
     return value
 
 
-# 有限 number：接受 int/float，拒绝 bool/str/inf/nan；Schema 发标准 minimum/maximum
+# Finite number: accepts int/float, rejects bool/str/inf/nan, and emits bounds.
 ScaleValue = Annotated[float, Field(ge=0, le=1), BeforeValidator(_num_coerce)]
 GuidanceValue = Annotated[float, Field(ge=0, le=50), BeforeValidator(_num_coerce)]
 StepsValue = Annotated[int, Field(ge=1, le=200), AfterValidator(_reject_bool)]
@@ -138,7 +139,7 @@ ResolutionMember = Annotated[
 ]
 
 
-# --- 模型 ---
+# --- Models ---
 
 
 class Metadata(BaseModel):
@@ -289,12 +290,13 @@ class L2Config(BaseModel):
 
 
 class L3Config(BaseModel):
-    """L3 配置。
+    """L3 configuration.
 
-    NOTE: master-plan 只冻结 ``l3: L3Config | None``；内部字段对照 spec §4.1
-    (plugin_id/plugin_revision/threshold_profile)，按 SafeText 建模——spec §4.1
-    中 l3.threshold_profile 是普通字符串，与 L2 的 ThresholdProfileRef 不同。
-    待 architect/security-reviewer 确认。
+    The master plan freezes only ``l3: L3Config | None``. Internal fields follow
+    spec section 4.1 (``plugin_id``, ``plugin_revision``, and
+    ``threshold_profile``) and use ``SafeText``. Section 4.1 defines
+    ``l3.threshold_profile`` as a plain string, unlike L2's
+    ``ThresholdProfileRef``. Pending architect and security reviewer approval.
     """
 
     model_config = MODEL_CONFIG
@@ -384,11 +386,11 @@ class StyleSpecV1(BaseModel):
     replay_contract: ReplayContract
 
 
-# --- Style Spec 1.1（contracts §14）---
+# --- Style Spec 1.1 (contracts section 14) ---
 
 
 class StyleV11(BaseModel):
-    """1.1 style：在 1.0 Style 上增加 strength_mapping_version pin。"""
+    """Style 1.1 adds a strength_mapping_version pin to Style 1.0."""
 
     model_config = MODEL_CONFIG
 
@@ -400,7 +402,7 @@ class StyleV11(BaseModel):
 
 
 class ReplayContractV11(BaseModel):
-    """1.1 replay：增加 environment_policy。"""
+    """Replay 1.1 adds environment_policy."""
 
     model_config = MODEL_CONFIG
 

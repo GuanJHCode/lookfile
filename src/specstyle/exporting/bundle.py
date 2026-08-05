@@ -1,16 +1,20 @@
-"""EXP-001B secure atomic bundle publish (§13.11).
+"""EXP-001B secure atomic bundle publish (section 13.11).
 
-实现 trusted root fd、同盘 staging、``O_NOFOLLOW/O_EXCL``、short-write loop、
-fsync、写后 readback、Linux ``renameat2(RENAME_NOREPLACE)`` 与 macOS
-``renameatx_np(RENAME_EXCL)`` 原子发布、stale 保留与 ``ExportBundle``。
-不使用 Path convenience、``resolve``、``shutil`` 或普通 rename fallback；
-不重跑 verifier 或修改 gate。
+Implements a trusted root fd, same-filesystem staging, ``O_NOFOLLOW/O_EXCL``,
+a short-write loop, fsync, post-write readback, atomic publication through
+Linux ``renameat2(RENAME_NOREPLACE)`` or macOS
+``renameatx_np(RENAME_EXCL)``, stale staging retention, and ``ExportBundle``.
+It does not use Path conveniences, ``resolve``, ``shutil``, or a plain rename
+fallback, and it does not rerun verifiers or modify gates.
 
-在线流程只关闭自有 fd，不按名删除 staging；未发布的随机 0700 staging
-留给受信恢复/离线 GC，避免 POSIX stat→unlink/rmdir 的同名替换竞态。
+The online flow closes only its own file descriptors and never removes staging
+by name. Unpublished random 0700 staging directories are left for trusted
+recovery or offline GC, avoiding same-name replacement races between POSIX
+stat and unlink/rmdir operations.
 
-只从 ``manifest`` 导入冻结 public/prepared ABI；canonical parse 在本模块
-内联实现，不直接依赖 ``qa_report``（§13.2 ABI 边界）。
+Only the frozen public/prepared ABI is imported from ``manifest``. Canonical
+parsing is implemented inline here without a direct ``qa_report`` dependency,
+preserving the section 13.2 ABI boundary.
 """
 
 from __future__ import annotations
@@ -479,7 +483,10 @@ def _open_dir(parent_fd: int, name: str) -> int:
 
 
 def _open_parent_chain(root_fd: int, parts: tuple[str, ...]) -> tuple[list[int], int]:
-    """沿 held dirfd 逐组件 O_NOFOLLOW 打开父目录，返回 (opened, leaf_parent)."""
+    """Open parent components from a held dirfd with O_NOFOLLOW.
+
+    Return ``(opened, leaf_parent)``.
+    """
     parent = root_fd
     opened: list[int] = []
     for component in parts:

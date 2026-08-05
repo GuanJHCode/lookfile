@@ -361,7 +361,7 @@ def test_rejects_missing_credit() -> None:
     item, request, _artifact, report = _approved_item()
     cohort = ExportCohort("xhs_grid", report, (item,))
     env = _env()
-    # 只提供 input credit，缺 style credit
+    # Supply only input credit, omitting style credit.
     incomplete = (
         AssetCredit(request.source.source, ("input",), None, None, None, None),
     )
@@ -406,7 +406,7 @@ def test_rejects_style_provenance_mismatch() -> None:
     bad_style = AssetCredit(
         request.style_references[0],
         ("style_reference",),
-        "https://example.com/wrong",  # 与 spec 不符
+        "https://example.com/wrong",  # Does not match the spec.
         style_ref.license,
         style_ref.attribution,
         style_ref.consent,

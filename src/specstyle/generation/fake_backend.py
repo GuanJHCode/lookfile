@@ -1,4 +1,4 @@
-"""用于 CPU 合同测试的确定性假生成后端。"""
+"""Deterministic fake generation backend for CPU contract tests."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ from specstyle.observability.hashing import hash_bytes
 
 @dataclass(slots=True)
 class FakeBackend:
-    """实例内按 attempt 只渲染一次的确定性 CPU 后端。"""
+    """Deterministic CPU backend that renders each attempt once per instance."""
 
     _lock: threading.Lock = field(init=False, repr=False)
     _seen_attempts: set[str] = field(init=False, repr=False)

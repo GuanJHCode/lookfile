@@ -155,7 +155,7 @@ def test_decode_rejects_multi_frame_gif() -> None:
 
 
 def test_low_contrast_not_hard_fail_on_pixels() -> None:
-    """Style-like low contrast must not be L1 hard fail (handoff 禁止)."""
+    """Style-like low contrast must not be an L1 hard fail, per the handoff."""
     # near-uniform gray but not pure black/white
     data = _png((40, 41, 42), (32, 32))
     assert check_pixels(_aid(), data).status is RuleStatus.PASS

@@ -1,4 +1,4 @@
-"""Repair policy 1.0 的首个阻断规则选择。"""
+"""First-blocking-rule selection for repair policy 1.0."""
 
 from __future__ import annotations
 
@@ -81,7 +81,7 @@ def _seen(value: object) -> tuple[tuple[_Parameters, int], ...]:
 
 
 def repair_state_key(request: _Request) -> tuple[_Parameters, int]:
-    """返回防伪重建请求的可审计状态键。"""
+    """Return an auditable state key from a defensively rebuilt request."""
     rebuilt = _request(request)
     return rebuilt.execution_parameters, rebuilt.variation_index
 
@@ -94,7 +94,7 @@ def select_repair(
     decision_id: _DecisionId,
     seen_state_keys: tuple[tuple[_Parameters, int], ...] = (),
 ) -> _RepairDecision | _NoAction:
-    """仅为首个阻断 rule 选择一个合法的内置 repair action。"""
+    """Choose one valid built-in repair action for the first blocking rule."""
     rebuilt_request, rebuilt_plan, rebuilt_report, target = _validated_context(
         request, plan, report, target_artifact_id
     )

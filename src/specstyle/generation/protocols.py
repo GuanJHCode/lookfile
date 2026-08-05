@@ -1,4 +1,4 @@
-"""生成后端与控制输入构建器边界。"""
+"""Boundaries for generation backends and control input builders."""
 
 from __future__ import annotations
 

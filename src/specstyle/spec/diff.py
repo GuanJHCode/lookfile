@@ -1,7 +1,7 @@
-"""SPEC-004 typed semantic diff（contracts §14.3）。
+"""SPEC-004 typed semantic diff under contracts section 14.3.
 
-比较两份 StyleSpec 的 JSON 规范化 primitive 树；只报告 leaf 差异；path 字典序；
-不 mutation、不 I/O。
+Compares the JSON-normalized primitive trees of two StyleSpecs, reports only
+leaf differences in lexicographic path order, and performs no mutation or I/O.
 """
 
 from __future__ import annotations

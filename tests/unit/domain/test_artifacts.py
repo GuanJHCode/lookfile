@@ -1,12 +1,11 @@
-"""specstyle.domain.artifacts 单测：AssetRef、ArtifactRef。
+"""Unit tests for specstyle.domain.artifacts AssetRef and ArtifactRef.
 
-覆盖 Module 1（Domain Foundation）冻结合同：
-- immutable AssetRef(asset_id, sha256) 与 ArtifactRef(artifact_id, sha256)；
-- 严格类型（sibling ID 错配、非 Sha256 抛 DomainError）；
-- 精确 mapping round-trip（to_primitive/from_primitive，额外/缺失 key 报错）；
-- frozen+slots、hashable、无 __dict__、不含 path、无 IO/解码/hash 计算。
+Cover the frozen Module 1 Domain Foundation contract: immutable asset and
+artifact references, strict sibling-ID and ``Sha256`` typing, exact mapping
+round trips with extra or missing key rejection, and frozen, slotted, hashable
+objects with no ``__dict__``, path, I/O, decoding, or hash calculation.
 
-重点测试：Sibling ID 错配、额外/缺失 mapping key。
+Key cases are sibling-ID mismatches and extra or missing mapping keys.
 """
 
 import dataclasses
@@ -31,7 +30,7 @@ def _artifact_ref(value="r1"):
     return ArtifactRef(ArtifactId(value), Sha256(HEX))
 
 
-# --- 构造与字段 ---
+# --- Construction and fields ---
 
 
 def test_asset_ref_construction():
@@ -51,7 +50,7 @@ def test_refs_have_no_path_field():
     assert not hasattr(_artifact_ref(), "path")
 
 
-# --- 严格类型：sibling ID 错配与非 Sha256 ---
+# --- Strict typing: sibling-ID mismatch and non-Sha256 values ---
 
 
 def test_asset_ref_rejects_plain_string_asset_id():
@@ -86,7 +85,7 @@ def test_artifact_ref_rejects_plain_strings():
         ArtifactRef(ArtifactId("r1"), HEX)  # type: ignore[arg-type]
 
 
-# --- to_primitive / from_primitive 精确 round-trip ---
+# --- Exact to_primitive / from_primitive round trips ---
 
 
 def test_asset_ref_to_primitive_shape():
@@ -131,25 +130,25 @@ def test_asset_ref_from_primitive_rejects_non_mapping():
 
 def test_asset_ref_from_primitive_rejects_bad_inner_values():
     with pytest.raises(DomainError):
-        AssetRef.from_primitive({"asset_id": "-bad", "sha256": HEX})  # 非法 ID
+        AssetRef.from_primitive({"asset_id": "-bad", "sha256": HEX})  # Invalid ID.
     with pytest.raises(DomainError):
-        AssetRef.from_primitive({"asset_id": "a1", "sha256": "g" * 64})  # 非法 sha
+        AssetRef.from_primitive({"asset_id": "a1", "sha256": "g" * 64})  # Invalid SHA.
 
 
 def test_asset_ref_from_primitive_rejects_wrong_key_name():
-    # key 名不匹配（artifact_id 而非 asset_id）
+    # The key is artifact_id instead of asset_id.
     with pytest.raises(DomainError):
         AssetRef.from_primitive({"artifact_id": "a1", "sha256": HEX})
 
 
-# --- 非 dict Mapping 正例（MappingProxyType / UserDict）---
+# --- Valid non-dict mappings: MappingProxyType and UserDict ---
 
 
 def test_asset_ref_accepts_mapping_proxy_type():
     data = MappingProxyType({"asset_id": "a1", "sha256": HEX_UPPER})
     ref = AssetRef.from_primitive(data)
     assert ref.asset_id == AssetId("a1")
-    assert ref.sha256.value == HEX  # 大写 SHA 规范为小写
+    assert ref.sha256.value == HEX  # Uppercase SHA input is normalized.
     assert ref == AssetRef(AssetId("a1"), Sha256(HEX_UPPER))
     restored = AssetRef.from_primitive(ref.to_primitive())
     assert restored == ref
@@ -181,7 +180,7 @@ def test_artifact_ref_accepts_user_dict():
     assert ArtifactRef.from_primitive(ref.to_primitive()) == ref
 
 
-# --- ArtifactRef from_primitive 负例（与 AssetRef 对称）---
+# --- ArtifactRef from_primitive negative cases, symmetric with AssetRef ---
 
 
 @pytest.mark.parametrize(
@@ -205,12 +204,12 @@ def test_artifact_ref_from_primitive_rejects_extra_key():
 
 
 def test_artifact_ref_from_primitive_rejects_wrong_key_name():
-    # key 名不匹配（asset_id 而非 artifact_id）
+    # The key is asset_id instead of artifact_id.
     with pytest.raises(DomainError):
         ArtifactRef.from_primitive({"asset_id": "r1", "sha256": HEX})
 
 
-# --- frozen / slots / hashable / 类型隔离 ---
+# --- Frozen, slotted, hashable, and type-separated behavior ---
 
 
 def test_refs_frozen():

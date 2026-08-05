@@ -1,4 +1,4 @@
-"""Repair 选择与 guardrail 共用的私有合同校验。"""
+"""Private contract validation shared by repair selection and guardrails."""
 
 from __future__ import annotations
 
@@ -35,7 +35,7 @@ def _safe(message: str, callback):
 
 
 def _primitive(value: object, message: str) -> str:
-    """复制不可信文本为 exact built-in ``str``，不做宽松转换。"""
+    """Copy untrusted text into an exact built-in ``str`` without coercion."""
     if not isinstance(value, str):
         raise _DomainError(message)
 

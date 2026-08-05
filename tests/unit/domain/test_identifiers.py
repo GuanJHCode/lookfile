@@ -1,13 +1,12 @@
-"""specstyle.domain.identifiers 单测：Identifier、6 个具体 ID、Sha256。
+"""Unit tests for Identifier, six concrete IDs, and Sha256.
 
-覆盖 Module 1（Domain Foundation）冻结合同：
-- ID 仅接受 re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}", value, re.ASCII)；
-  非法值抛 DomainError，不 strip、不改大小写；
-- Sha256 严格 64 hex，规范为小写；
-- frozen+slots、hashable、无 __dict__、str/to_primitive/from_primitive round-trip；
-- 具体类型隔离（JobId ≠ AssetId ≠ … ≠ Identifier 基类）。
+Cover the frozen Module 1 Domain Foundation contract: IDs accept only the
+contracted ASCII regular expression, invalid values raise ``DomainError``
+without stripping or case changes, ``Sha256`` requires and normalizes 64
+hexadecimal characters, values are frozen/slotted/hashable with exact primitive
+round trips, and every concrete identifier type remains isolated.
 
-重点测试：ASCII 控制字符、尾随换行、长度边界。
+Key cases are ASCII control characters, trailing newlines, and length bounds.
 """
 
 import dataclasses
@@ -51,7 +50,7 @@ INVALID_IDS = [
 ]
 
 
-# --- 有效 / 非法 ID ---
+# --- Valid and invalid IDs ---
 
 
 @pytest.mark.parametrize("cls", ID_TYPES, ids=lambda c: c.__name__)
@@ -79,7 +78,7 @@ def test_non_string_id_raises_domain_error(cls):
 
 
 def test_no_strip_leading_trailing_space():
-    # 不 strip：首/尾空格使值非法
+    # Values are not stripped, so leading or trailing spaces are invalid.
     with pytest.raises(DomainError):
         JobId(" abc")
     with pytest.raises(DomainError):
@@ -117,7 +116,7 @@ def test_hashable(cls):
     assert {a: 1}[b] == 1
 
 
-# --- 具体类型隔离 ---
+# --- Concrete type separation ---
 
 
 def test_sibling_ids_not_equal():
@@ -153,7 +152,7 @@ def test_from_primitive_non_string_raises(cls):
             cls.from_primitive(bad)
 
 
-# --- Identifier 基类 ---
+# --- Identifier base class ---
 
 
 def test_identifier_base_construction():
@@ -222,6 +221,6 @@ def test_sha256_frozen_no_dict_hashable():
 
 
 def test_sha256_no_strip():
-    # 前导空格使长度变 65 且非 hex → 非法
+    # A leading space makes the 65-character value non-hexadecimal and invalid.
     with pytest.raises(DomainError):
         Sha256(" " + "a" * 64)

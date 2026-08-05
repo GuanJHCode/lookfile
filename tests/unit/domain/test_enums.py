@@ -1,16 +1,11 @@
-"""specstyle.domain.enums 领域枚举单测。
+"""Unit tests for specstyle.domain enums.
 
-覆盖 BOOT-002A 冻结合同：
-- 七个枚举均继承 enum.StrEnum，member.name == member.value；
-- 无 alias（__members__ 与迭代等长）；
-- 无自定义 _missing_、无别名、无宽松转换；
-- 精确成员顺序与精确值（经 __members__ 读取，出现 alias 时必须失败）；
-- member 为 str 实例，str(member) == member.value；
-- JSON 字符串 round-trip（json.dumps(member) == json.dumps(value)；
-  json.loads 后 EnumClass(value) 还原原 member）；
-- 未知值 / 错误大小写 / 空字符串均抛 ValueError；
-- RuleStatus 不含 NOT_APPLICABLE，NOT_APPLICABLE 只属于 StaticApplicability；
-- specstyle.domain 不 re-export 任一枚举、不定义 __all__。
+Cover the frozen BOOT-002A contract: all seven enums derive from
+``enum.StrEnum`` with matching names and values; aliases, custom ``_missing_``,
+and permissive conversion are absent; membership order and values are exact;
+members behave as strings and round-trip through JSON; unknown, mis-cased, and
+empty values raise ``ValueError``; ``NOT_APPLICABLE`` belongs only to
+``StaticApplicability``; and ``specstyle.domain`` exports no enum or ``__all__``.
 """
 
 import enum
@@ -40,11 +35,11 @@ ALL_ENUMS = [
 
 
 def _members(cls):
-    """[(name, value), ...] 按 __members__ 顺序，含 alias（出现 alias 时精确成员测试必须失败）。"""
+    """Return ordered ``(name, value)`` pairs, including aliases."""
     return [(name, member.value) for name, member in cls.__members__.items()]
 
 
-# --- 精确成员顺序与精确值 ---
+# --- Exact member order and values ---
 
 
 def test_rulestatus_members():
@@ -107,7 +102,7 @@ def test_rulescope_members():
     ]
 
 
-# --- 不变量 ---
+# --- Invariants ---
 
 
 @pytest.mark.parametrize("cls", ALL_ENUMS, ids=lambda c: c.__name__)
@@ -126,19 +121,19 @@ def test_members_are_str(cls):
 def test_json_roundtrip(cls):
     for m in cls:
         dumped = json.dumps(m)
-        assert dumped == json.dumps(m.value)  # member 序列化与纯值字符串一致
+        assert dumped == json.dumps(m.value)  # Member serialization matches its value.
         loaded = json.loads(dumped)
         assert loaded == m.value
-        assert cls(loaded) is m  # EnumClass(value) 还原原 member
+        assert cls(loaded) is m  # EnumClass(value) restores the member.
 
 
 @pytest.mark.parametrize("cls", ALL_ENUMS, ids=lambda c: c.__name__)
 def test_invalid_values_raise_valueerror(cls):
     first = next(iter(cls))
     bad_values = (
-        "DEFINITELY_NOT_A_MEMBER_XYZ",  # 未知值
-        first.value.lower(),  # 错误大小写
-        "",  # 空字符串
+        "DEFINITELY_NOT_A_MEMBER_XYZ",  # Unknown value.
+        first.value.lower(),  # Incorrect case.
+        "",  # Empty string.
     )
     for bad in bad_values:
         with pytest.raises(ValueError):
@@ -147,13 +142,13 @@ def test_invalid_values_raise_valueerror(cls):
 
 @pytest.mark.parametrize("cls", ALL_ENUMS, ids=lambda c: c.__name__)
 def test_no_custom_missing(cls):
-    # 仅验证未自定义 _missing_；alias 由 test_enum_has_no_aliases 单独把关
+    # Check only _missing_; test_enum_has_no_aliases covers aliases separately.
     assert "_missing_" not in cls.__dict__
 
 
 @pytest.mark.parametrize("cls", ALL_ENUMS, ids=lambda c: c.__name__)
 def test_enum_has_no_aliases(cls):
-    # __members__ 含 alias；与迭代（仅 canonical）等长则无 alias
+    # __members__ includes aliases; iteration includes only canonical members.
     assert len(cls.__members__) == len(cls)
 
 
@@ -164,7 +159,7 @@ def test_enum_uses_strenum(cls):
         assert str(member) == member.value
 
 
-# --- RuleStatus / StaticApplicability 分离 ---
+# --- RuleStatus / StaticApplicability separation ---
 
 
 def test_rulestatus_excludes_not_applicable():
@@ -186,7 +181,7 @@ def test_not_applicable_only_in_staticapplicability():
             )
 
 
-# --- specstyle.domain 不 re-export ---
+# --- specstyle.domain does not re-export enums ---
 
 
 def test_domain_package_does_not_reexport_enums():

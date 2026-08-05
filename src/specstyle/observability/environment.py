@@ -1,4 +1,4 @@
-"""不读取环境变量的可审计环境快照。"""
+"""Auditable environment snapshots that do not read environment variables."""
 
 from __future__ import annotations
 
@@ -65,7 +65,7 @@ def _status(status: object, value: object, reason: object, validator: object) ->
 
 
 def _is_safe_observation_text(value: object) -> bool:
-    """不抛异常地拒绝可能携带秘密或路径的公开文本。"""
+    """Reject public text that may contain secrets or paths without raising."""
     try:
         if (
             type(value) is not str
@@ -244,7 +244,7 @@ class EnvironmentProbe(Protocol):
 
 
 class DefaultEnvironmentProbe:
-    """仅通过冻结的 stdlib/torch API 观测，不进行计算或设备扫描。"""
+    """Observe only through frozen stdlib and torch APIs without compute or scans."""
 
     def os_name(self) -> str | None:
         return platform.system()
@@ -400,7 +400,7 @@ def _devices(probe: EnvironmentProbe, hip: TextObservation) -> DeviceInventory:
 def capture_environment(
     probe: EnvironmentProbe | None = None, /
 ) -> EnvironmentSnapshot:
-    """将单一 probe 的每个字段失败隔离为固定 unavailable reason。"""
+    """Isolate each field failure in one probe as a fixed unavailable reason."""
     active = DefaultEnvironmentProbe() if probe is None else probe
     platform_fields = tuple(
         _text_probe(active, name, "NOT_REPORTED")

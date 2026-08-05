@@ -1,4 +1,4 @@
-"""WF-001 状态机 property tests：合法转换序列可达 terminal、replay 幂等。"""
+"""WF-001 properties for terminal reachability and idempotent event replay."""
 
 from __future__ import annotations
 

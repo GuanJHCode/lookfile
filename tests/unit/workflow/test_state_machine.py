@@ -1,4 +1,4 @@
-"""WF-001 状态机转换表与校验契约测试。"""
+"""WF-001 state-machine transition table and validation contract tests."""
 
 from __future__ import annotations
 

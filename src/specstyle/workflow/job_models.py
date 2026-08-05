@@ -1,8 +1,9 @@
-"""WF-001 Job/Event/Store 值对象（frozen+slots，defensive rebuild）。
+"""WF-001 job, event, and store value objects with defensive rebuilding.
 
-按 architect 冻结合同（derived from contracts §5/§2/§4/§8）。只依赖 domain 与 errors。
-ID/Sha256 用 exact type 重建；tuple 只接受 ``type(value) is tuple``；timestamp 为
-RFC3339 UTC 毫秒字符串。
+The architect-frozen contract is derived from sections 5, 2, 4, and 8 and
+depends only on domain and errors. IDs and ``Sha256`` are rebuilt with exact
+types, tuples require ``type(value) is tuple``, and timestamps are RFC3339 UTC
+strings with millisecond precision.
 """
 
 from __future__ import annotations

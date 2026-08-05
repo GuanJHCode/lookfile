@@ -33,7 +33,7 @@ from tests.unit.exporting.test_manifest import (
     _export_request,
     _production_request,
 )
-# 复用 EXP-001A 的 frozen input 构造器；不修改 A 文件。
+# Reuse EXP-001A frozen input builders without modifying its test module.
 
 
 def _root_fd(tmp_path: Path) -> int:

@@ -1,4 +1,4 @@
-"""受限输入的 SHA-256 计算。"""
+"""SHA-256 calculation for constrained inputs."""
 
 from __future__ import annotations
 
@@ -180,7 +180,7 @@ def hash_file(
     *,
     chunk_size: int = DEFAULT_HASH_CHUNK_SIZE,
 ) -> Sha256:
-    """通过 POSIX dirfd/openat 链安全散列可信根内的普通文件。"""
+    """Safely hash a regular file beneath a trusted root via a POSIX openat chain."""
     size = _chunk_size(chunk_size)
     root = _root_text(allowed_root)
     parts = _relative_text(relative_path)

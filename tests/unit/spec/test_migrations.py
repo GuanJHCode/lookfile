@@ -1,4 +1,4 @@
-"""SPEC-004 migration registry tests（contracts §14）。"""
+"""SPEC-004 migration registry tests for contracts section 14."""
 
 from __future__ import annotations
 
@@ -35,10 +35,10 @@ def test_migrate_1_0_to_1_1_golden() -> None:
     assert target.schema_uri == SCHEMA_URI_V11
     assert target.style.strength_mapping_version == LEGACY_STRENGTH_MAPPING_VERSION
     assert target.replay_contract.environment_policy == DEFAULT_ENVIRONMENT_POLICY_V11
-    # 源不变
+    # The source remains unchanged.
     assert source.model_dump(mode="json") == source_dump
     assert source.schema_version == "1.0"
-    # 其余字段 deep-equal（除迁移路径）
+    # Other fields are deeply equal except for the migration path.
     td = target.model_dump(mode="json")
     sd = copy.deepcopy(source_dump)
     sd["schema_version"] = "1.1"

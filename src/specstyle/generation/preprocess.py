@@ -1,4 +1,4 @@
-"""受限输入图像的确定性预处理。"""
+"""Deterministic preprocessing for constrained input images."""
 
 from __future__ import annotations
 
@@ -404,7 +404,7 @@ class PreparedImage:
 def preprocess_image(
     encoded: bytes, source: AssetRef, plan: PreprocessPlan
 ) -> PreparedImage:
-    """检查、规范化并以固定 PNG 编码输入。"""
+    """Inspect, normalize, and encode input with fixed PNG settings."""
     if type(encoded) is not bytes or not 1 <= len(encoded) <= _MAX_BYTES:
         raise DomainError("invalid preprocess input")
     source = _rebuild_asset_ref(source)

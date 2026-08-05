@@ -1,4 +1,4 @@
-"""WF-001 job_models frozen/slotted/forged rebuild 契约测试。"""
+"""WF-001 job model contract tests for frozen, slotted, defensive rebuilds."""
 
 from __future__ import annotations
 

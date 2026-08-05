@@ -1,11 +1,10 @@
-"""specstyle.spec.schema 单测：JSON Schema Draft 2020-12 生成。
+"""Unit tests for Style Spec JSON Schema Draft 2020-12 generation.
 
-覆盖 Module 2 冻结合同：
-- build_style_spec_schema 返回 Draft 2020-12 dict，$schema 官方 URI，$id = schema_uri；
-- 14 顶层字段全部在 required 与 properties；
-- 每次 build 返回互不污染的新对象；
-- SHA/ID/resolution/scale 约束出现在 Schema（Pydantic 用 $defs，故用 dump 子串校验）；
-- dump_style_spec_schema 返回 canonical JSON（sort_keys、紧凑、ensure_ascii=False）。
+Cover the frozen Module 2 contract: a Draft 2020-12 dictionary with the official
+``$schema`` URI and instance ``schema_uri`` as ``$id``; all 14 top-level fields
+in ``required`` and ``properties``; independent build results; SHA, ID,
+resolution, and scale constraints in Pydantic ``$defs``; and canonical JSON
+dumping with sorted keys, compact separators, and ``ensure_ascii=False``.
 """
 
 from __future__ import annotations
@@ -62,7 +61,7 @@ def test_schema_build_returns_independent_objects():
 
 def test_schema_sha256_pattern_and_length():
     dumped = dump_style_spec_schema()
-    # SHA 字段：64-hex pattern + minLength/maxLength 64
+    # SHA fields use a 64-hex pattern and exact length bounds.
     assert "[0-9a-fA-F]" in dumped
     assert '"minLength":64' in dumped
     assert '"maxLength":64' in dumped
@@ -70,7 +69,7 @@ def test_schema_sha256_pattern_and_length():
 
 def test_schema_idlike_pattern_and_length():
     dumped = dump_style_spec_schema()
-    # ID-like：minLength 1, maxLength 128
+    # ID-like fields have minLength 1 and maxLength 128.
     assert '"minLength":1' in dumped
     assert '"maxLength":128' in dumped
 
@@ -92,7 +91,7 @@ def test_schema_scale_range():
 
 def test_schema_per_item_metric_equality_required_const_false():
     dumped = dump_style_spec_schema()
-    # Literal[False] -> const:false（收紧，非宽松 boolean）
+    # Literal[False] emits const:false rather than a permissive boolean.
     assert '"const":false' in dumped
 
 

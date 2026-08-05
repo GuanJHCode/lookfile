@@ -1,4 +1,4 @@
-"""Repair Core 的冻结值对象。"""
+"""Frozen Repair Core value objects."""
 
 from __future__ import annotations
 

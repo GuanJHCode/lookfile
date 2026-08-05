@@ -1,13 +1,19 @@
-"""specstyle.spec.loader — YAML 安全解析 + 路径/输入安全。
+"""Secure YAML parsing and path/input safety for Style Specs.
 
-load_style_spec_text：文本 → UTF-8/size 检查 → 安全 compose（拒绝 alias/merge/dup/depth/nodes/root mapping）
-→ SafeLoader load（拒绝 custom/unsafe tag）→ list→tuple 转换 → StyleSpecV1 校验。
-load_style_spec_file：路径安全（相对/无 ../逐组件拒 symlink/resolve 仍在 root/仅 regular file）
-+ 前后双重 size/短读检查 → 调 load_text。
+``load_style_spec_text`` checks UTF-8 and size, composes safely while rejecting
+aliases, merges, duplicates, excessive depth or nodes, and non-mapping roots,
+loads with ``SafeLoader`` while rejecting custom or unsafe tags, converts lists
+to tuples, and validates ``StyleSpecV1``. ``load_style_spec_file`` requires a
+relative path without ``..``, rejects symlinks component by component, keeps
+the resolved path under the root, accepts only regular files, checks size and
+short reads before and after reading, and then calls the text loader.
 
-限额：MAX_SPEC_BYTES=1_048_576、MAX_YAML_DEPTH=32、MAX_YAML_NODES=10_000；P0 拒绝所有 alias 与 merge。
-异常：不存在/路径政策违反/输入错误=DomainError；权限/设备/短读/其它非输入 OSError=InfrastructureError（保 chain）。
-错误消息不含完整私密绝对路径、YAML 原文或字段值。
+Limits are ``MAX_SPEC_BYTES=1_048_576``, ``MAX_YAML_DEPTH=32``, and
+``MAX_YAML_NODES=10_000``; P0 rejects every alias and merge. Missing paths,
+policy violations, and invalid input raise ``DomainError``. Permission, device,
+short-read, and other non-input OS failures raise ``InfrastructureError`` with
+the exception chain preserved. Error messages exclude full private absolute
+paths, original YAML text, and field values.
 """
 
 from __future__ import annotations
@@ -33,7 +39,7 @@ _MERGE_KEY = "<<"
 
 
 class _StrictLoader(yaml.SafeLoader):
-    """SafeLoader + 拒绝 alias / merge key / duplicate key。"""
+    """SafeLoader that rejects aliases, merge keys, and duplicate keys."""
 
     def compose_node(self, parent: Any, index: Any) -> yaml.Node:  # type: ignore[override]
         if self.check_event(AliasEvent):
@@ -72,7 +78,7 @@ def _walk_depth_nodes(node: yaml.Node, depth: int, count: list[int]) -> None:
 
 
 def _list_to_tuple(obj: Any) -> Any:
-    """在 YAML sequence 边界把 list 转 tuple（合同：loader 显式转换，model 不放宽）。"""
+    """Convert YAML sequence lists to tuples while keeping models strict."""
     if isinstance(obj, list):
         return tuple(_list_to_tuple(x) for x in obj)
     if isinstance(obj, dict):
@@ -153,7 +159,7 @@ def load_style_spec_file(
     if ".." in rp.parts:
         raise DomainError("relative_path must not contain parent traversal")
 
-    # 逐组件拒绝 symlink（TOCTOU 为合同接受剩余风险）
+    # Reject symlinks component by component; TOCTOU is an accepted residual risk.
     cur = root_resolved
     for part in rp.parts:
         cur = cur / part
@@ -196,7 +202,7 @@ def load_style_spec_file(
     except OSError as exc:
         raise InfrastructureError("read error") from exc
 
-    # 短读 / 读后 size 复查
+    # Check for short reads and recheck size after reading.
     if len(raw) != st.st_size:
         raise InfrastructureError("short read detected")
     if len(raw) > max_bytes:

@@ -54,7 +54,7 @@ def test_assert_canonical_round_trip_rejects_reordered_or_reencoded() -> None:
     payload = b'{"a":1,"b":2}'
     qa_report.assert_canonical_round_trip(payload)
     with pytest.raises(DomainError):
-        # 重新序列化但换分隔符，应不等于原 bytes
+        # Re-serialize with different separators so bytes differ from the original.
         qa_report.assert_canonical_round_trip(b'{"a": 1, "b": 2}')
 
 

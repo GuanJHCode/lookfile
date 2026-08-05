@@ -1,4 +1,4 @@
-"""Repair policy 1.0 的动作白名单与纯子请求构造。"""
+"""Repair policy 1.0 action allowlist and pure child request construction."""
 
 from __future__ import annotations
 
@@ -149,12 +149,12 @@ def _patch_for(request: GenerationRequest, action: Identifier) -> RepairPatch:
 
 
 def repair_policy_from_request(request: GenerationRequest) -> RepairPolicy:
-    """从防伪重建后的 request 取得且校验内置 policy。"""
+    """Get and validate the built-in policy from a defensively rebuilt request."""
     return _policy(_request(request))
 
 
 def is_action_executable(request: GenerationRequest, action_id: Identifier) -> bool:
-    """判断白名单动作是否在当前状态仍会产生合法 patch。"""
+    """Check whether an allowlisted action still yields a valid patch."""
     rebuilt_request = _request(request)
     action = _action(action_id)
     if action not in EXECUTABLE_ACTION_IDS:
@@ -172,7 +172,7 @@ def plan_repair_action(
     trigger_rule_id: RuleId,
     action_id: Identifier,
 ) -> RepairDecision:
-    """为当前请求计算一个且仅一个类型化 repair patch。"""
+    """Compute exactly one typed repair patch for the current request."""
     rebuilt_request = _request(request)
     policy = _policy(rebuilt_request)
     decision = _identifier(decision_id, DecisionId, "decision id")
@@ -194,7 +194,7 @@ def build_repair_request(
     decision: RepairDecision,
     next_attempt_id: AttemptId,
 ) -> GenerationRequest:
-    """验证决策后，构造保留父材料的下一次生成请求。"""
+    """Validate the decision and build the next request with parent material."""
     rebuilt_parent = _request(parent)
     rebuilt_decision = _decision(decision)
     next_attempt = _identifier(next_attempt_id, AttemptId, "next attempt id")

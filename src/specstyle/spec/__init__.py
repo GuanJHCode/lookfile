@@ -1,4 +1,5 @@
-"""specstyle 风格规范（Style Spec）层：模型、JSON Schema 与安全 loader。
+"""The specstyle Style Spec layer: models, JSON Schema, and a secure loader.
 
-本模块仅为包占位，不 import、不 re-export；具体类型见 specstyle.spec.models 等。
+This module is only a package marker. It imports and re-exports nothing; see
+``specstyle.spec.models`` and related modules for concrete types.
 """

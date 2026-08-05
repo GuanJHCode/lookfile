@@ -1,9 +1,11 @@
-"""EXP-001A Export input models, invariants, routing and canonical documents.
+"""EXP-001A export input models, invariants, routing, and canonical documents.
 
-按 §13.1–§13.10、§13.12 冻结。本模块定义 public input 类型 ``CreditRole``、
-``AssetCredit``、``ExportItem``、``ExportCohort``、``ExportRequest`` 与
-package-private ``_PreparedFile``、``_PreparedExport``、``_prepare_export``。
-全部为纯内存生成：不执行文件系统、网络、环境捕获、模型调用或 verifier 重跑。
+Frozen by sections 13.1 through 13.10 and 13.12. This module defines the
+public input types ``CreditRole``, ``AssetCredit``, ``ExportItem``,
+``ExportCohort``, and ``ExportRequest``, plus the package-private
+``_PreparedFile``, ``_PreparedExport``, and ``_prepare_export``. All generation
+is in memory, with no filesystem, network, environment capture, model call, or
+verifier rerun.
 """
 
 from __future__ import annotations
@@ -260,20 +262,20 @@ class ExportCohort:
         compiled: CompiledStyleSpec,
         plan: CompiledVerificationPlan,
     ) -> None:
-        # items 语义顺序 == final_report.artifacts（defensive，不调 __eq__）
+        # Item semantic order must match final_report.artifacts; do not call __eq__.
         current_refs = [item.history.current_artifact.ref for item in items]
         if _qa.canonical_material(tuple(current_refs)) != _qa.canonical_material(
             final_report.artifacts
         ):
             _invariant_violation()
-        # 每个 current ref 由 current_artifact.content 提供 bytes
+        # current_artifact.content supplies bytes for each current reference.
         for item in items:
             artifact = item.history.current_artifact
             if type(artifact) is not GeneratedArtifact:
                 _invariant_violation()
             if hash_bytes(artifact.content) != artifact.ref.sha256:
                 _invariant_violation()
-        # rules 精确匹配 profile compiled applicable rule definitions（顺序无关）
+        # Rules exactly match applicable compiled definitions, regardless of order.
         applicable = plan.applicable_rule_definitions
         if {_qa.canonical_material(rule) for rule in final_report.rules} != {
             _qa.canonical_material(rule) for rule in applicable
@@ -281,7 +283,7 @@ class ExportCohort:
             _invariant_violation()
         # sequence_index per profile + terminal artifact ID == current artifact ID
         self._validate_sequence_and_terminals(items)
-        # routing 重演 decide_artifact；v1 拒绝 accepted_with_override=True
+        # Replay decide_artifact routing; v1 rejects accepted_with_override=True.
         for item in items:
             decision = item.terminal.artifact_decision
             if decision.accepted_with_override:
@@ -631,7 +633,7 @@ def _cohort_primitive(
 
 
 def _prepare_export(request: ExportRequest) -> _PreparedExport:
-    """纯内存生成全部 canonical documents、payload/manifest/bundle digest。"""
+    """Build canonical documents and payload, manifest, and bundle digests in memory."""
     compiled = _qa.rebuild_compiled_spec(
         request.cohorts[0].items[0].history.current_request.compiled_spec
     )
@@ -750,7 +752,7 @@ def _prepare_export(request: ExportRequest) -> _PreparedExport:
     }
     bundle_sha256 = hash_bytes(_qa.canonical_json_bytes(bundle_material))
 
-    # strict parse 回读校验（§13.9）：每个 canonical document re-dump 等于原 bytes
+    # Section 13.9 readback: each canonical document must re-dump identically.
     for prepared in (*payload_files,):
         if prepared.relative_path.endswith((".json", ".yaml")):
             _qa.assert_canonical_round_trip(prepared.content)

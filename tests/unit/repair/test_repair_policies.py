@@ -40,7 +40,7 @@ from tests.unit.spec.test_compiler import context, raw_spec
 
 
 class SelfSafeCrossExplodingText(str):
-    """仅与自身比较安全的 str 子类，用于证明边界规范化。"""
+    """A str subclass safe only for self-comparison, proving boundary normalization."""
 
     def __hash__(self) -> int:
         return str.__hash__(self)

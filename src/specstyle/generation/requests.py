@@ -1,4 +1,4 @@
-"""生成请求及其确定性哈希材料。"""
+"""Generation requests and their deterministic hash material."""
 
 from __future__ import annotations
 
@@ -370,7 +370,7 @@ class GenerationRequest:
 
     @property
     def graph(self) -> CompiledExecutionGraph:
-        """唯一按请求 selectors 解析的执行图。"""
+        """The unique execution graph resolved by the request selectors."""
         return self._resolve_graph()
 
     def _fingerprint_materials(

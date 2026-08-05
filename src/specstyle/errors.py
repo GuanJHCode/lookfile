@@ -1,20 +1,22 @@
-"""specstyle 领域异常基础层级。
+"""Base hierarchy for specstyle domain exceptions.
 
-仅定义继承关系（SpecStyleError ← Exception；DomainError/InfrastructureError ← SpecStyleError）。
-错误码、错误上下文与序列化在后续 Task 实现，当前不引入。
+This module defines only inheritance: ``SpecStyleError`` derives from
+``Exception``, while ``DomainError`` and ``InfrastructureError`` derive from
+``SpecStyleError``. Error codes, contexts, and serialization are intentionally
+deferred to a later task.
 """
 
 
 class SpecStyleError(Exception):
-    """所有 specstyle 异常的根。"""
+    """Root of all specstyle exceptions."""
 
 
 class DomainError(SpecStyleError):
-    """领域语义错误：业务规则违反、Spec 校验失败等。"""
+    """Domain semantic error, such as a rule violation or invalid specification."""
 
 
 class InfrastructureError(SpecStyleError):
-    """基础设施错误：GPU/ROCm、文件 IO、依赖缺失等运行环境问题。"""
+    """Runtime infrastructure error involving GPU/ROCm, file I/O, or dependencies."""
 
 
 class _GpuOutOfMemoryError(InfrastructureError):

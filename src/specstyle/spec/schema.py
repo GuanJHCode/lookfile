@@ -1,7 +1,9 @@
-"""specstyle.spec.schema — Style Spec JSON Schema Draft 2020-12 生成。
+"""Style Spec JSON Schema Draft 2020-12 generation.
 
-build_style_spec_schema 每次返回互不污染的新对象；$schema 固定 Draft 2020-12 官方 URI，
-$id 等于实例 schema_uri；dump 使用 sort_keys + 紧凑分隔 + ensure_ascii=False 的 canonical JSON。
+``build_style_spec_schema`` returns an independent object on every call.
+``$schema`` is fixed to the official Draft 2020-12 URI, ``$id`` equals the
+instance ``schema_uri``, and dumping uses canonical JSON with ``sort_keys``,
+compact separators, and ``ensure_ascii=False``.
 """
 
 from __future__ import annotations

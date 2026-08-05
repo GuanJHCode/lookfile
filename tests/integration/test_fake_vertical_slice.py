@@ -1,12 +1,14 @@
-"""WF-002 Fake CPU 端到端纵向切片集成测试。
+"""WF-002 fake CPU end-to-end vertical-slice integration tests.
 
-一个 CPU 命令跑四条链（approved / fail→repair→approved / exhausted→rejected /
-unverifiable→manual_review），并验证 canonical parse、终态隔离、重启幂等恢复、
-同输入 deterministic 与 import graph 不含 Torch/Diffusers/Gradio。
+One CPU command runs four chains: approved, fail to repair to approved,
+exhausted to rejected, and unverifiable to manual review. It verifies canonical
+parsing, terminal-state isolation, idempotent restart recovery, same-input
+determinism, and an import graph free of Torch, Diffusers, and Gradio.
 
-FakeBackend bit-exact 使 artifact_id 由 request_hash 决定；本测试用 orchestrator 的
-``_initial_request``/``_expected_artifact_id`` 预计算 initial/repaired artifact_id，
-据此 script FakeVerifier，不声称 Spec replay 已验证。
+FakeBackend bit-exact behavior derives ``artifact_id`` from ``request_hash``.
+The tests use the orchestrator's ``_initial_request`` and
+``_expected_artifact_id`` to precompute initial and repaired artifact IDs and
+script FakeVerifier accordingly; they do not claim verified Spec replay.
 """
 
 from __future__ import annotations
@@ -76,11 +78,11 @@ _JOB = JobId("wf002-job")
 
 
 def _spec_text() -> str:
-    """JSON（YAML 1.2 子集）spec：policy_version 1.0 + on_unverifiable manual_review。
+    """JSON (a YAML 1.2 subset) spec using policy 1.0 and manual review.
 
-    on_unverifiable=manual_review 使同一份 spec 既能走 fail→repair（FAIL 路由不受
-    on_unverifiable 影响），又能走 unverifiable→manual_review（UNVERIFIABLE+manual
-    路由到 MANUAL_REVIEW）。
+    ``on_unverifiable=manual_review`` lets one spec exercise both fail-to-repair,
+    because FAIL routing ignores ``on_unverifiable``, and
+    unverifiable-to-manual-review routing.
     """
     data = raw_spec().model_dump(mode="python", round_trip=True)
     data["repair"]["policy_version"] = "1.0"
@@ -89,7 +91,7 @@ def _spec_text() -> str:
 
 
 def _context_with_style_low():
-    """将 L2 fidelity rule 改名为 STYLE_LOW 且 affected_by INCREASE_STYLE_SCALE。"""
+    """Rename the L2 fidelity rule to STYLE_LOW, affected by style-scale repair."""
     base = context()
     catalog = base.rule_catalogs[0]
     style_low = replace(
@@ -125,7 +127,7 @@ def _source():
 
 
 class _CannyBuilder:
-    """control_builder：control image 即 source，kind canny 匹配 graph。"""
+    """Use the source itself as control input with kind canny matching the graph."""
 
     def build(self, source, graph):  # noqa: ANN001, ANN202
         return PreparedControlInput("canny", source)
@@ -149,7 +151,7 @@ def _compiled():
 
 
 class _SpyBackend:
-    """包裹 FakeBackend 以计数 generate 调用（验证重启不重复生成）。"""
+    """Wrap FakeBackend to count calls and prove restart does not regenerate."""
 
     def __init__(self) -> None:
         self._inner = FakeBackend()
@@ -161,15 +163,16 @@ class _SpyBackend:
 
 
 # --------------------------------------------------------------------------- #
-# FakeVerifier（测试基础设施）
+# FakeVerifier test infrastructure
 # --------------------------------------------------------------------------- #
 
 
 class FakeVerifier:
-    """按 artifact_id.value→{rule_id.value:status} 脚本化的假 verifier。
+    """Fake verifier scripted by artifact ID to rule-status mappings.
 
-    ITEM rule 对每个 artifact 产一条 affected=(artifact,)；BATCH rule 产一条
-    affected=all artifacts；未脚本化默认 PASS（approved 链零脚本可跑）；score=None。
+    An ITEM rule emits one ``affected=(artifact,)`` result per artifact. A BATCH
+    rule emits one result affecting all artifacts. Unscripted rules default to
+    PASS so the approved chain needs no script; scores are ``None``.
     """
 
     def __init__(self) -> None:
@@ -195,7 +198,7 @@ class FakeVerifier:
                             (art.artifact_id,),
                         )
                     )
-            else:  # BATCH：一条 affected=all artifacts
+            else:  # BATCH emits one result affecting all artifacts.
                 status = RuleStatus.PASS
                 for art in artifacts:
                     candidate = self._status(art.artifact_id, rule.rule_id)
@@ -238,7 +241,7 @@ def _req0(compiled, source, prompt, env_hash):
 
 
 def _predict_ids():
-    """预计算 initial 与 repaired（INCREASE_STYLE_SCALE round 1）的 artifact_id。"""
+    """Precompute initial and round-one style-scale-repaired artifact IDs."""
     compiled, source, prompt, env, env_hash = _materials()
     req0 = _req0(compiled, source, prompt, env_hash)
     initial = ArtifactId(_expected_artifact_id(req0))
@@ -366,7 +369,7 @@ def test_fake_job_runs_each_terminal_chain(chain: str, tmp_path: Path) -> None:
     assert decision.decision_reason is reason
     assert decision.repair_stop_reason is stop
     assert result.histories[0].rounds == rounds
-    # 终态 artifact_id 与 current artifact 一致
+    # The terminal artifact ID matches the current artifact.
     assert decision.artifact_id == result.histories[0].current_target_artifact_id
 
 
@@ -391,7 +394,7 @@ def test_bundle_documents_canonical_round_trip(tmp_path: Path) -> None:
     ):
         data = (bundle_dir / name).read_bytes()
         assert_canonical_round_trip(data)
-        parse_strict(data)  # 拒绝 duplicate key / NaN / Inf
+        parse_strict(data)  # Reject duplicate keys, NaN, and infinity.
 
 
 # --------------------------------------------------------------------------- #
@@ -530,9 +533,9 @@ def test_restart_of_completed_job_skips_generation_and_export(tmp_path: Path) ->
             backend=spy,
         )
         assert second.final_status == "COMPLETED"
-        assert second.bundle is None  # 短路：bundle 已发布，不重复导出
-        assert spy.generate_calls == 0  # 重启不重复生成
-        assert approved_png.stat().st_mtime_ns == mtime_before  # bundle 未被触碰
+        assert second.bundle is None  # Published bundle takes the restart shortcut.
+        assert spy.generate_calls == 0  # Restart does not regenerate.
+        assert approved_png.stat().st_mtime_ns == mtime_before  # Bundle is untouched.
     finally:
         os.close(root_fd)
 

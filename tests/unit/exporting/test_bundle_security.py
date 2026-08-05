@@ -1176,7 +1176,7 @@ def test_native_no_replace_leaves_no_partial_final(tmp_path: Path) -> None:
             export_bundle(_export_request(), root_fd, "collide")
     finally:
         os.close(root_fd)
-    # 原目录未被覆盖（仍为空目录，无 manifest）
+    # The original directory remains empty and has no manifest.
     assert not (tmp_path / "collide" / "manifest.json").exists()
 
 
@@ -1218,7 +1218,7 @@ def test_readback_failure_raises_readback_failed(tmp_path: Path, monkeypatch) ->
     def boom(fd: int, n: int) -> bytes:
         raise OSError("read denied")
 
-    # 只在 readback 阶段（写完后）触发；写阶段 os.read 不被调用。
+    # Trigger only during post-write readback; writing does not call os.read.
     monkeypatch.setattr(os, "read", boom)
     root_fd = _root_fd(tmp_path)
     try:
@@ -1352,7 +1352,7 @@ def test_parent_symlink_component_fails_closed(tmp_path: Path, monkeypatch) -> N
         real_mkdir(staging_fd, parts, dir_ids)
         if parts == ("approved",) and not state["done"]:
             state["done"] = True
-            # 用同名 symlink 替换 approved 目录，模拟 TOCTOU。
+            # Replace approved with a same-name symlink to simulate TOCTOU.
             os.rmdir("approved", dir_fd=staging_fd)
             os.symlink(".", "approved", dir_fd=staging_fd)
             dir_ids.pop("approved", None)
@@ -1399,7 +1399,7 @@ def test_primary_failure_preserves_staging_without_online_cleanup(
 
 
 def test_staging_root_fsync_is_invoked(tmp_path: Path, monkeypatch) -> None:
-    """_fsync_dir(staging_fd, ()) 必须 fsync staging 根 dirfd。"""
+    """_fsync_dir(staging_fd, ()) fsyncs the staging root dirfd."""
     real_fsync = os.fsync
     seen: list[int] = []
 
@@ -1413,5 +1413,5 @@ def test_staging_root_fsync_is_invoked(tmp_path: Path, monkeypatch) -> None:
         export_bundle(_export_request(), root_fd, "fsync_root")
     finally:
         os.close(root_fd)
-    # 至少有文件 fsync + staging 根 + final root；保证 empty-parts 路径被调用
+    # Cover file fsync, staging root, final root, and the empty-parts path.
     assert len(seen) >= 3

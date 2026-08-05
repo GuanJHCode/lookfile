@@ -1,6 +1,7 @@
-"""SPEC-004 StyleSpec migration registry（contracts §14）。
+"""SPEC-004 StyleSpec migration registry under contracts section 14.
 
-显式有向 edge；copy-on-write；失败不修改 source；无 identity / 无降级 / 无跨 major。
+Uses explicit directed edges and copy-on-write. Failure does not modify the
+source. Identity, downgrade, and cross-major migrations are unsupported.
 """
 
 from __future__ import annotations
@@ -41,7 +42,7 @@ def _version_of(spec: StyleSpec) -> str:
 
 
 def _list_to_tuple(obj: object) -> object:
-    """model_dump JSON 模式产出 list；strict model 要求 tuple（与 loader 一致）。"""
+    """Convert model_dump JSON lists to tuples required by strict models."""
     if type(obj) is list:
         return tuple(_list_to_tuple(x) for x in obj)
     if type(obj) is dict:
@@ -81,7 +82,7 @@ _EDGE: dict[tuple[str, str], Callable[[StyleSpec], StyleSpec]] = {
 def _shortest_path(source: str, target: str) -> tuple[str, ...] | None:
     if source == target:
         return None
-    # 单层 BFS 覆盖未来多 edge；当前仅 1.0→1.1。
+    # A shallow BFS supports future multiple edges; currently only 1.0 to 1.1.
     frontier: list[tuple[str, ...]] = [(source,)]
     seen = {source}
     while frontier:
@@ -111,7 +112,7 @@ def migrate_style_spec(source: StyleSpec, target_version: str, /) -> MigrationRe
         raise DomainError("unsupported style spec migration") from None
 
     current: StyleSpec = source
-    # 保留源引用；每一步只消费 dump 副本
+    # Preserve the source reference; each step consumes only a dumped copy.
     for i in range(len(path) - 1):
         edge = (path[i], path[i + 1])
         fn = _EDGE.get(edge)

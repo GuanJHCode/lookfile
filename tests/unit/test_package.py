@@ -1,51 +1,49 @@
-"""specstyle package 基础层级单测：import、版本、异常继承与抛出/捕获。
+"""Unit tests for package imports, version, and exception hierarchy.
 
-覆盖 BOOT-001 冻结合同：
-- specstyle 可作为顶层 package 导入；
-- specstyle.__version__ 严格等于 "0.1.0"；
-- SpecStyleError 继承 Exception；
-- DomainError / InfrastructureError 继承 SpecStyleError；
-- 三者均可正常 raise 并被捕获。
+Cover the frozen BOOT-001 contract: top-level package import, exact version
+``0.1.0``, ``SpecStyleError`` inheritance from ``Exception``, domain and
+infrastructure inheritance from ``SpecStyleError``, and normal raise/catch
+behavior for all three exceptions.
 """
 
 import pytest
 
 
 def test_package_importable():
-    """specstyle 必须可作为顶层 package 导入。"""
+    """specstyle imports as a top-level package."""
     import specstyle  # noqa: F401
 
 
 def test_version_is_0_1_0():
-    """__version__ 必须严格等于 0.1.0。"""
+    """__version__ equals 0.1.0 exactly."""
     import specstyle
 
     assert specstyle.__version__ == "0.1.0"
 
 
 def test_specstyle_error_inherits_exception():
-    """SpecStyleError 必须继承 Exception。"""
+    """SpecStyleError derives from Exception."""
     from specstyle.errors import SpecStyleError
 
     assert issubclass(SpecStyleError, Exception)
 
 
 def test_domain_error_inherits_specstyle_error():
-    """DomainError 必须继承 SpecStyleError。"""
+    """DomainError derives from SpecStyleError."""
     from specstyle.errors import DomainError, SpecStyleError
 
     assert issubclass(DomainError, SpecStyleError)
 
 
 def test_infrastructure_error_inherits_specstyle_error():
-    """InfrastructureError 必须继承 SpecStyleError。"""
+    """InfrastructureError derives from SpecStyleError."""
     from specstyle.errors import InfrastructureError, SpecStyleError
 
     assert issubclass(InfrastructureError, SpecStyleError)
 
 
 def test_specstyle_error_raise_and_catch():
-    """SpecStyleError 可正常抛出并被自身捕获。"""
+    """SpecStyleError can be raised and caught directly."""
     from specstyle.errors import SpecStyleError
 
     with pytest.raises(SpecStyleError):
@@ -53,7 +51,7 @@ def test_specstyle_error_raise_and_catch():
 
 
 def test_domain_error_raise_and_catch_as_base():
-    """DomainError 可抛出，且作为 SpecStyleError 也可被捕获。"""
+    """DomainError can be caught as itself or as SpecStyleError."""
     from specstyle.errors import DomainError, SpecStyleError
 
     with pytest.raises(DomainError):
@@ -63,7 +61,7 @@ def test_domain_error_raise_and_catch_as_base():
 
 
 def test_infrastructure_error_raise_and_catch_as_base():
-    """InfrastructureError 可抛出，且作为 SpecStyleError 也可被捕获。"""
+    """InfrastructureError can be caught as itself or as SpecStyleError."""
     from specstyle.errors import InfrastructureError, SpecStyleError
 
     with pytest.raises(InfrastructureError):

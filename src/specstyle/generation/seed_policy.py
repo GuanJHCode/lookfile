@@ -1,4 +1,4 @@
-"""确定性 seed 派生。"""
+"""Deterministic seed derivation."""
 
 from __future__ import annotations
 
@@ -43,7 +43,7 @@ def _seed_value(
 
 @dataclass(frozen=True, slots=True)
 class SeedSnapshot:
-    """可审计的确定性 seed 快照。"""
+    """Auditable deterministic seed snapshot."""
 
     source_sha256: Sha256
     compiled_spec_hash: Sha256
@@ -85,7 +85,7 @@ def derive_seed(
     output_profile: OutputProfile,
     variation_index: int,
 ) -> SeedSnapshot:
-    """仅从稳定生成材料派生 seed。"""
+    """Derive a seed solely from stable generation material."""
     return SeedSnapshot(
         source_sha256, compiled_spec_hash, output_profile, variation_index
     )

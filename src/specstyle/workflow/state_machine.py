@@ -1,8 +1,9 @@
-"""WF-001 Job 状态机：合法转换表、转换校验与事件重放（contracts §5）。
+"""WF-001 job state machine, transition validation, and event replay.
 
-derived from §5。状态命名以 §5 为准（CREATED/SPEC_VALIDATED/.../COMPLETED/
-JOB_FAILED/CANCELLED/RECOVERABLE_ERROR）。APPROVED/MANUAL_REVIEW/REJECTED 是
-cohort/item 决策中间态（待 EXPORTING），Job 正常终态为 COMPLETED。
+Derived from contracts section 5, whose state names govern
+CREATED/SPEC_VALIDATED/.../COMPLETED/JOB_FAILED/CANCELLED/RECOVERABLE_ERROR.
+APPROVED, MANUAL_REVIEW, and REJECTED are cohort/item decision states awaiting
+EXPORTING; the normal terminal job state is COMPLETED.
 """
 
 from __future__ import annotations
@@ -127,7 +128,7 @@ def validate_transition(
     event_type: EventType,
     /,
 ) -> None:
-    """校验 (from→to)∈TRANSITIONS ∧ event_type↔to_state 匹配。"""
+    """Validate membership in TRANSITIONS and the event-type-to-state mapping."""
     if to_state not in TRANSITIONS.get(from_state, frozenset()):
         raise DomainError("invalid job transition") from None
     if to_state not in _EVENT_TO_STATE.get(event_type, frozenset()):
@@ -135,10 +136,10 @@ def validate_transition(
 
 
 def replay_events(snapshot: JobSnapshot, events: tuple[object, ...], /) -> JobState:
-    """从 snapshot 之后重放事件，逐事件校验转换+幂等+推进。
+    """Replay and advance events after a snapshot with per-event validation.
 
-    重复 sequence/attempt_id/bundle_name、乱序（非连续递增）→
-    ``DomainError("invalid job event") from None``。
+    Duplicate sequence, attempt ID, or bundle name, and non-contiguous order,
+    raise ``DomainError("invalid job event") from None``.
     """
     try:
         if type(snapshot) is not JobSnapshot or type(events) is not tuple:
@@ -206,7 +207,7 @@ def _check_idempotent(event: object, attempts: list[str], bundles: list[str]) ->
 
 
 def _check_bound_payload(job: Job, event: Event) -> None:
-    """验证 genesis 不可变材料不会被事件日志替换。"""
+    """Verify that event logs cannot replace immutable genesis material."""
     if event.event_type is EventType.JOB_STARTED:
         payload = event.payload
         if (
